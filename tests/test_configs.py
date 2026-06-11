@@ -11,7 +11,10 @@ from hydra.core.global_hydra import GlobalHydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 
-CONFIG_DIR = str(Path(__file__).resolve().parents[1] / "configs")
+import lattice_lab
+
+# Locate configs via the installed package (layout-independent).
+CONFIG_DIR = str(Path(lattice_lab.__file__).resolve().parent / "configs")
 
 TRAIN_CASES = [
     [],

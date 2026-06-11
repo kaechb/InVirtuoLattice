@@ -1,10 +1,7 @@
-# Standalone package metadata for lattice_lab.
-#
-# Today this directory lives inside the LATTICE monorepo and runs in-place
-# (`python -m lattice_lab.train` from the monorepo root). To spin it out into
-# its own repository, move THIS directory to be the new repo root — the
-# package-dir mapping below makes `.` the `lattice_lab` package, so
-# `pip install -e .` then works unchanged.
+# Standalone package metadata for lattice_lab (src layout).
+# Install with `pip install -e .` from the repo root; then `python -m
+# lattice_lab.<...>` and the `lattice-train` / `lattice-eval` console scripts
+# work from anywhere.
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
@@ -42,14 +39,9 @@ dev = ["ruff>=0.4", "mypy>=1.8", "pytest>=7.0"]
 lattice-train = "lattice_lab.train:main"
 lattice-eval = "lattice_lab.evaluate:main"
 
-# Map the package `lattice_lab` onto this directory itself ("repo root is the
-# package"), so subpackages resolve as lattice_lab.<sub>.
-[tool.setuptools]
-package-dir = { "lattice_lab" = "." }
-
+# Standard src layout: the importable package is src/lattice_lab/.
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["backbone*", "protein*", "preprocessing*", "ebm*", "eval*", "inference*", "data*", "models*", "callbacks*", "utils*", "training*"]
+where = ["src"]
 
 [tool.setuptools.package-data]
 lattice_lab = ["configs/**/*.yaml"]

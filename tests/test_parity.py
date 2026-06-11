@@ -19,7 +19,7 @@ import torch
 
 pytest.importorskip("lattice", reason="original lattice package not importable")
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[1]
 ADAPTER_CKPT = REPO / "artifacts/adapter/checkpoints_ssl2/adapter_v1.pt"
 TRAIN_PARQUET = REPO / "artifacts/processed/bindingdb/threshold_90/train.parquet"
 

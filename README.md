@@ -30,27 +30,19 @@ single-purpose modules (`models/builders.py`, `models/schedules.py`,
 ## Layout
 
 ```
-lattice_lab/
-├── train.py / evaluate.py     # Hydra @main entrypoints
-├── export_adapter.py          # Lightning .ckpt → legacy adapter_v1.pt
-├── configs/                   # Hydra config tree (see below)
-├── data/                      # EBMDataModule, AdapterDataModule, cluster sampler
-├── models/                    # EBMLitModule, AdapterLitModule + builders/schedules/encode
-├── callbacks/                 # SanityGateCallback (Stage-2 gate)
-├── utils/                     # instantiate_{callbacks,loggers}, seed, hparam logging
-├── tests/                     # import + config-resolution tests
-│
-├── preprocessing/             # ── re-homed science kernels (no `import lattice`) ──
-├── backbone/                  #    FragMol + adapter encoder
-├── protein/                   #    frozen ESM-2 + mmap embedding store
-├── ebm/                       #    energy head, losses, datasets/collators
-├── eval/                      #    metrics, sanity checks, LIT-PCBA / DUD-E harnesses
-├── inference/                 #    virtual-screening predictors
-├── training/                  #    ssl_dataset, ssl_loss, run_logger
-│
-├── scripts/                   # data-download CLIs + DATASETS.md
-├── artifacts/                 # all pipeline data (git-ignored; tree below)
-└── pyproject.toml             # standalone package metadata
+lattice_lab/                      # repo root
+├── pyproject.toml                # install:  pip install -e .
+├── README.md
+├── scripts/                      # data-download CLIs + DATASETS.md
+├── tests/                        # import + config-resolution + parity tests
+├── artifacts/                    # all pipeline data (git-ignored; tree below)
+└── src/lattice_lab/              # the importable package
+    ├── train.py / evaluate.py    # Hydra @main entrypoints
+    ├── export_adapter.py         # Lightning .ckpt → legacy adapter_v1.pt
+    ├── configs/                  # Hydra config tree (see below)
+    ├── data/ models/ callbacks/ utils/    # Lightning/Hydra orchestration
+    └── preprocessing/ backbone/ protein/ ebm/ eval/ inference/ training/
+                                   #    re-homed science kernels (no `import lattice`)
 ```
 
 All pipeline inputs/outputs live under one git-ignored `artifacts/` tree
@@ -85,11 +77,35 @@ interpolated into **both** `data` and `model` so a collator and its consumer
 can't silently disagree. `model.num_steps = ${trainer.max_steps}` and
 `model.hard_mining_mult = ${data.hard_mining_mult}` for the same reason.
 
+## Install
+
+The package lives under `src/`, so it must be installed before
+`python -m lattice_lab.*` (or the `lattice-train` / `lattice-eval` scripts) work.
+From the repo root:
+
+```bash
+pip install -e .          # editable: code changes take effect without reinstall
+# (add --no-build-isolation on an offline cluster where setuptools is preinstalled)
+```
+
+Verify:
+
+```bash
+python -c "import lattice_lab; print(lattice_lab.__file__)"
+python -m lattice_lab.train --help
+```
+
+> Not installing it (or relying on the old "run from inside the folder") gives
+> `ModuleNotFoundError: No module named 'lattice_lab'` — `src/` is intentionally
+> **not** on `sys.path` until you `pip install -e .`. If you can't install,
+> `export PYTHONPATH=$PWD/src:$PYTHONPATH` from the repo root is an equivalent
+> stop-gap.
+
 ## Usage
 
-Data paths in `configs/data/*.yaml` are relative to the working directory and
-Hydra keeps the CWD (`hydra.job.chdir=false`), so run from the repo root — all
-pipeline inputs/outputs live under `artifacts/` (see the tree below).
+Run the CLIs from the repo root so the relative `artifacts/` paths in
+`configs/data/*.yaml` resolve (Hydra keeps the CWD via `hydra.job.chdir=false`).
+All pipeline inputs/outputs live under `artifacts/`.
 
 ```bash
 # Stage 5 — EBM head
@@ -114,8 +130,9 @@ python -m lattice_lab.evaluate ckpt_path=logs/train/<run>/checkpoints/last.ckpt
 
 Every stage lives **inside this package** (no `import lattice`). The data-prep,
 encoding and eval stages are argparse CLIs (one-shot data jobs); training is
-Hydra/Lightning. Run from the repo root; all stage data lives under `artifacts/`.
-Paths below match the released `ssl2` artifact set.
+Hydra/Lightning. **Run `pip install -e .` first** (see [Install](#install)), then
+run from the repo root; all stage data lives under `artifacts/`. Paths below match
+the released `ssl2` artifact set.
 
 ### Stage 0 — Data acquisition
 
@@ -171,6 +188,28 @@ github.com/soedinglab/MMseqs2/releases.) See `setup_lumi.md` for the full LUMI
 environment setup.
 
 ### Stage 1 — Preprocessing
+If you are on LUMI - use this:
+```bash
+  # In your sbatch script / before running preprocessing:
+  export PROJ=project_465003063
+  export FLASH=/flash/$PROJ/$USER
+  mkdir -p $FLASH/tmp $FLASH/artifacts
+  export TMPDIR=$FLASH/tmp
+  python -m lattice_lab.preprocessing.run_bindingdb \
+    --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \
+    --lit-pcba-dir  artifacts/raw/lit_pcba \
+    --output-dir     $FLASH/artifacts/processed/bindingdb \
+    --identity 90 --n-jobs 16
+
+# Canonicalise MOSES (adapter SSL set) into FragMol-view parquet shards.
+python -m lattice_lab.preprocessing.run_preprocessing \
+    --input  artifacts/raw/moses.csv \
+    --output  $FLASH/artifacts/processed/moses \
+    --n-views 3 --n-jobs 16
+
+cp -r $FLASH/artifacts/processed/* /scratch/$PROJ/benno/lattice_lab/artifacts/processed/
+```
+
 ```bash
 # Curate BindingDB + build the 90% MMseqs2 identity split held out vs LIT-PCBA.
 # Needs MMseqs2 (hard dep). LATTICE_ALLOW_KMER_FALLBACK=1 only for smoke/tests.
