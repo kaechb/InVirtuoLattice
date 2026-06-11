@@ -1,6 +1,6 @@
 _target_: lattice_lab.data.AdapterDataModule
 
-shard_dir: 01_preprocessing/processed
+shard_dir: artifacts/processed/moses
 batch_size: 64
 val_ratio: 0.005
 test_ratio: 0.005

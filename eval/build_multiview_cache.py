@@ -7,9 +7,9 @@ why a single-view cache leaves EF@1% jittery. Averaging K seeded views denoises
 z_m, is fully reproducible (fixed per-molecule seeds), and leaves only a small,
 controlled uncertainty (≈ single-view spread / sqrt(K)).
 
-    PYTHONPATH=. python 05_training/build_multiview_cache.py \
-        --n-views 8 --zm-cache 06_evaluation/lit_pcba_zm_mv8 \
-        --adapter-ckpt 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt --n-jobs 32
+    PYTHONPATH=. python artifacts/energy/build_multiview_cache.py \
+        --n-views 8 --zm-cache artifacts/evaluation/lit_pcba_zm_mv8 \
+        --adapter-ckpt artifacts/adapter/checkpoints_ssl2/adapter_v1.pt --n-jobs 32
 """
 from __future__ import annotations
 import argparse, hashlib
@@ -36,9 +36,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-views", type=int, default=8)
     ap.add_argument("--zm-cache", type=Path, required=True)
-    ap.add_argument("--test-parquet", type=Path, default=Path("01_preprocessing/processed_bindingdb/test_lit_pcba.parquet"))
-    ap.add_argument("--adapter-ckpt", type=Path, default=Path("02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt"))
-    ap.add_argument("--protein-store", type=Path, default=Path("03_protein_encoder/embeddings/esm2_650M"))
+    ap.add_argument("--test-parquet", type=Path, default=Path("artifacts/processed/bindingdb/test_lit_pcba.parquet"))
+    ap.add_argument("--adapter-ckpt", type=Path, default=Path("artifacts/adapter/checkpoints_ssl2/adapter_v1.pt"))
+    ap.add_argument("--protein-store", type=Path, default=Path("artifacts/protein_store/embeddings/esm2_650M"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--n-jobs", type=int, default=32)

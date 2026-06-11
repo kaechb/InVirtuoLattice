@@ -15,8 +15,8 @@ Pipeline (mirrors ``lattice/preprocessing/run_preprocessing.py``):
 Run as::
 
     python -m lattice.protein.precompute \\
-        --fasta 00_data/raw/targets.fasta \\
-        --store 03_protein_encoder/embeddings/esm2_650M/ \\
+        --fasta artifacts/raw/targets.fasta \\
+        --store artifacts/protein_store/embeddings/esm2_650M/ \\
         --batch-size 8 --device cuda
 """
 

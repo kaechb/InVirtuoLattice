@@ -1,10 +1,10 @@
 _target_: lattice_lab.data.EBMDataModule
 
-train_parquet: 01_preprocessing/processed_bindingdb/threshold_90/train.parquet
-val_parquet: 01_preprocessing/processed_bindingdb/threshold_90/val.parquet
-protein_store: 03_protein_encoder/embeddings/esm2_650M/
-decoy_store: 04_ebm_head/decoy_zm_ssl2/
-bdb_store: 04_ebm_head/bdb_zm_ssl2
+train_parquet: artifacts/processed/bindingdb/threshold_90/train.parquet
+val_parquet: artifacts/processed/bindingdb/threshold_90/val.parquet
+protein_store: artifacts/protein_store/embeddings/esm2_650M/
+decoy_store: artifacts/decoys/decoy_zm_ssl2/
+bdb_store: artifacts/decoys/bdb_zm_ssl2
 
 batch_size: 64
 n_decoys: ${n_decoys}
@@ -25,7 +25,7 @@ val_frac_non_binder: 0.15
 # MMseqs2 cluster-weighted protein sampling.
 cluster_weighted_sampler: false
 cluster_min_identity: 0.5
-cluster_cache_dir: 05_training/checkpoints
+cluster_cache_dir: artifacts/energy/checkpoints
 
 num_workers: 0
 seed: ${seed}

@@ -12,11 +12,11 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/lattice_smoke.XXXXXX")
 export WANDB_MODE=offline WANDB_DIR="$TMP" HYDRA_FULL_ERROR=1
 echo ">>> temp outputs: $TMP   (canonical 0X_ dirs are read-only)"
 
-PSTORE=03_protein_encoder/embeddings/esm2_650M
-DZM=04_ebm_head/decoy_zm_ssl2
-BDB=04_ebm_head/bdb_zm_ssl2
-ADP=02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt
-SRC=01_preprocessing/processed_bindingdb/threshold_90
+PSTORE=artifacts/protein_store/embeddings/esm2_650M
+DZM=artifacts/decoys/decoy_zm_ssl2
+BDB=artifacts/decoys/bdb_zm_ssl2
+ADP=artifacts/adapter/checkpoints_ssl2/adapter_v1.pt
+SRC=artifacts/processed/bindingdb/threshold_90
 
 # 1. Sample the real parquet (read-only) into the temp dir.
 python - "$TMP" "$SRC" <<'PY'

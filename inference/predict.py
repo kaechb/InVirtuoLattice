@@ -35,11 +35,11 @@ Example::
         --smiles-file  my_library.csv \\
         --binders      known_binders.smi \\
         --nonbinders   known_decoys.smi \\
-        --head-ckpt    05_training/checkpoints_gpu1/ebm_last.pt \\
-        --adapter-ckpt 02_backbone_adapter/checkpoints/adapter_v1.pt \\
+        --head-ckpt    artifacts/energy/checkpoints_gpu1/ebm_last.pt \\
+        --adapter-ckpt artifacts/adapter/checkpoints/adapter_v1.pt \\
         --target-name  THRB \\
-        --output-csv   07_inference/thrb_predictions.csv \\
-        --output-png   07_inference/thrb_affinity_violin.png
+        --output-csv   artifacts/predictions/thrb_predictions.csv \\
+        --output-png   artifacts/predictions/thrb_affinity_violin.png
 """
 
 from __future__ import annotations
@@ -88,10 +88,10 @@ class PredictConfig:
     smiles_file: Path
     binders_file: Path | None = None
     nonbinders_file: Path | None = None
-    head_ckpt: Path = Path("05_training/checkpoints_gpu1/ebm_last.pt")
-    adapter_ckpt: Path = Path("02_backbone_adapter/checkpoints/adapter_v1.pt")
-    output_csv: Path = Path("07_inference/predictions.csv")
-    output_png: Path = Path("07_inference/affinity_distribution.png")
+    head_ckpt: Path = Path("artifacts/energy/checkpoints_gpu1/ebm_last.pt")
+    adapter_ckpt: Path = Path("artifacts/adapter/checkpoints/adapter_v1.pt")
+    output_csv: Path = Path("artifacts/predictions/predictions.csv")
+    output_png: Path = Path("artifacts/predictions/affinity_distribution.png")
     target_name: str = "target"
     esm_model: str = ESM2_DEFAULT_MODEL
     batch_size: int = 256
@@ -518,13 +518,13 @@ def main() -> None:
                         help="optional SMILES file of KNOWN NON-BINDERS / random "
                              "molecules; added as a reference violin")
     parser.add_argument("--head-ckpt", type=Path,
-                        default=Path("05_training/checkpoints_gpu1/ebm_last.pt"))
+                        default=Path("artifacts/energy/checkpoints_gpu1/ebm_last.pt"))
     parser.add_argument("--adapter-ckpt", type=Path,
-                        default=Path("02_backbone_adapter/checkpoints/adapter_v1.pt"))
+                        default=Path("artifacts/adapter/checkpoints/adapter_v1.pt"))
     parser.add_argument("--output-csv", type=Path,
-                        default=Path("07_inference/predictions.csv"))
+                        default=Path("artifacts/predictions/predictions.csv"))
     parser.add_argument("--output-png", type=Path,
-                        default=Path("07_inference/affinity_distribution.png"))
+                        default=Path("artifacts/predictions/affinity_distribution.png"))
     parser.add_argument("--target-name", type=str, default="target",
                         help="label used in the CSV and the plot title")
     parser.add_argument("--esm-model", type=str, default=ESM2_DEFAULT_MODEL)

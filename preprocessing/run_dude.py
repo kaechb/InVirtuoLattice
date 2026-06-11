@@ -2,7 +2,7 @@
 
 DUD-E is a held-out test set only (no training rows, no homology split — that
 filtering lives in ``run_bindingdb.py`` for LIT-PCBA). This orchestrator just
-parses ``00_data/raw/dude/`` and writes, mirroring the LIT-PCBA test artifacts:
+parses ``artifacts/raw/dude/`` and writes, mirroring the LIT-PCBA test artifacts:
 
     <out>/test_dude.parquet      # one row per (target, ligand)
     <out>/dude_targets.fasta     # one entry per target (name -> receptor seq)
@@ -18,8 +18,8 @@ Idempotent: existing outputs are reused unless ``--overwrite`` is set.
 Example::
 
     python -m lattice.preprocessing.run_dude \\
-        --dude-dir   00_data/raw/dude \\
-        --output-dir 01_preprocessing/processed_dude
+        --dude-dir   artifacts/raw/dude \\
+        --output-dir artifacts/processed/moses_dude
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--dude-dir", type=Path, default=Path("00_data/raw/dude"),
+    p.add_argument("--dude-dir", type=Path, default=Path("artifacts/raw/dude"),
                    help="Directory with one subfolder per DUD-E target.")
     p.add_argument("--output-dir", type=Path,
-                   default=Path("01_preprocessing/processed_dude"))
+                   default=Path("artifacts/processed/moses_dude"))
     p.add_argument("--overwrite", action="store_true",
                    help="Re-write outputs even if they already exist.")
     p.add_argument("--log-level", default="INFO")

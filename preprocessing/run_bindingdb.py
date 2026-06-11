@@ -32,7 +32,7 @@ End-to-end pipeline:
             <out>/test_lit_pcba.parquet + lit_pcba_targets.fasta       # LIT-PCBA only
 
     The DUD-E **test** parquet + FASTA are produced separately by
-    ``lattice.preprocessing.run_dude`` (→ ``01_preprocessing/processed_dude/``);
+    ``lattice.preprocessing.run_dude`` (→ ``artifacts/processed/moses_dude/``);
     this script only needs the DUD-E target *sequences* to filter against.
 
 The script is **idempotent**: parquet files that already exist are skipped
@@ -42,16 +42,16 @@ Examples::
 
     # 90 % split held out against LIT-PCBA (the released default).
     python -m lattice.preprocessing.run_bindingdb \\
-        --bindingdb-tsv 00_data/raw/bindingdb/BindingDB_All.tsv \\
-        --lit-pcba-dir  00_data/raw/lit_pcba \\
-        --output-dir    01_preprocessing/processed_bindingdb \\
+        --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \\
+        --lit-pcba-dir  artifacts/raw/lit_pcba \\
+        --output-dir    artifacts/processed/bindingdb \\
         --identity      all --n-jobs 16
 
     # 90 % split held out against DUD-E (reuses the cached curated parquet).
     python -m lattice.preprocessing.run_bindingdb \\
-        --bindingdb-tsv 00_data/raw/bindingdb/BindingDB_All.tsv \\
-        --dude-dir      00_data/raw/dude \\
-        --output-dir    01_preprocessing/processed_bindingdb \\
+        --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \\
+        --dude-dir      artifacts/raw/dude \\
+        --output-dir    artifacts/processed/bindingdb \\
         --identity      90 --n-jobs 16
 """
 
@@ -170,12 +170,12 @@ def _split_by_uniprot_cluster(
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bindingdb-tsv", type=Path, required=True,
-                   help="Path to BindingDB_All.tsv (produced by 00_data/download_bindingdb.sh).")
+                   help="Path to BindingDB_All.tsv (produced by scripts/download_bindingdb.sh).")
     p.add_argument("--lit-pcba-dir", type=Path, default=None,
-                   help="Directory with one subfolder per LIT-PCBA target (00_data/raw/lit_pcba). "
+                   help="Directory with one subfolder per LIT-PCBA target (artifacts/raw/lit_pcba). "
                         "Held-out reference for the homology filter; mutually exclusive with --dude-dir.")
     p.add_argument("--dude-dir", type=Path, default=None,
-                   help="Directory with one subfolder per DUD-E target (00_data/raw/dude). "
+                   help="Directory with one subfolder per DUD-E target (artifacts/raw/dude). "
                         "Build the split held out against DUD-E instead of LIT-PCBA; "
                         "mutually exclusive with --lit-pcba-dir.")
     p.add_argument("--output-dir", type=Path, required=True)
@@ -218,7 +218,7 @@ def main() -> None:
         if not ref_targets:
             raise SystemExit(f"no DUD-E targets found in {args.dude_dir}")
         # DUD-E's test parquet + FASTA are written by lattice.preprocessing.run_dude
-        # (-> 01_preprocessing/processed_dude/); here we only need the sequences.
+        # (-> artifacts/processed/moses_dude/); here we only need the sequences.
     else:
         bench, suffix = "lit_pcba", ""
         ref_fasta = out_root / "lit_pcba_targets.fasta"

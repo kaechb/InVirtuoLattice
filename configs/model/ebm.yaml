@@ -1,6 +1,6 @@
 _target_: lattice_lab.models.EBMLitModule
 
-adapter_ckpt: 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt
+adapter_ckpt: artifacts/adapter/checkpoints_ssl2/adapter_v1.pt
 resume_from: null
 
 d_adapter: ${d_adapter}

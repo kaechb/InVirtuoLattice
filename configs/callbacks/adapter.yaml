@@ -20,7 +20,7 @@ sanity_gate:
   val_ratio: 0.005
   test_ratio: 0.005
   split_seed: 0
-  qm9_csv: 00_data/raw/qm9.csv
+  qm9_csv: artifacts/raw/qm9.csv
   qm9_n_subset: null
   batch_size: 64
   include_baselines: true

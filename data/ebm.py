@@ -61,7 +61,7 @@ class EBMDataModule(L.LightningDataModule):
         val_frac_non_binder: float = 0.15,
         cluster_weighted_sampler: bool = False,
         cluster_min_identity: float = 0.5,
-        cluster_cache_dir: str | Path = "05_training/checkpoints",
+        cluster_cache_dir: str | Path = "artifacts/energy/checkpoints",
         num_workers: int = 0,
         seed: int = 0,
     ) -> None:

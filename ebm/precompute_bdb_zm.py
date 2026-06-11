@@ -16,7 +16,7 @@ used by BigBind / DrugCLIP-DUDE:
   against the same protein and shown not to bind.
 
 This script writes a second :class:`EmbeddingStore` at the chosen path
-(default ``04_ebm_head/bdb_zm/``) plus a sidecar parquet
+(default ``artifacts/decoys/bdb_zm/``) plus a sidecar parquet
 (``index.parquet``) with one row per unique InChIKey carrying::
 
     inchikey, is_binder_any_target
@@ -59,9 +59,9 @@ INDEX_FILE = "index.parquet"
 
 @dataclass
 class BdbDecoyPrecomputeConfig:
-    bdb_parquet: Path = Path("01_preprocessing/processed_bindingdb/bindingdb_curated.parquet")
-    adapter_ckpt: Path = Path("02_backbone_adapter/checkpoints/adapter_v1.pt")
-    store_path: Path = Path("04_ebm_head/bdb_zm/")
+    bdb_parquet: Path = Path("artifacts/processed/bindingdb/bindingdb_curated.parquet")
+    adapter_ckpt: Path = Path("artifacts/adapter/checkpoints/adapter_v1.pt")
+    store_path: Path = Path("artifacts/decoys/bdb_zm/")
     batch_size: int = 256
     n_jobs: int = 1
     n_fragmol_layers: int = 4
@@ -252,11 +252,11 @@ def run(cfg: BdbDecoyPrecomputeConfig) -> dict[str, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bdb-parquet", type=Path,
-                        default=Path("01_preprocessing/processed_bindingdb/bindingdb_curated.parquet"))
+                        default=Path("artifacts/processed/bindingdb/bindingdb_curated.parquet"))
     parser.add_argument("--adapter-ckpt", type=Path,
-                        default=Path("02_backbone_adapter/checkpoints/adapter_v1.pt"))
+                        default=Path("artifacts/adapter/checkpoints/adapter_v1.pt"))
     parser.add_argument("--store", dest="store_path", type=Path,
-                        default=Path("04_ebm_head/bdb_zm/"))
+                        default=Path("artifacts/decoys/bdb_zm/"))
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-jobs", type=int, default=1,
                         help="Parallel workers for the CPU fragmolize step")

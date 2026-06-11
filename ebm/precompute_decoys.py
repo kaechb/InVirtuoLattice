@@ -77,9 +77,9 @@ def _tokenize_view_to_ids(view: str) -> list[int]:
 
 @dataclass
 class DecoyPrecomputeConfig:
-    shard_dir: Path = Path("01_preprocessing/processed")
-    adapter_ckpt: Path = Path("02_backbone_adapter/checkpoints/adapter_v1.pt")
-    store_path: Path = Path("04_ebm_head/decoy_zm/")
+    shard_dir: Path = Path("artifacts/processed/moses")
+    adapter_ckpt: Path = Path("artifacts/adapter/checkpoints/adapter_v1.pt")
+    store_path: Path = Path("artifacts/decoys/decoy_zm/")
     batch_size: int = 64
     n_jobs: int = 1
     n_fragmol_layers: int = 4
@@ -245,14 +245,14 @@ def run(cfg: DecoyPrecomputeConfig) -> dict[str, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shard-dir", type=Path, default=Path("01_preprocessing/processed"))
+    parser.add_argument("--shard-dir", type=Path, default=Path("artifacts/processed/moses"))
     parser.add_argument(
         "--adapter-ckpt", type=Path,
-        default=Path("02_backbone_adapter/checkpoints/adapter_v1.pt"),
+        default=Path("artifacts/adapter/checkpoints/adapter_v1.pt"),
     )
     parser.add_argument(
         "--store", dest="store_path", type=Path,
-        default=Path("04_ebm_head/decoy_zm/"),
+        default=Path("artifacts/decoys/decoy_zm/"),
     )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--n-jobs", type=int, default=1,

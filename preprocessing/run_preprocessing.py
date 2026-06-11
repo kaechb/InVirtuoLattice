@@ -8,7 +8,7 @@ output directory is idempotent: existing shards are skipped.
 Usage::
 
     python -m lattice.preprocessing.run_preprocessing \\
-        --input data/raw.smi --output 01_preprocessing/processed/ \\
+        --input data/raw.smi --output artifacts/processed/moses/ \\
         --n-views 3 --n-jobs 16
 """
 

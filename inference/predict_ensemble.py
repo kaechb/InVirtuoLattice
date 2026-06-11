@@ -17,16 +17,16 @@ fly) or as an id already in a precomputed protein store.
 Example:
 
     python -m lattice.inference.predict_ensemble \
-        --head-ckpts 05_training/checkpoints/seed0.pt \
-                     05_training/checkpoints/seed1.pt \
-                     05_training/checkpoints/seed2.pt \
-        --adapter-ckpt 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt \
+        --head-ckpts artifacts/energy/checkpoints/seed0.pt \
+                     artifacts/energy/checkpoints/seed1.pt \
+                     artifacts/energy/checkpoints/seed2.pt \
+        --adapter-ckpt artifacts/adapter/checkpoints_ssl2/adapter_v1.pt \
         --target-fasta thrb.fasta --target-name THRB \
         --smiles-file  my_library.csv \
         --binders      known_binders.smi \
         --nonbinders   known_decoys.smi \
-        --output-csv   07_inference/thrb_predictions.csv \
-        --output-png   07_inference/thrb_affinity_violin.png
+        --output-csv   artifacts/predictions/thrb_predictions.csv \
+        --output-png   artifacts/predictions/thrb_affinity_violin.png
 """
 from __future__ import annotations
 
@@ -89,8 +89,8 @@ def main() -> None:
     ap.add_argument("--target", type=str, help="protein id in --protein-store")
     ap.add_argument("--target-name", type=str, default="target", help="label for CSV / plots")
     # outputs / misc
-    ap.add_argument("--output-csv", type=Path, default=Path("07_inference/predictions.csv"))
-    ap.add_argument("--output-png", type=Path, default=Path("07_inference/affinity_distribution.png"))
+    ap.add_argument("--output-csv", type=Path, default=Path("artifacts/predictions/predictions.csv"))
+    ap.add_argument("--output-png", type=Path, default=Path("artifacts/predictions/affinity_distribution.png"))
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--n-jobs", type=int, default=1)
     ap.add_argument("--n-views", type=int, default=4,

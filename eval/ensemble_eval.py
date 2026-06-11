@@ -10,14 +10,14 @@ encoding is needed and the whole thing runs comfortably on CPU — handy when bo
 GPUs are busy training. Optionally writes a per-target actives-vs-inactives
 energy violin (``--violin-dir``) for the separation check.
 
-    python 05_training/ensemble_eval.py \
-        --ckpts 05_training/exp_hardneg_seed0/ebm_best_ef1.pt \
-                05_training/exp_hardneg_seed1/ebm_best_ef1.pt \
-                05_training/exp_hardneg_seed2/ebm_best_ef1.pt \
-        --zm-cache      06_evaluation/lit_pcba_zm_hardneg \
-        --protein-store 03_protein_encoder/embeddings/esm2_650M \
-        --test-parquet  01_preprocessing/processed_bindingdb/test_lit_pcba.parquet \
-        --out           06_evaluation/ensemble_hardneg.json
+    python artifacts/energy/ensemble_eval.py \
+        --ckpts artifacts/energy/exp_hardneg_seed0/ebm_best_ef1.pt \
+                artifacts/energy/exp_hardneg_seed1/ebm_best_ef1.pt \
+                artifacts/energy/exp_hardneg_seed2/ebm_best_ef1.pt \
+        --zm-cache      artifacts/evaluation/lit_pcba_zm_hardneg \
+        --protein-store artifacts/protein_store/embeddings/esm2_650M \
+        --test-parquet  artifacts/processed/bindingdb/test_lit_pcba.parquet \
+        --out           artifacts/evaluation/ensemble_hardneg.json
 """
 from __future__ import annotations
 
@@ -76,8 +76,8 @@ def main() -> None:
     ap.add_argument("--zm-cache", type=Path, required=True)
     ap.add_argument("--protein-store", type=Path, required=True)
     ap.add_argument("--test-parquet", type=Path,
-                    default=Path("01_preprocessing/processed_bindingdb/test_lit_pcba.parquet"))
-    ap.add_argument("--out", type=Path, default=Path("06_evaluation/ensemble_eval.json"))
+                    default=Path("artifacts/processed/bindingdb/test_lit_pcba.parquet"))
+    ap.add_argument("--out", type=Path, default=Path("artifacts/evaluation/ensemble_eval.json"))
     ap.add_argument("--violin-dir", type=Path, default=None)
     ap.add_argument("--bedroc-alpha", type=float, default=80.5)
     ap.add_argument("--n-jobs", type=int, default=12)

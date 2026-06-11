@@ -8,7 +8,7 @@ one-shot converter bridges the two:
 
     python -m lattice_lab.export_adapter \
         --ckpt   lattice_lab/logs/train/<run>/checkpoints/last.ckpt \
-        --output 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt
+        --output artifacts/adapter/checkpoints_ssl2/adapter_v1.pt
 """
 
 from __future__ import annotations

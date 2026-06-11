@@ -5,9 +5,9 @@ with experimentally-determined actives and a much larger pool of decoys (sourced
 from PubChem BioAssay). DrugCLIP uses it zero-shot — train on BindingDB / BioLiP,
 evaluate retrieval (EF@1%) per target.
 
-This module loads a LIT-PCBA dump prepared by ``00_data/copy_lit_pcba.sh``:
+This module loads a LIT-PCBA dump prepared by ``scripts/copy_lit_pcba.sh``:
 
-    00_data/raw/lit_pcba/<TARGET>/
+    artifacts/raw/lit_pcba/<TARGET>/
         actives.smi               (SMILES <tab/space> PubChem CID)
         inactives.smi             (same format)
         <pdb>_protein.mol2        one representative protein structure / target

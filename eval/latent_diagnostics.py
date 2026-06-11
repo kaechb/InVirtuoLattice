@@ -89,11 +89,11 @@ class DiagnosticsConfig:
     adapter_ckpt: Path
     source: str = "lit-pcba"             # "lit-pcba" (held-out test) or "val"
     test_parquet: Path = Path(
-        "01_preprocessing/processed_bindingdb/test_lit_pcba.parquet"
+        "artifacts/processed/bindingdb/test_lit_pcba.parquet"
     )
-    protein_store: Path = Path("03_protein_encoder/embeddings/esm2_650M/")
+    protein_store: Path = Path("artifacts/protein_store/embeddings/esm2_650M/")
     decoy_store: Path | None = None      # decoy z_m pool, enables figure 6
-    output_dir: Path = Path("06_evaluation/latent_diagnostics/")
+    output_dir: Path = Path("artifacts/evaluation/latent_diagnostics/")
     n_inactives: int = 1500              # inactives sampled for the t-SNE
     n_targets: int = 40                  # cap on targets used
     actives_per_target: int = 60         # actives sampled per target
@@ -603,12 +603,12 @@ def main() -> None:
                         help="source parquet; defaults per --source to the "
                              "LIT-PCBA test parquet or the threshold_90 val split")
     parser.add_argument("--protein-store", type=Path,
-                        default=Path("03_protein_encoder/embeddings/esm2_650M/"))
+                        default=Path("artifacts/protein_store/embeddings/esm2_650M/"))
     parser.add_argument("--decoy-store", type=Path, default=None,
-                        help="decoy z_m pool (e.g. 04_ebm_head/decoy_zm/); "
+                        help="decoy z_m pool (e.g. artifacts/decoys/decoy_zm/); "
                              "enables figure 6; must match --adapter-ckpt")
     parser.add_argument("--output-dir", type=Path,
-                        default=Path("06_evaluation/latent_diagnostics/"))
+                        default=Path("artifacts/evaluation/latent_diagnostics/"))
     parser.add_argument("--n-inactives", type=int, default=1500,
                         help="inactives sampled for the t-SNE figures")
     parser.add_argument("--n-targets", type=int, default=40,
@@ -632,9 +632,9 @@ def main() -> None:
     test_parquet = args.test_parquet
     if test_parquet is None:
         test_parquet = (
-            Path("01_preprocessing/processed_bindingdb/test_lit_pcba.parquet")
+            Path("artifacts/processed/bindingdb/test_lit_pcba.parquet")
             if args.source == "lit-pcba"
-            else Path("01_preprocessing/processed_bindingdb/threshold_90/val.parquet")
+            else Path("artifacts/processed/bindingdb/threshold_90/val.parquet")
         )
 
     run(DiagnosticsConfig(

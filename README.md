@@ -47,7 +47,25 @@ lattice_lab/
 ├── eval/                      #    metrics, sanity checks, LIT-PCBA / DUD-E harnesses
 ├── inference/                 #    virtual-screening predictors
 ├── training/                  #    ssl_dataset, ssl_loss, run_logger
+│
+├── scripts/                   # data-download CLIs + DATASETS.md
+├── artifacts/                 # all pipeline data (git-ignored; tree below)
 └── pyproject.toml             # standalone package metadata
+```
+
+All pipeline inputs/outputs live under one git-ignored `artifacts/` tree
+(meaningful names, no numeric stage prefixes):
+
+```
+artifacts/
+├── raw/            # downloads: moses.csv, qm9.csv, bindingdb/, lit_pcba/, dude/
+├── processed/      # Stage 1: bindingdb/threshold_90/*.parquet, moses/shard_*.parquet, *.fasta
+├── adapter/        # Stage 2: adapter checkpoints (adapter_v1.pt)
+├── protein_store/  # Stage 3: frozen ESM-2 embedding store
+├── decoys/         # Stage 4: decoy + BindingDB z_m pools
+├── energy/         # Stage 5: EBM head checkpoints
+├── evaluation/     # Stage 6: LIT-PCBA caches, results, violins
+└── predictions/    # Stage 7: inference outputs
 ```
 
 ```
@@ -70,8 +88,8 @@ can't silently disagree. `model.num_steps = ${trainer.max_steps}` and
 ## Usage
 
 Data paths in `configs/data/*.yaml` are relative to the working directory and
-Hydra keeps the CWD (`hydra.job.chdir=false`), so run from wherever the
-`00_data/ … 05_training/` stage dirs live (the monorepo root today).
+Hydra keeps the CWD (`hydra.job.chdir=false`), so run from the repo root — all
+pipeline inputs/outputs live under `artifacts/` (see the tree below).
 
 ```bash
 # Stage 5 — EBM head
@@ -89,47 +107,47 @@ python -m lattice_lab.train experiment=ebm_baseline model.learning_rate=1e-4 tra
 python -m lattice_lab.train experiment=ebm_baseline trainer=smoke logger=none
 
 # Evaluate a checkpoint (held-out EF/BEDROC via Trainer.validate)
-python -m lattice_lab.evaluate ckpt_path=lattice_lab/logs/train/<run>/checkpoints/last.ckpt
+python -m lattice_lab.evaluate ckpt_path=logs/train/<run>/checkpoints/last.ckpt
 ```
 
 ## End-to-end pipeline
 
 Every stage lives **inside this package** (no `import lattice`). The data-prep,
 encoding and eval stages are argparse CLIs (one-shot data jobs); training is
-Hydra/Lightning. Run from the directory holding the `00_data/ … 07_inference/`
-stage folders. Paths below match the released `ssl2` artifact set.
+Hydra/Lightning. Run from the repo root; all stage data lives under `artifacts/`.
+Paths below match the released `ssl2` artifact set.
 
 ### Stage 0 — Data acquisition
 
-Download scripts live in `00_data/` (they travel with the data dirs, not the
-package). See `00_data/README.md` for dataset details, sizes, and licences.
+Download scripts live in `scripts/` and write into `artifacts/raw/`. See
+`scripts/DATASETS.md` for dataset details, sizes, and licences.
 
 ```bash
-# MOSES — molecules for adapter self-supervision        → 00_data/raw/moses.csv
-bash 00_data/download_moses.sh
+# MOSES — molecules for adapter self-supervision        → artifacts/raw/moses.csv
+bash scripts/download_moses.sh
 
-# BindingDB-All — full monthly dump (~3.2M measurements) → 00_data/raw/bindingdb/
+# BindingDB-All — full monthly dump (~3.2M measurements) → artifacts/raw/bindingdb/
 # Pick the latest YYYYMM release from
 # https://www.bindingdb.org/rwd/bind/chemsearch/marvin/Download.jsp
 # download_bindingdb.sh is idempotent: if BindingDB_All.tsv already exists it
 # will NOT re-fetch. Delete stale files before refreshing:
-#   rm -f 00_data/raw/bindingdb/BindingDB_All.tsv 00_data/raw/bindingdb/BindingDB_All_*.tsv.zip
-BINDINGDB_DATE=202606 bash 00_data/download_bindingdb.sh
+#   rm -f artifacts/raw/bindingdb/BindingDB_All.tsv artifacts/raw/bindingdb/BindingDB_All_*.tsv.zip
+BINDINGDB_DATE=202606 bash scripts/download_bindingdb.sh
 
 # Sanity-check before Stage 1 (a truncated TSV silently poisons every later stage):
-wc -l 00_data/raw/bindingdb/BindingDB_All.tsv          # ~3.1–3.2M lines incl. header
-ls -lh 00_data/raw/bindingdb/BindingDB_All_*.tsv.zip   # zip ~550–570 MB; TSV ~3 GB
+wc -l artifacts/raw/bindingdb/BindingDB_All.tsv          # ~3.1–3.2M lines incl. header
+ls -lh artifacts/raw/bindingdb/BindingDB_All_*.tsv.zip   # zip ~550–570 MB; TSV ~3 GB
 
-# LIT-PCBA held-out benchmark                            → 00_data/raw/lit_pcba/
-mkdir -p 00_data/downloads
-curl -fL -C - -o 00_data/downloads/LIT-PCBA.zip \
+# LIT-PCBA held-out benchmark                            → artifacts/raw/lit_pcba/
+mkdir -p artifacts/downloads
+curl -fL -C - -o artifacts/downloads/LIT-PCBA.zip \
   'https://huggingface.co/datasets/THU-ATOM/DrugCLIP_data/resolve/main/LIT-PCBA.zip'
-unzip -q 00_data/downloads/LIT-PCBA.zip -d 00_data/downloads
-LIT_PCBA_SRC=00_data/downloads/lit_pcba bash 00_data/copy_lit_pcba.sh
+unzip -q artifacts/downloads/LIT-PCBA.zip -d artifacts/downloads
+LIT_PCBA_SRC=artifacts/downloads/lit_pcba bash scripts/copy_lit_pcba.sh
 
-# DUD-E benchmark (optional secondary eval)              → 00_data/raw/dude/
+# DUD-E benchmark (optional secondary eval)              → artifacts/raw/dude/
 # 102 targets from dude.docking.org; override the mirror with DUDE_BASE_URL=<url>.
-bash 00_data/download_dude.sh
+bash scripts/download_dude.sh
 ```
 
 ### MMseqs2 (required for Stage 1)
@@ -158,52 +176,52 @@ environment setup.
 # Curate BindingDB + build the 90% MMseqs2 identity split held out vs LIT-PCBA.
 # Needs MMseqs2 (hard dep). LATTICE_ALLOW_KMER_FALLBACK=1 only for smoke/tests.
 python -m lattice_lab.preprocessing.run_bindingdb \
-    --bindingdb-tsv 00_data/raw/bindingdb/BindingDB_All.tsv \
-    --lit-pcba-dir  00_data/raw/lit_pcba \
-    --output-dir    01_preprocessing/processed_bindingdb \
+    --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \
+    --lit-pcba-dir  artifacts/raw/lit_pcba \
+    --output-dir    artifacts/processed/bindingdb \
     --identity 90 --n-jobs 16
 
 # Canonicalise MOSES (adapter SSL set) into FragMol-view parquet shards.
 python -m lattice_lab.preprocessing.run_preprocessing \
-    --input  00_data/raw/moses.csv \
-    --output 01_preprocessing/processed_moses \
+    --input  artifacts/raw/moses.csv \
+    --output artifacts/processed/moses \
     --n-views 3 --n-jobs 16
 ```
 
 ### Stage 2 — Molecule encoder (FragMol + adapter SSL)
 ```bash
 python -m lattice_lab.train experiment=adapter_fp \
-    data.shard_dir=01_preprocessing/processed_moses \
+    data.shard_dir=artifacts/processed/moses \
     data.use_fp=true model.fp_weight=2.0 \
     trainer.max_epochs=10 data.batch_size=512 \
-    callbacks.model_checkpoint.dirpath=02_backbone_adapter/checkpoints_ssl2
+    callbacks.model_checkpoint.dirpath=artifacts/adapter/checkpoints_ssl2
 
 # Convert the best Lightning .ckpt → legacy adapter_v1.pt that the next stages load:
 python -m lattice_lab.export_adapter \
-    --ckpt   02_backbone_adapter/checkpoints_ssl2/last.ckpt \
-    --output 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt
+    --ckpt   artifacts/adapter/checkpoints_ssl2/last.ckpt \
+    --output artifacts/adapter/checkpoints_ssl2/adapter_v1.pt
 ```
 
 ### Stage 3 — Protein encoder (frozen ESM-2 650M)
 ```bash
 python -m lattice_lab.protein.precompute \
-    --fasta 01_preprocessing/processed_bindingdb/bindingdb_targets.fasta \
-    --store 03_protein_encoder/embeddings/esm2_650M --model-name esm2_t33_650M_UR50D
+    --fasta artifacts/processed/bindingdb/bindingdb_targets.fasta \
+    --store artifacts/protein_store/embeddings/esm2_650M --model-name esm2_t33_650M_UR50D
 python -m lattice_lab.protein.precompute \
-    --fasta 01_preprocessing/processed_bindingdb/lit_pcba_targets.fasta \
-    --store 03_protein_encoder/embeddings/esm2_650M --model-name esm2_t33_650M_UR50D
+    --fasta artifacts/processed/bindingdb/lit_pcba_targets.fasta \
+    --store artifacts/protein_store/embeddings/esm2_650M --model-name esm2_t33_650M_UR50D
 ```
 
 ### Stage 4 — Decoy `z_m` pools (run BOTH before Stage 5)
 ```bash
 python -m lattice_lab.ebm.precompute_decoys \
-    --shard-dir 01_preprocessing/processed_moses \
-    --adapter-ckpt 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt \
-    --store 04_ebm_head/decoy_zm_ssl2 --batch-size 512
+    --shard-dir artifacts/processed/moses \
+    --adapter-ckpt artifacts/adapter/checkpoints_ssl2/adapter_v1.pt \
+    --store artifacts/decoys/decoy_zm_ssl2 --batch-size 512
 python -m lattice_lab.ebm.precompute_bdb_zm \
-    --bdb-parquet 01_preprocessing/processed_bindingdb/threshold_90/train.parquet \
-    --adapter-ckpt 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt \
-    --store 04_ebm_head/bdb_zm_ssl2 --batch-size 512
+    --bdb-parquet artifacts/processed/bindingdb/threshold_90/train.parquet \
+    --adapter-ckpt artifacts/adapter/checkpoints_ssl2/adapter_v1.pt \
+    --store artifacts/decoys/bdb_zm_ssl2 --batch-size 512
 ```
 
 ### Stage 5 — Energy-head training (3 seeds)
@@ -211,7 +229,7 @@ python -m lattice_lab.ebm.precompute_bdb_zm \
 for S in 0 1 2; do
   python -m lattice_lab.train experiment=ebm_hardneg \
     model.head_arch=film trainer.max_steps=12000 seed=$S \
-    callbacks.model_checkpoint.dirpath=05_training/exp_hardneg_seed$S/checkpoints
+    callbacks.model_checkpoint.dirpath=artifacts/energy/exp_hardneg_seed$S/checkpoints
 done
 ```
 `ebm_hardneg` sets `data.hard_mining_mult=3` + the 0.4/0.15 hard-neg mix.
@@ -221,29 +239,29 @@ done
 ```bash
 # 1. Build the 4-view LIT-PCBA z_m cache.
 python -m lattice_lab.eval.build_multiview_cache \
-    --n-views 4 --zm-cache 06_evaluation/lit_pcba_zm_mv4 \
-    --adapter-ckpt 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt --n-jobs 4
+    --n-views 4 --zm-cache artifacts/evaluation/lit_pcba_zm_mv4 \
+    --adapter-ckpt artifacts/adapter/checkpoints_ssl2/adapter_v1.pt --n-jobs 4
 
 # 2. Score the 3-seed ensemble (the reported result).
 python -m lattice_lab.eval.ensemble_eval \
-    --ckpts 05_training/exp_hardneg_seed{0,1,2}/checkpoints/last.ckpt \
-    --zm-cache 06_evaluation/lit_pcba_zm_mv4 \
-    --protein-store 03_protein_encoder/embeddings/esm2_650M \
-    --test-parquet 01_preprocessing/processed_bindingdb/test_lit_pcba.parquet \
-    --out 06_evaluation/ensemble_hardneg_mv4.json --n-jobs 32
+    --ckpts artifacts/energy/exp_hardneg_seed{0,1,2}/checkpoints/last.ckpt \
+    --zm-cache artifacts/evaluation/lit_pcba_zm_mv4 \
+    --protein-store artifacts/protein_store/embeddings/esm2_650M \
+    --test-parquet artifacts/processed/bindingdb/test_lit_pcba.parquet \
+    --out artifacts/evaluation/ensemble_hardneg_mv4.json --n-jobs 32
 
 # Held-out (in-distribution) ranking metrics for a single checkpoint:
-python -m lattice_lab.evaluate ckpt_path=05_training/exp_hardneg_seed0/checkpoints/last.ckpt
+python -m lattice_lab.evaluate ckpt_path=artifacts/energy/exp_hardneg_seed0/checkpoints/last.ckpt
 ```
 
 ### Stage 7 — Inference / virtual screening
 ```bash
 python -m lattice_lab.inference.predict_ensemble \
-    --head-ckpts 05_training/exp_hardneg_seed{0,1,2}/checkpoints/last.ckpt \
-    --adapter-ckpt 02_backbone_adapter/checkpoints_ssl2/adapter_v1.pt \
+    --head-ckpts artifacts/energy/exp_hardneg_seed{0,1,2}/checkpoints/last.ckpt \
+    --adapter-ckpt artifacts/adapter/checkpoints_ssl2/adapter_v1.pt \
     --target-fasta thrb.fasta --target-name THRB \
     --smiles-file my_library.csv --n-views 4 \
-    --output-csv 07_inference/thrb_predictions.csv
+    --output-csv artifacts/predictions/thrb_predictions.csv
 ```
 
 > **Note on checkpoint formats.** The precompute / inference CLIs and
@@ -257,7 +275,7 @@ python -m lattice_lab.inference.predict_ensemble \
 
 ## Not re-homed (intentionally)
 
-The `05_training/` ablation tooling (`run_ablations.py`, `collect_ablation_results.py`,
+The `artifacts/energy/` ablation tooling (`run_ablations.py`, `collect_ablation_results.py`,
 the reproduce/sweep shell scripts) is monorepo experiment-management, not part of
 the model pipeline — it stays in the monorepo.
 

@@ -47,12 +47,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LitPcbaEvalConfig:
-    test_parquet: Path = Path("01_preprocessing/processed_bindingdb/test_lit_pcba.parquet")
-    head_ckpt: Path = Path("05_training/checkpoints/ebm_last.pt")
-    adapter_ckpt: Path = Path("02_backbone_adapter/checkpoints/adapter_v1.pt")
-    protein_store: Path = Path("03_protein_encoder/embeddings/esm2_650M/")
-    zm_cache: Path = Path("06_evaluation/lit_pcba_zm/")
-    output_csv: Path = Path("06_evaluation/lit_pcba_results.csv")
+    test_parquet: Path = Path("artifacts/processed/bindingdb/test_lit_pcba.parquet")
+    head_ckpt: Path = Path("artifacts/energy/checkpoints/ebm_last.pt")
+    adapter_ckpt: Path = Path("artifacts/adapter/checkpoints/adapter_v1.pt")
+    protein_store: Path = Path("artifacts/protein_store/embeddings/esm2_650M/")
+    zm_cache: Path = Path("artifacts/evaluation/lit_pcba_zm/")
+    output_csv: Path = Path("artifacts/evaluation/lit_pcba_results.csv")
     violin_dir: Path | None = None      # if set, write a per-target energy violin PNG
     batch_size: int = 256
     n_jobs: int = 1                     # parallel workers for CPU fragmolize step
@@ -485,17 +485,17 @@ def evaluate(cfg: LitPcbaEvalConfig) -> pd.DataFrame:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--test-parquet", type=Path,
-                        default=Path("01_preprocessing/processed_bindingdb/test_lit_pcba.parquet"))
+                        default=Path("artifacts/processed/bindingdb/test_lit_pcba.parquet"))
     parser.add_argument("--head-ckpt", type=Path,
-                        default=Path("05_training/checkpoints/ebm_last.pt"))
+                        default=Path("artifacts/energy/checkpoints/ebm_last.pt"))
     parser.add_argument("--adapter-ckpt", type=Path,
-                        default=Path("02_backbone_adapter/checkpoints/adapter_v1.pt"))
+                        default=Path("artifacts/adapter/checkpoints/adapter_v1.pt"))
     parser.add_argument("--protein-store", type=Path,
-                        default=Path("03_protein_encoder/embeddings/esm2_650M/"))
+                        default=Path("artifacts/protein_store/embeddings/esm2_650M/"))
     parser.add_argument("--zm-cache", type=Path,
-                        default=Path("06_evaluation/lit_pcba_zm/"))
+                        default=Path("artifacts/evaluation/lit_pcba_zm/"))
     parser.add_argument("--output-csv", type=Path,
-                        default=Path("06_evaluation/lit_pcba_results.csv"))
+                        default=Path("artifacts/evaluation/lit_pcba_results.csv"))
     parser.add_argument("--violin-dir", type=Path, default=None,
                         help="if set, write a per-target energy-distribution violin "
                              "PNG (actives vs inactives) here, matching Stage-7 inference")

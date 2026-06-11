@@ -27,3 +27,6 @@ software/
 # Core dumps
 core
 core.*
+
+# Pipeline data (downloaded + generated; large, reproduced by the pipeline)
+artifacts/
