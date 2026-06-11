@@ -46,6 +46,8 @@ MODULES = [
     "lattice_lab.backbone.adapter",
     "lattice_lab.backbone.encoder",
     "lattice_lab.backbone.fragmol_loader",
+    "lattice_lab.backbone.ddit.rotary",
+    "lattice_lab.backbone.ddit.model_ddit",
     "lattice_lab.protein.store",
     "lattice_lab.ebm.dataset",
     "lattice_lab.ebm.head",

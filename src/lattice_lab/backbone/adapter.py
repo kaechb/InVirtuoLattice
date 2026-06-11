@@ -9,6 +9,8 @@ Total parameter target: ~10M (4-layer, 8-head, d=512 encoder is the dominant
 chunk; linear projection contributes ~1.5M for 4×768 → 512).
 """
 
+#TODO: this the input_layer makes 0 sense - just take the normal layers of the pretrained transformers so we dont add a shitton of parameters for nothing
+
 from __future__ import annotations
 
 import math
