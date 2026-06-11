@@ -139,11 +139,10 @@ wc -l artifacts/raw/bindingdb/BindingDB_All.tsv          # ~3.1–3.2M lines inc
 ls -lh artifacts/raw/bindingdb/BindingDB_All_*.tsv.zip   # zip ~550–570 MB; TSV ~3 GB
 
 # LIT-PCBA held-out benchmark                            → artifacts/raw/lit_pcba/
-mkdir -p artifacts/downloads
-curl -fL -C - -o artifacts/downloads/LIT-PCBA.zip \
-  'https://huggingface.co/datasets/THU-ATOM/DrugCLIP_data/resolve/main/LIT-PCBA.zip'
-unzip -q artifacts/downloads/LIT-PCBA.zip -d artifacts/downloads
-LIT_PCBA_SRC=artifacts/downloads/lit_pcba bash scripts/copy_lit_pcba.sh
+# Downloads via huggingface_hub (CDN + retry/resume), unzips, and stages it.
+# Robust to HF rate-limiting (HTTP 429), common from shared cluster IPs — export
+# HF_TOKEN to raise the anonymous limit if it still throttles.
+bash scripts/download_lit_pcba.sh
 
 # DUD-E benchmark (optional secondary eval)              → artifacts/raw/dude/
 # 102 targets from dude.docking.org; override the mirror with DUDE_BASE_URL=<url>.

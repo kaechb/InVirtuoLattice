@@ -38,11 +38,9 @@ wc -l artifacts/raw/bindingdb/BindingDB_All.tsv          # ~3.1–3.2M lines inc
 ls -lh artifacts/raw/bindingdb/BindingDB_All_*.tsv.zip # zip ~550–570 MB, not ~130 MB
 
 # Stage 0c — LIT-PCBA (Stage 6 held-out benchmark).
-mkdir -p artifacts/downloads
-curl -fL -C - -o artifacts/downloads/LIT-PCBA.zip \
-  'https://huggingface.co/datasets/THU-ATOM/DrugCLIP_data/resolve/main/LIT-PCBA.zip'
-unzip -q artifacts/downloads/LIT-PCBA.zip -d artifacts/downloads
-LIT_PCBA_SRC=artifacts/downloads/lit_pcba bash scripts/copy_lit_pcba.sh
+# Downloads via huggingface_hub (CDN + retry/resume; robust to HTTP 429),
+# unzips, and stages into artifacts/raw/lit_pcba/. Set HF_TOKEN if throttled.
+bash scripts/download_lit_pcba.sh
 # The _feat_cache subfolder is intentionally skipped — 3D-coord cache from another pipeline.
 ```
 
