@@ -187,6 +187,21 @@ the squashfs env. (Fallback URL: the `mmseqs-linux-avx2.tar.gz` asset on
 github.com/soedinglab/MMseqs2/releases.) See `setup_lumi.md` for the full LUMI
 environment setup.
 
+### FragMol backbone (required for Stage 1+)
+
+The frozen FragMol backbone is a large (~1 GB) external dependency and is **not**
+shipped in this repo (`software/` is git-ignored). Stage 1 fragmolization needs
+its `utils.fragments` module; Stage 2+ needs its weights. Place it at
+`software/FragMol/` (so `software/FragMol/utils/fragments.py` exists), or point
+elsewhere without copying:
+
+```bash
+export LATTICE_FRAGMOL_DIR=/shared/path/to/FragMol
+```
+
+If it's missing you'll get a clear `FileNotFoundError: FragMol backbone not
+found at …` rather than a cryptic `No module named 'utils'`.
+
 ### Stage 1 — Preprocessing
 If you are on LUMI - use this:
 ```bash
