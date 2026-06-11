@@ -1,0 +1,41 @@
+pair_id,smiles_a,smiles_b,category
+1,O=C(O)Cc1ccccc1,c1ccc(Cc2[nH]nnn2)cc1,COOH<->tetrazole
+2,O=C(O)c1ccc(C)cc1,Cc1ccc(-c2[nH]nnn2)cc1,COOH<->tetrazole
+3,O=C(O)c1ccccc1Cl,Clc1ccccc1-c1[nH]nnn1,COOH<->tetrazole
+4,O=C(O)c1cccnc1,c1ncccc1-c1[nH]nnn1,COOH<->tetrazole
+5,O=C(O)CCc1ccccc1,c1ccc(CCc2[nH]nnn2)cc1,COOH<->tetrazole
+6,O=C(O)c1ccccc1,NS(=O)(=O)c1ccccc1,COOH<->SO2NH2
+7,O=C(O)c1ccc(Cl)cc1,NS(=O)(=O)c1ccc(Cl)cc1,COOH<->SO2NH2
+8,CC(=O)c1ccccc1,CC(=S)c1ccccc1,C=O<->C=S
+9,CCC(=O)c1ccccc1,CCC(=S)c1ccccc1,C=O<->C=S
+10,O=C(c1ccccc1)c1ccccc1,S=C(c1ccccc1)c1ccccc1,C=O<->C=S
+11,COc1ccccc1Cl,CSc1ccccc1Cl,OMe<->SMe
+12,COc1ccc(C)cc1,CSc1ccc(C)cc1,OMe<->SMe
+13,COc1ccncc1,CSc1ccncc1,OMe<->SMe
+14,Oc1ccc(C)cc1,Nc1ccc(C)cc1,OH<->NH2
+15,Oc1cccc(Cl)c1,Nc1cccc(Cl)c1,OH<->NH2
+16,Cc1ccc(C(=O)O)cc1,Clc1ccc(C(=O)O)cc1,CH3<->Cl
+17,Cc1ccc(O)cc1,Clc1ccc(O)cc1,CH3<->Cl
+18,Cc1ccc(N)cc1,Clc1ccc(N)cc1,CH3<->Cl
+19,CC(=O)c1ccccc1,CC(=O)c1ccncc1,benzene<->pyridine
+20,NCc1ccccc1,NCc1ccncc1,benzene<->pyridine
+21,CCCOc1ccccc1,CCCOc1ccncc1,benzene<->pyridine
+22,O=C(O)c1ccccc1,O=C(O)c1cccs1,benzene<->thiophene
+23,CC(=O)c1ccc(C)cc1,CC(=O)c1ccc(C)s1,benzene<->thiophene
+24,CCOC(=O)c1ccccc1,CCNC(=O)c1ccccc1,ester<->amide
+25,COC(=O)c1ccc(Cl)cc1,CNC(=O)c1ccc(Cl)cc1,ester<->amide
+26,c1ccc(Oc2ccccc2)cc1,c1ccc(Sc2ccccc2)cc1,O<->S linker
+27,c1ccc(OCc2ccccc2)cc1,c1ccc(SCc2ccccc2)cc1,O<->S linker
+28,c1ccc(Oc2ccccc2)cc1,c1ccc(Nc2ccccc2)cc1,O<->N linker
+29,CCOc1ccccc1,CCNc1ccccc1,O<->N linker
+30,O=C(O)C1CCCCC1,O=C(O)c1ccccc1,cyclohexyl<->phenyl
+31,NC1CCCCC1,Nc1ccccc1,cyclohexyl<->phenyl
+32,FC(F)(F)c1ccccc1,N#Cc1ccccc1,CF3<->CN
+33,FC(F)(F)c1ccc(C(=O)O)cc1,N#Cc1ccc(C(=O)O)cc1,CF3<->CN
+34,CC(=O)Nc1ccccc1,CNC(=O)Nc1ccccc1,amide<->urea
+35,CC(=O)c1ccco1,CC(=O)c1cccs1,furan<->thiophene
+36,O=C(O)c1ccc[nH]1,O=C(O)c1ccco1,pyrrole<->furan
+37,c1ccc(Cc2ccccc2)cc1,c1ccc(Oc2ccccc2)cc1,CH2<->O linker
+38,O=C(O)CCCc1ccccc1,c1ccc(CCCc2[nH]nnn2)cc1,COOH<->tetrazole
+39,O=C(O)c1ccc(F)cc1,O=C(O)c1ccc(Cl)cc1,F<->Cl
+40,Fc1ccc(C(C)=O)cc1,Clc1ccc(C(C)=O)cc1,F<->Cl

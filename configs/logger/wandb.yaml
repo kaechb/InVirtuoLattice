@@ -1,0 +1,7 @@
+wandb:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: lattice
+  name: null
+  save_dir: ${paths.output_dir}
+  tags: ${tags}
+  log_model: false

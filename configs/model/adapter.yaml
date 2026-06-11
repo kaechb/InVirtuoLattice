@@ -1,0 +1,17 @@
+_target_: lattice_lab.models.AdapterLitModule
+
+n_fragmol_layers: 4
+d_adapter: ${d_adapter}
+n_adapter_layers: 4
+
+learning_rate: 3.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+# Cosine-decay horizon. Set to steps_per_epoch * num_epochs for the real run;
+# only affects the LR decay shape, not correctness.
+total_steps: 30000
+
+temperature: 0.1
+fp_weight: 0.0
+fp_radius: 2
+fp_bits: 2048

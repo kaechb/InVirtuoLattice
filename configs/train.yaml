@@ -1,0 +1,30 @@
+# @package _global_
+# Main training config. Compose a concrete run with an experiment, e.g.
+#   python -m lattice_lab.train experiment=ebm_baseline
+defaults:
+  - _self_
+  - paths: default
+  - trainer: ebm
+  - data: ebm
+  - model: ebm
+  - callbacks: ebm
+  - logger: wandb
+  - experiment: null
+  - optional local: default
+
+task_name: train
+tags: ["dev"]
+seed: 0
+ckpt_path: null
+
+# Shared dimensions/sizes interpolated into BOTH data and model so a collator
+# and its consumer can never silently disagree.
+n_decoys: 600
+d_adapter: 512
+d_protein: 1280
+
+hydra:
+  run:
+    dir: ${paths.log_dir}/${task_name}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  job:
+    chdir: false

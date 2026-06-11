@@ -1,0 +1,8 @@
+"""LightningModules for the LATTICE training stages."""
+
+from __future__ import annotations
+
+from lattice_lab.models.adapter import AdapterLitModule
+from lattice_lab.models.ebm import EBMLitModule
+
+__all__ = ["AdapterLitModule", "EBMLitModule"]

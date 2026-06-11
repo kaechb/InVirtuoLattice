@@ -1,0 +1,15 @@
+# @package _global_
+# python -m lattice_lab.train experiment=ebm_baseline
+defaults:
+  - override /data: ebm
+  - override /model: ebm
+  - override /trainer: ebm
+  - override /callbacks: ebm
+
+tags: ["ebm", "baseline"]
+n_decoys: 600
+
+data:
+  hard_mining_mult: 1
+  frac_other_binder: 0.4
+  frac_non_binder: 0.15

@@ -1,0 +1,62 @@
+# Standalone package metadata for lattice_lab.
+#
+# Today this directory lives inside the LATTICE monorepo and runs in-place
+# (`python -m lattice_lab.train` from the monorepo root). To spin it out into
+# its own repository, move THIS directory to be the new repo root — the
+# package-dir mapping below makes `.` the `lattice_lab` package, so
+# `pip install -e .` then works unchanged.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lattice_lab"
+version = "0.1.0"
+description = "LATTICE — Hydra + Lightning training/eval for target-informed contrastive affinity"
+requires-python = ">=3.9"
+readme = "README.md"
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "pyarrow>=14",
+    "rdkit>=2023.09",
+    "tokenizers>=0.15",
+    "tqdm>=4.65",
+    "pyyaml>=6.0",
+    "joblib>=1.3",
+    "scikit-learn>=1.2",
+    "matplotlib>=3.7",
+    "wandb>=0.16",
+    "transformers>=4.40",
+    "lightning>=2.1",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.4", "mypy>=1.8", "pytest>=7.0"]
+
+[project.scripts]
+lattice-train = "lattice_lab.train:main"
+lattice-eval = "lattice_lab.evaluate:main"
+
+# Map the package `lattice_lab` onto this directory itself ("repo root is the
+# package"), so subpackages resolve as lattice_lab.<sub>.
+[tool.setuptools]
+package-dir = { "lattice_lab" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backbone*", "protein*", "preprocessing*", "ebm*", "eval*", "inference*", "data*", "models*", "callbacks*", "utils*", "training*"]
+
+[tool.setuptools.package-data]
+lattice_lab = ["configs/**/*.yaml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]

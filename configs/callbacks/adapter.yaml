@@ -1,0 +1,26 @@
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: adapter-{epoch:03d}-{step:06d}
+  monitor: val/acc@1
+  mode: max
+  save_last: true
+  save_top_k: 1
+  auto_insert_metric_name: false
+
+learning_rate_monitor:
+  _target_: lightning.pytorch.callbacks.LearningRateMonitor
+  logging_interval: step
+
+# Stage-2 freeze gate: runs sanity checks on the best adapter after fit and
+# promotes adapter_v1.ckpt only on a full pass.
+sanity_gate:
+  _target_: lattice_lab.callbacks.SanityGateCallback
+  skip_sanity: false
+  val_ratio: 0.005
+  test_ratio: 0.005
+  split_seed: 0
+  qm9_csv: 00_data/raw/qm9.csv
+  qm9_n_subset: null
+  batch_size: 64
+  include_baselines: true

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Run outputs / logs
+logs/
+outputs/
+wandb/
+*.log
+
+# Trained weights (large; tracked via releases, not git)
+*.ckpt
+*.pt
+
+# Downloaded binaries (MMseqs2 — see README "MMseqs2" / setup_lumi)
+software/
+
+# Core dumps
+core
+core.*

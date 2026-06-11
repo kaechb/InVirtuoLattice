@@ -1,0 +1,18 @@
+# @package _global_
+# Adapter SSL + Tanimoto fingerprint similarity distillation.
+# python -m lattice_lab.train experiment=adapter_fp
+defaults:
+  - override /data: adapter
+  - override /model: adapter
+  - override /trainer: adapter
+  - override /callbacks: adapter
+
+tags: ["adapter", "ssl", "fp"]
+
+data:
+  use_fp: true               # must mirror model.fp_weight > 0
+
+model:
+  fp_weight: 0.5
+  fp_radius: 2
+  fp_bits: 2048

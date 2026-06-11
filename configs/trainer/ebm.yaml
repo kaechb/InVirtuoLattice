@@ -1,0 +1,19 @@
+_target_: lightning.pytorch.trainer.Trainer
+
+default_root_dir: ${paths.output_dir}
+max_steps: 20000
+accelerator: auto
+devices: 1
+precision: 32-true
+
+# Replaces the old manual clip_grad_norm_(params, 1.0).
+gradient_clip_val: 1.0
+
+log_every_n_steps: 50
+# Step-based validation (requires one epoch >= val_check_interval batches, true
+# for the full BindingDB binder set). Reduce for smoke runs.
+val_check_interval: 2000
+check_val_every_n_epoch: null
+num_sanity_val_steps: 0
+limit_val_batches: 50
+enable_progress_bar: true

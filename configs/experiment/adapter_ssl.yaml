@@ -1,0 +1,9 @@
+# @package _global_
+# python -m lattice_lab.train experiment=adapter_ssl
+defaults:
+  - override /data: adapter
+  - override /model: adapter
+  - override /trainer: adapter
+  - override /callbacks: adapter
+
+tags: ["adapter", "ssl"]
