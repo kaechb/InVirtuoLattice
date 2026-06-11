@@ -87,6 +87,11 @@ class DiscreteFlowConfig:
     n_backbone_layers: int = 4
     # Flow time fed to the backbone when *encoding* clean tokens (t=1 is clean).
     encode_time: float = 0.5
+    # When True, ``encode_time`` is the init value of a learnable nn.Parameter
+    # (sigmoid-bounded to (0, 1)) optimized by the SSL objective. Gradients reach
+    # it through the (frozen) backbone, so the backbone forward is graph-tracked
+    # even when its weights are frozen.
+    learnable_time: bool = False
     # Lowest non-special token id used for the uniform-noise source.
     token_id_min: int = 4
     freeze_backbone: bool = True
@@ -113,7 +118,19 @@ def load_ddit(
     saved ``hyper_parameters.vocab_size`` in InVirtuoFM checkpoints is
     unreliable).
     """
-    from in_virtuo_gen.models.transformer.model_ddit import DDiT
+    from lattice_lab.paths import ensure_invirtuo_on_path
+
+    ensure_invirtuo_on_path()
+    try:
+        from in_virtuo_gen.models.transformer.model_ddit import DDiT
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "The discrete-flow backbone needs the InVirtuoGen package "
+            "(`in_virtuo_gen`), which provides the DDiT architecture the checkpoint "
+            "weights load into — the ckpt alone is not enough. Install it, or place "
+            "the repo under software/ (so software/<repo>/in_virtuo_gen/ exists), or "
+            "set LATTICE_INVIRTUO_DIR. See the README 'Discrete-flow backbone' section."
+        ) from e
 
     if not cfg.ckpt_path:
         model = DDiT(
@@ -401,6 +418,19 @@ class DiscreteFlowEncoder(nn.Module):
             self.backbone.forward
         ).parameters
 
+        # Optional learnable encode-time (sigmoid-bounded to (0, 1)).
+        self._learnable_time = bool(self.cfg.learnable_time)
+        if self._learnable_time:
+            t0 = min(max(float(self.cfg.encode_time), 1e-4), 1.0 - 1e-4)
+            self.time_logit = nn.Parameter(torch.logit(torch.tensor(float(t0))))
+
+    @property
+    def encode_time_value(self) -> float:
+        """Current encode time as a plain float (for logging)."""
+        if self._learnable_time:
+            return float(torch.sigmoid(self.time_logit.detach()))
+        return float(self.cfg.encode_time)
+
     # -- low-level ---------------------------------------------------------- #
     def _attn_mask(self, x: Tensor) -> Tensor:
         """Additive ``[B, 1, L, L]`` mask: -inf where the *key* is PAD."""
@@ -409,13 +439,18 @@ class DiscreteFlowEncoder(nn.Module):
         block = (~valid).unsqueeze(1).expand(b, length, length)
         return block.float().masked_fill(block, float("-inf")).unsqueeze(1)
 
-    def _build_time(self, batch: int, device: torch.device, t: float) -> Tensor:
-        return torch.full((batch,), float(t), device=device, dtype=torch.float32)
+    def _build_time(self, batch: int, device: torch.device) -> Tensor:
+        if self._learnable_time:
+            # Keep the graph so d(loss)/d(time_logit) flows through the backbone.
+            return torch.sigmoid(self.time_logit).to(device).expand(batch)
+        return torch.full(
+            (batch,), float(self.cfg.encode_time), device=device, dtype=torch.float32
+        )
 
     def _backbone_hidden(self, x: Tensor) -> Tensor:
         """Run DDiT once on clean tokens; return last-L concat hiddens ``[B,T,L*d]``."""
         attn = self._attn_mask(x)
-        t = self._build_time(x.size(0), x.device, self.cfg.encode_time)
+        t = self._build_time(x.size(0), x.device)
         kwargs: dict[str, Any] = {"attn_mask": attn, "conds": None}
         if self._supports_post_hidden:
             kwargs["return_post_hidden"] = True
@@ -434,7 +469,9 @@ class DiscreteFlowEncoder(nn.Module):
         x, m = prepare_backbone_tokens(
             ids, mask, bos_id=self.bundle.bos_id, eos_id=self.bundle.eos_id, pad_id=self.bundle.pad_id
         )
-        grad = any(p.requires_grad for p in self.backbone.parameters())
+        # Track the backbone graph when its params need grad OR when the encode
+        # time is learnable (gradient must reach time_logit through the backbone).
+        grad = self._learnable_time or any(p.requires_grad for p in self.backbone.parameters())
         with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
             hs = self._backbone_hidden(x)
         return self.adapter(hs, m.to(hs.dtype), return_projection=return_projection)

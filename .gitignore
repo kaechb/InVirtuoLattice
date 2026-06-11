@@ -28,5 +28,8 @@ software/
 core
 core.*
 
-# Pipeline data (downloaded + generated; large, reproduced by the pipeline)
-artifacts/
+# Pipeline data (downloaded + generated; large, reproduced by the pipeline).
+# Ignore the *contents* (not artifacts/ itself) so git still descends and the
+# negation below can re-include the small tokenizer (a model asset, not data).
+artifacts/*
+!artifacts/tokenizer/

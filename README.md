@@ -204,6 +204,24 @@ export LATTICE_FRAGMOL_DIR=/shared/path/to/FragMol
 If it's missing you'll get a clear `FileNotFoundError: FragMol backbone not
 found at …` rather than a cryptic `No module named 'utils'`.
 
+### Discrete-flow backbone (optional, alternative to FragMol)
+
+`backbone/discrete_flow.py` is a self-contained alternative encoder (a DDiT /
+InVirtuoGen discrete-flow SMILES model). It needs **three** things, not just a
+checkpoint:
+
+1. a **checkpoint** (weights) — e.g. `artifacts/checkpoints/invirtuo_gen.ckpt`;
+2. a **tokenizer** JSON — e.g. `artifacts/tokenizer/smiles_new.json` (tracked in git);
+3. the **`in_virtuo_gen` package** — the DDiT *architecture* class the weights load
+   into. The ckpt stores only weights, so this code must be importable. Place the
+   InVirtuoGen repo under `software/` (so `software/<repo>/in_virtuo_gen/` exists)
+   or set `LATTICE_INVIRTUO_DIR`. A missing package gives a clear
+   `ModuleNotFoundError: The discrete-flow backbone needs the InVirtuoGen package …`.
+
+The encode-time fed to the backbone can be a **learnable parameter**
+(`DiscreteFlowConfig.learnable_time=True`): it's sigmoid-bounded to (0, 1) and the
+SSL gradient reaches it through the frozen backbone.
+
 ### Stage 1 — Preprocessing
 If you are on LUMI - use this:
 ```bash
