@@ -118,18 +118,14 @@ def load_ddit(
     saved ``hyper_parameters.vocab_size`` in InVirtuoFM checkpoints is
     unreliable).
     """
-    from lattice_lab.paths import ensure_invirtuo_on_path
-
-    ensure_invirtuo_on_path()
     try:
-        from in_virtuo_gen.models.transformer.model_ddit import DDiT
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "The discrete-flow backbone needs the InVirtuoGen package "
-            "(`in_virtuo_gen`), which provides the DDiT architecture the checkpoint "
-            "weights load into — the ckpt alone is not enough. Install it, or place "
-            "the repo under software/ (so software/<repo>/in_virtuo_gen/ exists), or "
-            "set LATTICE_INVIRTUO_DIR. See the README 'Discrete-flow backbone' section."
+        from lattice_lab.backbone.ddit.model_ddit import DDiT
+    except ImportError as e:
+        raise ImportError(
+            "Vendored DDiT failed to import. It needs its sibling rotary module at "
+            "src/lattice_lab/backbone/ddit/rotary.py (model_ddit does "
+            "`from . import rotary`, requiring `Rotary` and `apply_rotary_emb_torch`). "
+            "Drop that file in. Original error: " + str(e)
         ) from e
 
     if not cfg.ckpt_path:

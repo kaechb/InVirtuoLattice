@@ -58,38 +58,3 @@ def ensure_fragmol_on_path() -> None:
         sys.path.insert(0, p)
     # FragMol writes log files into models/ next to CWD; tolerate missing dir.
     os.environ.setdefault("RDKIT_DISABLE_DEPRECATION_WARNINGS", "1")
-
-
-def ensure_invirtuo_on_path() -> None:
-    """Make the ``in_virtuo_gen`` package (InVirtuoGen — the DDiT architecture for
-    the discrete-flow backbone) importable.
-
-    A checkpoint only stores weights; the model *class* must be importable to load
-    them. Honors ``LATTICE_INVIRTUO_DIR`` (either the ``in_virtuo_gen`` package dir
-    or its parent); otherwise searches ``software/`` for an ``in_virtuo_gen``
-    package. No-op if it's already importable.
-    """
-    import importlib.util
-
-    if importlib.util.find_spec("in_virtuo_gen") is not None:
-        return
-
-    def _is_pkg_parent(d: Path) -> bool:
-        return (d / "in_virtuo_gen" / "__init__.py").is_file()
-
-    candidates: list[Path] = []
-    env = os.environ.get("LATTICE_INVIRTUO_DIR")
-    if env:
-        candidates += [Path(env), Path(env).parent]
-    soft = REPO_ROOT / "software"
-    if soft.is_dir():
-        if _is_pkg_parent(soft):
-            candidates.append(soft)
-        for child in soft.iterdir():
-            if child.is_dir() and _is_pkg_parent(child):
-                candidates.append(child)
-
-    for c in candidates:
-        if _is_pkg_parent(c) and str(c) not in sys.path:
-            sys.path.insert(0, str(c))
-            return

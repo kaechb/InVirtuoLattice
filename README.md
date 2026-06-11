@@ -206,17 +206,16 @@ found at …` rather than a cryptic `No module named 'utils'`.
 
 ### Discrete-flow backbone (optional, alternative to FragMol)
 
-`backbone/discrete_flow.py` is a self-contained alternative encoder (a DDiT /
-InVirtuoGen discrete-flow SMILES model). It needs **three** things, not just a
-checkpoint:
+`backbone/discrete_flow.py` is an alternative encoder (a DDiT discrete-flow
+SMILES model). The DDiT architecture is **vendored** in
+`backbone/ddit/` (no `in_virtuo_gen` dependency), so it needs only:
 
 1. a **checkpoint** (weights) — e.g. `artifacts/checkpoints/invirtuo_gen.ckpt`;
-2. a **tokenizer** JSON — e.g. `artifacts/tokenizer/smiles_new.json` (tracked in git);
-3. the **`in_virtuo_gen` package** — the DDiT *architecture* class the weights load
-   into. The ckpt stores only weights, so this code must be importable. Place the
-   InVirtuoGen repo under `software/` (so `software/<repo>/in_virtuo_gen/` exists)
-   or set `LATTICE_INVIRTUO_DIR`. A missing package gives a clear
-   `ModuleNotFoundError: The discrete-flow backbone needs the InVirtuoGen package …`.
+2. a **tokenizer** JSON — e.g. `artifacts/tokenizer/smiles_new.json` (tracked in git).
+
+`backbone/ddit/model_ddit.py` does `from . import rotary`, so `backbone/ddit/rotary.py`
+(providing `Rotary` and `apply_rotary_emb_torch`) must be present — it's part of
+the vendored architecture.
 
 The encode-time fed to the backbone can be a **learnable parameter**
 (`DiscreteFlowConfig.learnable_time=True`): it's sigmoid-bounded to (0, 1) and the
