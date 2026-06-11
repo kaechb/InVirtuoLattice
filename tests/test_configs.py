@@ -22,6 +22,7 @@ TRAIN_CASES = [
     ["experiment=ebm_hardneg"],
     ["experiment=adapter_ssl"],
     ["experiment=adapter_fp"],
+    ["experiment=adapter_discrete_flow"],
     ["trainer=smoke"],
     ["logger=csv"],
     ["logger=none"],

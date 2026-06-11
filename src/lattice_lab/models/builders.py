@@ -73,3 +73,42 @@ def build_adapter_encoder(
 
 def build_energy_head(*, d_adapter: int, d_protein: int, head_arch: str) -> EnergyHead:
     return EnergyHead(EnergyHeadConfig(d_m=d_adapter, d_p=d_protein, arch=head_arch))
+
+
+def build_discrete_flow_encoder(
+    *,
+    ckpt_path: str | Path,
+    tokenizer_path: str | Path,
+    d_adapter: int = 512,
+    n_adapter_layers: int = 4,
+    n_backbone_layers: int = 4,
+    learnable_time: bool = True,
+    encode_time: float = 0.5,
+    freeze_backbone: bool = True,
+):
+    """Frozen DDiT (loaded from ckpt) + a fresh trainable adapter, with an
+    optional learnable encode-time. Returns a ``DiscreteFlowEncoder``."""
+    from lattice_lab.backbone.discrete_flow import (
+        DiscreteFlowConfig,
+        DiscreteFlowEncoder,
+        load_discrete_flow,
+    )
+
+    cfg = DiscreteFlowConfig(
+        ckpt_path=str(ckpt_path),
+        tokenizer_path=str(tokenizer_path),
+        n_backbone_layers=n_backbone_layers,
+        learnable_time=learnable_time,
+        encode_time=encode_time,
+        freeze_backbone=freeze_backbone,
+    )
+    bundle = load_discrete_flow(cfg)
+    adapter = Adapter(
+        AdapterConfig(
+            d_fragmol=bundle.n_embd,
+            n_fragmol_layers=n_backbone_layers,
+            d_adapter=d_adapter,
+            n_layers=n_adapter_layers,
+        )
+    )
+    return DiscreteFlowEncoder(bundle, adapter=adapter, config=cfg)

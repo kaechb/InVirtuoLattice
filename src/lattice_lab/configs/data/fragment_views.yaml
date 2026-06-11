@@ -1,0 +1,9 @@
+_target_: lattice_lab.data.FragmentViewDataModule
+
+shard_dir: artifacts/processed/moses
+batch_size: 256
+val_ratio: 0.005
+test_ratio: 0.005
+split_seed: 0
+run_validation: true
+num_workers: 0

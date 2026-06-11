@@ -1,0 +1,11 @@
+# @package _global_
+# Stage-2 SSL on the discrete-flow (DDiT) backbone with fragment-shuffle views
+# and a shared learnable encode-time.
+#   python -m lattice_lab.train experiment=adapter_discrete_flow
+defaults:
+  - override /data: fragment_views
+  - override /model: discrete_flow
+  - override /trainer: adapter
+  - override /callbacks: ssl_basic
+
+tags: ["ssl", "discrete_flow"]

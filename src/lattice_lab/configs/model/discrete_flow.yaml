@@ -1,0 +1,21 @@
+_target_: lattice_lab.models.DiscreteFlowSSLModule
+
+ckpt_path: artifacts/checkpoints/invirtuo_gen.ckpt
+tokenizer_path: artifacts/tokenizer/smiles_new.json
+
+d_adapter: ${d_adapter}
+n_adapter_layers: 4
+n_backbone_layers: 4
+
+# Encode-time is a shared, learnable parameter (sigmoid-bounded to (0,1)).
+learnable_time: true
+encode_time: 0.5
+# Token id of the fragment separator (space) in the discrete-flow tokenizer.
+frag_sep_id: 4
+
+learning_rate: 3.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+total_steps: 30000        # cosine-decay horizon (affects LR shape only)
+temperature: 0.1
+seed: ${seed}
