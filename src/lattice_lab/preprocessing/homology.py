@@ -49,6 +49,11 @@ class HomologyHit:
 
 
 def _mmseqs_available() -> bool:
+    # Make the repo's bundled software/mmseqs/bin discoverable before checking,
+    # so no manual PATH export is needed (a system mmseqs on PATH still works).
+    from lattice_lab.paths import ensure_mmseqs_on_path
+
+    ensure_mmseqs_on_path()
     return shutil.which("mmseqs") is not None
 
 

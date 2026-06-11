@@ -168,9 +168,11 @@ bash scripts/download_dude.sh
 
 ### MMseqs2 (required for Stage 1)
 
-Stage 1 needs MMseqs2 for the identity split + protein clustering; the code
-locates it via `shutil.which("mmseqs")` (must be on `PATH`). On a normal box:
-`conda install -c bioconda mmseqs2`.
+Stage 1 needs MMseqs2 for the identity split + protein clustering. The repo
+**auto-discovers a bundled binary** at `software/mmseqs/bin/mmseqs` (it's
+prepended to `PATH` automatically — no manual export needed); `LATTICE_MMSEQS_DIR`
+overrides the location. Otherwise it falls back to whatever `mmseqs` is on
+`PATH`. On a normal box: `conda install -c bioconda mmseqs2`.
 
 **On LUMI** there is no MMseqs2 module and it isn't pip-installable — drop in the
 static AVX2 binary (the EPYC nodes are AVX2, **not** AVX512):
@@ -180,7 +182,7 @@ curl -LO https://mmseqs.com/latest/mmseqs-linux-avx2.tar.gz   # wget on a login 
 tar xzf mmseqs-linux-avx2.tar.gz
 ./mmseqs/bin/mmseqs version                                   # smoke-check
 # Put on PATH in ~/.zshrc AND in every sbatch script (after `module load`):
-export PATH=/projappl/project_465003063/$USER/software/mmseqs/bin:$PATH
+export PATH=/pfs/lustrep4/scratch/project_465003063/benno/software:$PATH
 ```
 It runs as a plain binary outside the PyTorch container, so it's independent of
 the squashfs env. (Fallback URL: the `mmseqs-linux-avx2.tar.gz` asset on
