@@ -1,0 +1,22 @@
+# @package _global_
+# LeJEPA SSL — same settings as adapter_discrete_flow_baseline, only the primary
+# loss changes. Inherits fp_weight=2.0 + return_smiles=true: the Morgan-FP
+# similarity distillation runs on a normalized copy of z_m, so it adds the
+# chemical-similarity prior without touching LeJEPA's unnormalized latents.
+# Set model.fp_weight=0.0 to ablate it.
+#
+#   python -m lattice_lab.train experiment=adapter_discrete_flow_lejepa
+defaults:
+  - adapter_discrete_flow_baseline
+
+model:
+  ssl_loss: lejepa
+  lejepa_lambda: 0.001
+
+logger:
+  wandb:
+    name: lejepa_${model.lejepa_lambda}_fp${model.fp_weight}
+
+data:
+  batch_size: 256
+tags: ["ssl", "discrete_flow", "lejepa", "fp_distill"]

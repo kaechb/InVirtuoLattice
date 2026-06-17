@@ -1,0 +1,25 @@
+# @package _global_
+# EBM hard-negative training on LeJEPA adapter + decoy pools.
+#
+#   python -m lattice_lab.train experiment=ebm_hardneg_lejepa
+defaults:
+  - ebm_hardneg
+
+tags: ["ebm", "hardneg", "lejepa"]
+
+# W&B run id from Stage 2 (edit after adapter SSL training).
+ssl_run_id: 4tau7a38
+
+data:
+  decoy_store: artifacts/decoys/lejepa/decoy_zm/
+  bdb_store: artifacts/decoys/lejepa/bdb_zm
+  binder_store: artifacts/binders/lejepa/binder_zm
+
+model:
+  encoder:
+    adapter_ckpt: artifacts/adapter/lejepa/checkpoints/${ssl_run_id}/last.ckpt
+
+logger:
+  wandb:
+    group: ssl_compare_lejepa
+    name: ebm_hardneg_lejepa

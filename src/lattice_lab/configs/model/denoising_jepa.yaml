@@ -1,0 +1,98 @@
+_target_: lattice_lab.models.denoising_jepa_ssl.DenoisingJEPAModule
+
+# Conditional denoising-JEPA student: an encoder pools the clean string into a
+# molecule latent z_s; a separate conditional DDiT denoiser reconstructs a
+# corrupted copy, conditioned on z_s. The objective is a pure generative (token)
+# CE at the noised positions — no representation matching, so no EMA teacher.
+student:
+  _target_: lattice_lab.training.denoising_jepa.build_denoising_jepa
+  ckpt_path: artifacts/checkpoints/invirtuo_gen.ckpt
+  tokenizer_path: artifacts/tokenizer/smiles_new.json
+  # The encoder runs on the clean string → flow time at the clean endpoint t = 1
+  # (sigma = 1 - t**path_power = 0).
+  encode_time: 1.0
+  # Adapter-style: freeze the encoder backbone and train only the attention pool
+  # (z_s) + the conditional denoiser. Set false to fine-tune the encoder too.
+  freeze_backbone: true
+  token_id_min: 4
+  pool_heads: 8
+
+# Corruption / anti-collapse anchor (uniform source x0 ~ U[token_id_min, vocab)).
+# corrupt_t is a [lo, hi] range → uniform per-sample flow time; each molecule is
+# corrupted by a fraction sigma = 1 - t**path_power in [1-hi^p, 1-lo^p]. With
+# [0.1, 0.6] and path_power=1 that's 40–90% of positions replaced. The
+# reconstruction CE is taken only at the positions that were actually noised.
+corrupt_t: [0., 0.4]
+corrupt_t_cap: 1.0e-3
+path_power: 1.0
+
+shuffle_fragments: true     # one fragment-shuffled clean view per molecule
+frag_sep_id: 4
+
+# View-invariance regularizer: align z_s of two views of the same molecule
+# (loss += align_lambda * mean(1 - cos)). DISABLED by default: it only enforces
+# invariance (collapse two views to one code), which a high-capacity pool always
+# satisfies (align_cos saturates at ~1, gradient → 0) WITHOUT imposing chemical
+# structure — so it did not stop val/probe_r2_* eroding. Use fp_weight instead.
+align_lambda: 1
+align_corrupt_t: [0., 0.5]
+
+# Fingerprint (Tanimoto) similarity distillation — the structural anti-erosion
+# term. loss += fp_weight * MSE(cos(z_s), Tanimoto(Morgan-FP)). Unlike alignment,
+# the target is a full off-diagonal [B,B] similarity matrix, so it cannot
+# saturate and it pulls chemically-similar molecules together / dissimilar apart
+# directly — the same signal that keeps discrete_flow_ssl's probes healthy
+# (fp_weight=2.0 there). Requires data.return_smiles=true. 0 disables.
+fp_weight: 0.0
+fp_radius: 2
+fp_bits: 2048
+
+# SIGReg: push z_s toward an isotropic Gaussian to prevent dimensional collapse.
+# Applied as (sigreg_lambda / batch_size) * SIGReg(z_s) — the /batch_size keeps
+# the effective weight batch-size-independent (raw Epps-Pulley statistic scales
+# ~linearly with N, same convention as LeJEPALoss). 0 disables.
+sigreg_lambda: 0.1
+sigreg_num_projections: 256
+sigreg_knots: 17
+sigreg_t_max: 3.0
+
+# Beta-VAE KL regularizer: reparameterization head on z_s forces an information
+# bottleneck (encoder must compress to molecule-relevant features).
+# loss += kl_beta * KL(N(mu,sigma)||N(0,I)). 0 disables.
+kl_beta: 0.01
+
+# t-scaled conditioning noise: z_s_cond = z_s + t * scale * ε (training only).
+# At t≈0 (heavy corruption) z_s is clean and load-bearing; at t≈1 (easy task)
+# it is noisy so the denoiser cannot bypass z_s at easy timesteps, preventing
+# easy-task gradients from eroding the pool's chemical structure. 0 disables.
+cond_noise_scale: 0.0
+
+# Optimizer / schedule
+learning_rate: 1.0e-3
+weight_decay: 0.01
+warmup_steps: 500
+# Cosine-decay horizon. null → auto-derive from the trainer's estimated step
+# count so the LR spans the whole run. A fixed value (e.g. 30000) makes the
+# cosine bottom out at its 0.1x floor and stay there for the rest of training.
+total_steps: null
+
+# Diagnostics
+# Condition-bypass: reconstruct with z_s vs zeros at a fixed strong corruption.
+# gap = recon_zeroed - recon_real; a gap below condition_margin means z_s is
+# inert (warn loudly, or hard-fail if condition_hard_fail).
+condition_corrupt_t: 0.1
+condition_margin: 0.1
+condition_hard_fail: false
+train_rank_every_n_steps: 50   # effective_rank(z_s) tripwire cadence
+
+# Validation probes: encode a fixed val-split subset to z_s, fit Ridge heads for
+# QED / molWt (val/probe_r2_*), log rank/{effective,numerical} over the subset,
+# and PCA(50)→t-SNE scatter plots (val/tsne_{qed,molwt}) to W&B.
+val_probe_n_molecules: 2000
+val_probe_every_n_epochs: 1
+val_probe_encode_batch_size: 128
+val_probe_ridge_alpha: 1.0
+val_probe_test_size: 0.2
+val_probe_tsne_perplexity: null
+
+seed: ${seed}

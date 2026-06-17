@@ -1,6 +1,6 @@
 """Dataset that yields paired molecule views from parquet shards.
 
-Each parquet shard contains rows of the form (smiles, inchikey, view_idx, fragmol_view).
+Each parquet shard contains rows of the form (smiles, inchikey, view_idx, fragment_view).
 For SSL we want two distinct views of the same molecule per sample. The dataset
 groups rows by ``inchikey`` and serves a random pair per molecule.
 
@@ -81,11 +81,20 @@ class PairedViewDataset(Dataset):
 
         self._return_smiles = return_smiles
         self._same_view_pairs = same_view_pairs
-        cols = ["inchikey", "fragmol_view"] + (["smiles"] if return_smiles else [])
-        frames = [pd.read_parquet(p, columns=cols) for p in shard_paths]
+        from lattice_lab.preprocessing.molecules import (
+            fragment_view_column,
+            fragment_view_column_for_parquet,
+        )
+
+        view_col = fragment_view_column_for_parquet(shard_paths[0])
+        frames = []
+        for p in shard_paths:
+            cols = ["inchikey", view_col] + (["smiles"] if return_smiles else [])
+            frames.append(pd.read_parquet(p, columns=cols))
         if not frames:
             raise ValueError("no shards provided")
         df = pd.concat(frames, ignore_index=True)
+        view_col = fragment_view_column(df)
 
         if split != "all":
             keep = df["inchikey"].map(
@@ -96,7 +105,7 @@ class PairedViewDataset(Dataset):
             )
             df = df[keep]
 
-        grouped = df.groupby("inchikey")["fragmol_view"].apply(list)
+        grouped = df.groupby("inchikey")[view_col].apply(list)
         keep_pairs = [(k, v) for k, v in grouped.items() if len(v) >= 2]
         self._inchikeys: list[str] = [k for k, _ in keep_pairs]
         self._views: list[list[str]] = [v for _, v in keep_pairs]

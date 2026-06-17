@@ -1,0 +1,27 @@
+# @package _global_
+# NT-Xent / InfoNCE SSL on fragment-shuffle views + Morgan-fingerprint
+# similarity distillation (fp_weight=2.0) — the LATTICE baseline recipe
+# (adapter_v1.pt). The fp-distillation term aligns z_m cosine geometry with
+# Tanimoto similarity and is what makes the adapter transfer to LIT-PCBA;
+# without it this collapses to the `ssl_ntxent_only` ablation.
+#
+#   python -m lattice_lab.train experiment=adapter_discrete_flow_baseline
+defaults:
+  - adapter_discrete_flow
+
+data:
+  shard_dir: /flash/project_465003063/grassogi/artifacts/processed/moses
+  return_smiles: true
+
+model:
+  ssl_loss: ntxent
+  fp_weight: 2.0
+  fp_radius: 2
+  fp_bits: 2048
+
+logger:
+  wandb:
+    group: ssl_ntxent_fpdistill
+    name: ntxent_fp2.0_baseline
+
+tags: ["ssl", "discrete_flow", "ntxent", "fp_distill"]

@@ -1,0 +1,25 @@
+# @package _global_
+# Hybrid SSL — NT-Xent (explicit between-molecule repulsion) linearly annealed
+# in favor of LeJEPA (invariance + SIGReg) over model.hybrid_anneal_steps.
+# Motivation (see diag_rank_trace group): pure LeJEPA reaches near-full
+# numerical rank but very low effective rank, because nothing in its objective
+# pushes different molecules apart between-sample. NT-Xent's pairwise
+# repulsion supplies that directly while it's annealed in, before SIGReg has
+# to maintain isotropy alone.
+#
+#   python -m lattice_lab.train experiment=adapter_discrete_flow_hybrid
+defaults:
+  - adapter_discrete_flow_baseline
+
+model:
+  ssl_loss: hybrid
+  lejepa_lambda: 0.05
+  hybrid_anneal_steps: 2000
+
+logger:
+  wandb:
+    name: hybrid_anneal${model.hybrid_anneal_steps}_fp${model.fp_weight}
+
+data:
+  batch_size: 128
+tags: ["ssl", "discrete_flow", "hybrid", "fp_distill"]
