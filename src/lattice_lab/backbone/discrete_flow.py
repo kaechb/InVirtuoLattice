@@ -1,13 +1,10 @@
 """Discrete-flow (DDiT) SMILES backbone for LATTICE.
 
-A minimal, self-contained alternative to the FragMol backbone
-(``lattice/backbone/fragmol_loader.py`` + ``encoder.py``). It wraps the
-pretrained ``DDiT`` discrete-flow model from InVirtuoFM/InVirtuoGEN and exposes
-the *same* encoder contract as :class:`lattice.backbone.encoder.MoleculeEncoder`
-so the rest of the pipeline (Stage-2 adapter SSL, decoy precompute, EBM head)
-plugs in unchanged:
+Wraps the pretrained ``DDiT`` discrete-flow model from InVirtuoFM/InVirtuoGEN and
+exposes a molecule encoder for the rest of the pipeline (adapter SSL, decoy
+precompute, EBM head):
 
-    DDiT (frozen) → last-L block hidden states → Adapter → z_m  [B, d_adapter]
+    DDiT (frozen) → block hidden states [start..end] → Adapter → z_m  [B, d_adapter]
 
 It additionally supports the model's *own* discrete-flow pretraining objective
 (:meth:`DiscreteFlowEncoder.discrete_flow_loss`), so the backbone can either be
@@ -19,23 +16,25 @@ Design notes
   and a ``tokenizers``/``transformers`` SMILES tokenizer. The discrete-flow
   corruption math is inlined (a few lines) to avoid pulling the heavier
   InVirtuoFM Lightning stack.
-* Hidden states are captured with forward hooks on ``DDiT.blocks`` — identical
-  in spirit to :class:`lattice.backbone.encoder.HiddenStateCollector`, so the
-  trainable :class:`lattice.backbone.adapter.Adapter` is reused verbatim
-  (``d_fragmol`` simply becomes the DDiT ``hidden_size``).
+* Hidden states are captured with forward hooks on ``DDiT.blocks`` (see
+  :class:`_BlockHiddenCollector`), feeding the trainable
+  :class:`lattice_lab.backbone.adapter.Adapter` (``d_backbone`` is the DDiT
+  ``hidden_size``). This same encode path is used by Stage-2 SSL training,
+  inference (:mod:`lattice_lab.eval.encode_utils`), and tests — there is no
+  separate encoder implementation.
 * Token preprocessing matches the InVirtuoFM pretrain convention: drop the
   leading BOS and treat EOS as PAD for the backbone.
 
 CLI::
 
     # load pretrained DDiT and encode a couple of SMILES
-    python -m lattice.backbone.discrete_flow \
+    python -m lattice_lab.backbone.discrete_flow \
         --ckpt /path/to/invirtuo_gen.ckpt \
         --tokenizer /path/to/smiles_new.json \
         --smiles "CCO" "c1ccccc1"
 
     # build a fresh DDiT and run one discrete-flow training step
-    python -m lattice.backbone.discrete_flow \
+    python -m lattice_lab.backbone.discrete_flow \
         --from-scratch --tokenizer /path/to/smiles_new.json --train-step
 """
 
@@ -51,10 +50,10 @@ import torch
 from torch import Tensor, nn
 from transformers import PreTrainedTokenizerFast
 
-from lattice_lab.backbone.adapter import Adapter, AdapterConfig
+from lattice_lab.backbone.adapter import Adapter
+from lattice_lab.backbone.ddit.model_ddit import DDiT
 
 __all__ = [
-    "DiscreteFlowConfig",
     "DiscreteFlowBundle",
     "DiscreteFlowEncoder",
     "load_ddit",
@@ -63,38 +62,16 @@ __all__ = [
 ]
 
 
-# --------------------------------------------------------------------------- #
-# Config + checkpoint loading
-# --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class DiscreteFlowConfig:
-    """Everything needed to build / load a DDiT backbone bundle.
+def _n_backbone_layers(layer_start: int, layer_end: int) -> int:
+    return int(layer_end) - int(layer_start) + 1
 
-    ``ckpt_path=None`` builds a fresh DDiT (train-from-scratch); otherwise the
-    architecture + weights are read from the checkpoint and ``n_layer`` /
-    ``n_embd`` below are ignored.
-    """
 
-    ckpt_path: Optional[str] = None
-    tokenizer_path: str = "tokenizer/smiles_new.json"
-    # Fresh-build architecture (ignored when ``ckpt_path`` is set).
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.1
-    n_conds: int = 0
-    # Number of trailing DDiT blocks whose hidden states feed the adapter.
-    n_backbone_layers: int = 4
-    # Flow time fed to the backbone when *encoding* clean tokens (t=1 is clean).
-    encode_time: float = 0.5
-    # When True, ``encode_time`` is the init value of a learnable nn.Parameter
-    # (sigmoid-bounded to (0, 1)) optimized by the SSL objective. Gradients reach
-    # it through the (frozen) backbone, so the backbone forward is graph-tracked
-    # even when its weights are frozen.
-    learnable_time: bool = False
-    # Lowest non-special token id used for the uniform-noise source.
-    token_id_min: int = 4
-    freeze_backbone: bool = True
+def _validate_backbone_layer_range(n_blocks: int, layer_start: int, layer_end: int) -> None:
+    if layer_start < 0 or layer_end >= n_blocks or layer_start > layer_end:
+        raise ValueError(
+            f"invalid backbone layer range [{layer_start}, {layer_end}] "
+            f"for DDiT with {n_blocks} blocks (0-indexed, inclusive)"
+        )
 
 
 def _strip_module_prefix(state: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -106,9 +83,15 @@ def _strip_module_prefix(state: dict[str, Tensor]) -> dict[str, Tensor]:
 
 
 def load_ddit(
-    cfg: DiscreteFlowConfig,
     *,
+    ckpt_path: Optional[str],
     vocab_size: int,
+    n_layer: int = 12,
+    n_head: int = 12,
+    n_embd: int = 768,
+    dropout: float = 0.1,
+    n_conds: int = 0,
+    force_n_conds: bool = False,
     map_location: str = "cpu",
 ) -> tuple[nn.Module, dict[str, Any]]:
     """Build a ``DDiT`` and either load a checkpoint or return a fresh model.
@@ -116,68 +99,63 @@ def load_ddit(
     ``vocab_size`` is only used for the fresh build; when a checkpoint is given
     the vocab/hidden dims are derived from ``model.vocab_embed.weight`` (the
     saved ``hyper_parameters.vocab_size`` in InVirtuoFM checkpoints is
-    unreliable).
+    unreliable). Fresh-build arch kwargs are ignored when ``ckpt_path`` is set,
+    **except** ``n_conds`` when ``force_n_conds`` is set: the requested
+    conditioning width is then used regardless of the checkpoint (the missing
+    ``conds.*`` weights stay freshly initialized via ``strict=False``). This
+    lets a conditional denoiser warm-start from an unconditional pretrained DDiT.
     """
-    try:
-        from lattice_lab.backbone.ddit.model_ddit import DDiT
-    except ImportError as e:
-        raise ImportError(
-            "Vendored DDiT failed to import. It needs its sibling rotary module at "
-            "src/lattice_lab/backbone/ddit/rotary.py (model_ddit does "
-            "`from . import rotary`, requiring `Rotary` and `apply_rotary_emb_torch`). "
-            "Drop that file in. Original error: " + str(e)
-        ) from e
 
-    if not cfg.ckpt_path:
+    if not ckpt_path:
         model = DDiT(
             vocab_size=int(vocab_size),
-            hidden_size=int(cfg.n_embd),
-            n_heads=int(cfg.n_head),
-            n_layer=int(cfg.n_layer),
-            dropout=float(cfg.dropout),
-            n_conds=int(cfg.n_conds),
+            hidden_size=int(n_embd),
+            n_heads=int(n_head),
+            n_layer=int(n_layer),
+            dropout=float(dropout),
+            n_conds=int(n_conds),
         )
         meta = {
             "from_checkpoint": False,
             "vocab_size": int(vocab_size),
-            "hidden_size": int(cfg.n_embd),
-            "n_layer": int(cfg.n_layer),
+            "hidden_size": int(n_embd),
+            "n_layer": int(n_layer),
         }
         return model, meta
 
-    ckpt = torch.load(cfg.ckpt_path, map_location=map_location, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=False)
     h = ckpt.get("hyper_parameters") or {}
     state = ckpt.get("state_dict", ckpt)
     if not isinstance(state, dict):
-        raise RuntimeError(f"invalid checkpoint state_dict in {cfg.ckpt_path!r}")
+        raise RuntimeError(f"invalid checkpoint state_dict in {ckpt_path!r}")
 
     embed_w = state.get("model.vocab_embed.weight", state.get("vocab_embed.weight"))
     if embed_w is not None:
         vocab = int(embed_w.shape[0])
-        n_embd = int(embed_w.shape[1])
+        n_embd_ckpt = int(embed_w.shape[1])
     else:
         vocab = int(h.get("vocab_size") or vocab_size)
-        n_embd = int(h.get("n_embd") or h.get("hidden_size") or cfg.n_embd)
+        n_embd_ckpt = int(h.get("n_embd") or h.get("hidden_size") or n_embd)
 
-    n_layer = int(h.get("n_layer", h.get("num_layers", cfg.n_layer)))
-    n_head = int(h.get("n_head", h.get("num_heads", cfg.n_head)))
-    n_conds = int(h.get("n_conds", cfg.n_conds))
-    dropout = float(h.get("dropout", cfg.dropout))
+    n_layer_ckpt = int(h.get("n_layer", h.get("num_layers", n_layer)))
+    n_head_ckpt = int(h.get("n_head", h.get("num_heads", n_head)))
+    n_conds_ckpt = int(n_conds) if force_n_conds else int(h.get("n_conds", n_conds))
+    dropout_ckpt = float(h.get("dropout", dropout))
 
     model = DDiT(
         vocab_size=vocab,
-        hidden_size=n_embd,
-        n_heads=n_head,
-        n_layer=n_layer,
-        dropout=dropout,
-        n_conds=n_conds,
+        hidden_size=n_embd_ckpt,
+        n_heads=n_head_ckpt,
+        n_layer=n_layer_ckpt,
+        dropout=dropout_ckpt,
+        n_conds=n_conds_ckpt,
     )
     missing, unexpected = model.load_state_dict(_strip_module_prefix(state), strict=False)
     meta = {
         "from_checkpoint": True,
         "vocab_size": vocab,
-        "hidden_size": n_embd,
-        "n_layer": n_layer,
+        "hidden_size": n_embd_ckpt,
+        "n_layer": n_layer_ckpt,
         "missing_keys": list(missing),
         "unexpected_keys": list(unexpected),
     }
@@ -185,7 +163,7 @@ def load_ddit(
 
 
 # --------------------------------------------------------------------------- #
-# Bundle (analogous to FragMolBundle)
+# Bundle
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class DiscreteFlowBundle:
@@ -201,37 +179,62 @@ class DiscreteFlowBundle:
     eos_id: int
 
 
-def _special_id(tok: PreTrainedTokenizerFast, token: str, override: Optional[int]) -> int:
-    if override is not None:
-        return int(override)
+def _special_id(tok: PreTrainedTokenizerFast, token: str) -> int:
     ids = tok.encode(token, add_special_tokens=False)
     if not ids:
         raise ValueError(f"tokenizer has no id for {token!r}")
     return int(ids[0])
 
 
-def load_discrete_flow(
-    cfg: DiscreteFlowConfig | None = None,
+def resolve_mask_token_id(
+    tokenizer: PreTrainedTokenizerFast,
     *,
+    override: int | None = None,
+) -> int:
+    """Token id for LeJEPA local masked views (never PAD)."""
+    if override is not None:
+        return int(override)
+    for tok in ("<redacted_MASK>", "<MASK>", "<mask>"):
+        try:
+            return _special_id(tokenizer, tok)
+        except ValueError:
+            continue
+    return _special_id(tokenizer, "[UNK]")
+
+
+def load_discrete_flow(
+    *,
+    ckpt_path: Optional[str],
+    tokenizer_path: str,
+    freeze_backbone: bool,
+    n_layer: int = 12,
+    n_head: int = 12,
+    n_embd: int = 768,
+    dropout: float = 0.1,
+    n_conds: int = 0,
     device: str | torch.device = "cpu",
-    pad_id: Optional[int] = None,
-    bos_id: Optional[int] = None,
-    eos_id: Optional[int] = None,
 ) -> DiscreteFlowBundle:
-    """Load tokenizer + DDiT (pretrained or fresh) into a frozen-by-default bundle."""
-    cfg = cfg or DiscreteFlowConfig()
-    tok_path = Path(cfg.tokenizer_path)
+    """Load tokenizer + DDiT (pretrained or fresh)."""
+    tok_path = Path(tokenizer_path)
     if not tok_path.is_file():
-        raise FileNotFoundError(f"tokenizer_path={cfg.tokenizer_path!r} is not a file")
+        raise FileNotFoundError(f"tokenizer_path={tokenizer_path!r} is not a file")
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tok_path))
 
-    pad = _special_id(tokenizer, "[PAD]", pad_id)
-    bos = _special_id(tokenizer, "[BOS]", bos_id)
-    eos = _special_id(tokenizer, "[EOS]", eos_id)
+    pad = _special_id(tokenizer, "[PAD]")
+    bos = _special_id(tokenizer, "[BOS]")
+    eos = _special_id(tokenizer, "[EOS]")
 
-    model, meta = load_ddit(cfg, vocab_size=len(tokenizer))
+    model, meta = load_ddit(
+        ckpt_path=ckpt_path,
+        vocab_size=len(tokenizer),
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        dropout=dropout,
+        n_conds=n_conds,
+    )
     model.to(device)
-    if cfg.freeze_backbone:
+    if freeze_backbone:
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
@@ -335,21 +338,20 @@ def _sample_path(t: Tensor, x0: Tensor, x1: Tensor, *, n: float = 1.0) -> Tensor
 # Hidden-state collector (DDiT blocks)
 # --------------------------------------------------------------------------- #
 class _BlockHiddenCollector:
-    """Forward hooks on the last ``n_layers`` DDiT blocks → ``[B, T, L*d]``."""
+    """Forward hooks on DDiT blocks ``[layer_start, layer_end]`` → ``[B, T, L*d]``."""
 
-    def __init__(self, model: nn.Module, n_layers: int) -> None:
+    def __init__(self, model: nn.Module, layer_start: int, layer_end: int) -> None:
         self.model = model
-        self.n_layers = int(n_layers)
+        self.layer_start = int(layer_start)
+        self.layer_end = int(layer_end)
+        self.n_layers = _n_backbone_layers(self.layer_start, self.layer_end)
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._buffer: list[Tensor] = []
 
     def __enter__(self) -> "_BlockHiddenCollector":
         blocks = list(self.model.blocks)  # type: ignore[attr-defined]
-        if self.n_layers > len(blocks):
-            raise ValueError(
-                f"requested {self.n_layers} layers but DDiT has only {len(blocks)}"
-            )
-        for b in blocks[-self.n_layers :]:
+        _validate_backbone_layer_range(len(blocks), self.layer_start, self.layer_end)
+        for b in blocks[self.layer_start : self.layer_end + 1]:
             self._handles.append(
                 b.register_forward_hook(lambda _m, _i, out: self._buffer.append(out))
             )
@@ -370,12 +372,11 @@ class _BlockHiddenCollector:
 
 
 # --------------------------------------------------------------------------- #
-# Encoder (drop-in for MoleculeEncoder)
+# Encoder
 # --------------------------------------------------------------------------- #
 class DiscreteFlowEncoder(nn.Module):
-    """``DDiT (frozen) → last-L block hiddens → Adapter → z_m``.
+    """``DDiT (frozen) → block hiddens [start..end] → Adapter → z_m``.
 
-    API-compatible with :class:`lattice.backbone.encoder.MoleculeEncoder`:
     ``encode_token_ids`` / ``encode_views`` / ``encode_molecule`` return the
     L2-normalized molecule latent ``z_m`` (optionally with the SimCLR
     projection). ``encode_views`` accepts **SMILES strings** (the discrete-flow
@@ -386,27 +387,44 @@ class DiscreteFlowEncoder(nn.Module):
     def __init__(
         self,
         bundle: DiscreteFlowBundle,
+        *,
+        backbone_layer_start: int,
+        backbone_layer_end: int,
+        encode_time: float,
+        learnable_time: bool,
+        token_id_min: int,
         adapter: Adapter | None = None,
-        config: DiscreteFlowConfig | None = None,
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.cfg = config or DiscreteFlowConfig()
+        # Filled in by ``build_discrete_flow_encoder`` so checkpoints can embed the
+        # exact skeleton kwargs (``on_save_checkpoint``). ``None`` for encoders built
+        # directly (e.g. unit tests), in which case loaders fall back to defaults.
+        self.build_config: dict | None = None
+        self.backbone_layer_start = int(backbone_layer_start)
+        self.backbone_layer_end = int(backbone_layer_end)
+        self.encode_time = float(encode_time)
+        self.learnable_time = bool(learnable_time)
+        self.token_id_min = int(token_id_min)
+        n_backbone_layers = _n_backbone_layers(
+            self.backbone_layer_start, self.backbone_layer_end
+        )
+        _validate_backbone_layer_range(
+            bundle.n_layer, self.backbone_layer_start, self.backbone_layer_end
+        )
         self.backbone = bundle.model
         self.adapter = adapter or Adapter(
-            AdapterConfig(
-                d_fragmol=bundle.n_embd,
-                n_fragmol_layers=self.cfg.n_backbone_layers,
-            )
+            d_backbone=bundle.n_embd,
+            n_backbone_layers=n_backbone_layers,
         )
-        if self.adapter.cfg.d_fragmol != bundle.n_embd:
+        if self.adapter.d_backbone != bundle.n_embd:
             raise AssertionError(
-                f"adapter d_fragmol={self.adapter.cfg.d_fragmol} != DDiT hidden={bundle.n_embd}"
+                f"adapter d_backbone={self.adapter.d_backbone} != DDiT hidden={bundle.n_embd}"
             )
-        if self.adapter.cfg.n_fragmol_layers != self.cfg.n_backbone_layers:
+        if self.adapter.n_backbone_layers != n_backbone_layers:
             raise AssertionError(
-                f"adapter n_fragmol_layers={self.adapter.cfg.n_fragmol_layers} "
-                f"!= n_backbone_layers={self.cfg.n_backbone_layers}"
+                f"adapter n_backbone_layers={self.adapter.n_backbone_layers} "
+                f"!= backbone layers {n_backbone_layers}"
             )
         # DDiT.forward gained ``return_post_hidden`` in the JEPA fork; detect it
         # so we can skip the output projection when only encoding.
@@ -415,9 +433,9 @@ class DiscreteFlowEncoder(nn.Module):
         ).parameters
 
         # Optional learnable encode-time (sigmoid-bounded to (0, 1)).
-        self._learnable_time = bool(self.cfg.learnable_time)
+        self._learnable_time = self.learnable_time
         if self._learnable_time:
-            t0 = min(max(float(self.cfg.encode_time), 1e-4), 1.0 - 1e-4)
+            t0 = min(max(self.encode_time, 1e-4), 1.0 - 1e-4)
             self.time_logit = nn.Parameter(torch.logit(torch.tensor(float(t0))))
 
     @property
@@ -425,13 +443,14 @@ class DiscreteFlowEncoder(nn.Module):
         """Current encode time as a plain float (for logging)."""
         if self._learnable_time:
             return float(torch.sigmoid(self.time_logit.detach()))
-        return float(self.cfg.encode_time)
+        return float(self.encode_time)
 
     # -- low-level ---------------------------------------------------------- #
     def _attn_mask(self, x: Tensor) -> Tensor:
         """Additive ``[B, 1, L, L]`` mask: -inf where the *key* is PAD."""
         b, length = x.shape
-        valid = x != self.bundle.pad_id
+        valid = (x != self.bundle.pad_id) & (x != self.bundle.bos_id) & (x != self.bundle.eos_id)
+
         block = (~valid).unsqueeze(1).expand(b, length, length)
         return block.float().masked_fill(block, float("-inf")).unsqueeze(1)
 
@@ -440,27 +459,30 @@ class DiscreteFlowEncoder(nn.Module):
             # Keep the graph so d(loss)/d(time_logit) flows through the backbone.
             return torch.sigmoid(self.time_logit).to(device).expand(batch)
         return torch.full(
-            (batch,), float(self.cfg.encode_time), device=device, dtype=torch.float32
+            (batch,), float(self.encode_time), device=device, dtype=torch.float32
         )
 
     def _backbone_hidden(self, x: Tensor) -> Tensor:
-        """Run DDiT once on clean tokens; return last-L concat hiddens ``[B,T,L*d]``."""
+        """Run DDiT once on clean tokens; return concat hiddens ``[B,T,L*d]``."""
         attn = self._attn_mask(x)
         t = self._build_time(x.size(0), x.device)
         kwargs: dict[str, Any] = {"attn_mask": attn, "conds": None}
         if self._supports_post_hidden:
             kwargs["return_post_hidden"] = True
-        with _BlockHiddenCollector(self.backbone, self.cfg.n_backbone_layers) as col:
+        with _BlockHiddenCollector(
+            self.backbone, self.backbone_layer_start, self.backbone_layer_end
+        ) as col:
             self.backbone(x, t, **kwargs)
             return col.stack()
 
-    # -- public API (mirrors MoleculeEncoder) ------------------------------- #
+    # -- public API -------------------------------------------------------- #
     def encode_token_ids(
         self,
         ids: Tensor,
         mask: Tensor,
         *,
         return_projection: bool = False,
+        normalize: bool = True,
     ) -> Tensor | tuple[Tensor, Tensor]:
         x, m = prepare_backbone_tokens(
             ids, mask, bos_id=self.bundle.bos_id, eos_id=self.bundle.eos_id, pad_id=self.bundle.pad_id
@@ -470,7 +492,9 @@ class DiscreteFlowEncoder(nn.Module):
         grad = self._learnable_time or any(p.requires_grad for p in self.backbone.parameters())
         with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
             hs = self._backbone_hidden(x)
-        return self.adapter(hs, m.to(hs.dtype), return_projection=return_projection)
+        return self.adapter(
+            hs, m.to(hs.dtype), return_projection=return_projection, normalize=normalize
+        )
 
     def encode_views(
         self,
@@ -478,11 +502,15 @@ class DiscreteFlowEncoder(nn.Module):
         device: torch.device | str = "cpu",
         *,
         return_projection: bool = False,
+        normalize: bool = True,
     ) -> Tensor | tuple[Tensor, Tensor]:
         seqs = [encode_smiles(self.bundle, v) for v in views]
         ids, mask = pad_batch(seqs, pad_id=self.bundle.pad_id)
         return self.encode_token_ids(
-            ids.to(device), mask.to(device), return_projection=return_projection
+            ids.to(device),
+            mask.to(device),
+            return_projection=return_projection,
+            normalize=normalize,
         )
 
     def encode_molecule(
@@ -513,7 +541,7 @@ class DiscreteFlowEncoder(nn.Module):
         valid = x != self.bundle.pad_id
         t = _sample_timesteps(b, x.device, t_cap=t_cap)
         x0 = torch.randint(
-            int(self.cfg.token_id_min), int(self.bundle.vocab_size), x.shape, device=x.device
+            int(self.token_id_min), int(self.bundle.vocab_size), x.shape, device=x.device
         ).masked_fill(~valid, self.bundle.pad_id)
         x_t = _sample_path(t, x0, x, n=float(path_power))
         attn = self._attn_mask(x_t)
@@ -531,16 +559,74 @@ class DiscreteFlowEncoder(nn.Module):
 
 
 def build_discrete_flow_encoder(
-    cfg: DiscreteFlowConfig | None = None,
     *,
+    ckpt_path: Optional[str],
+    tokenizer_path: str,
+    backbone_layer_start: int,
+    backbone_layer_end: int,
+    d_adapter: int,
+    adapter_n_layers: int,
+    encode_time: float,
+    learnable_time: bool,
+    freeze_backbone: bool,
+    token_id_min: int = 4,
+    n_layer: int = 12,
+    n_head: int = 12,
+    n_embd: int = 768,
+    dropout: float = 0.1,
+    n_conds: int = 0,
     device: str | torch.device = "cpu",
-    adapter: Adapter | None = None,
 ) -> DiscreteFlowEncoder:
-    """One-call factory: load the bundle and wrap it in the encoder."""
-    cfg = cfg or DiscreteFlowConfig()
-    bundle = load_discrete_flow(cfg, device=device)
-    enc = DiscreteFlowEncoder(bundle, adapter=adapter, config=cfg)
+    """Hydra entrypoint: load DDiT + adapter and return a :class:`DiscreteFlowEncoder`.
+
+    Every argument is explicit in ``configs/model/discrete_flow.yaml`` so there
+    are no silent Python defaults on the training path. Fresh-build arch kwargs
+    apply only when ``ckpt_path`` is null.
+    """
+    n_backbone_layers = _n_backbone_layers(backbone_layer_start, backbone_layer_end)
+    bundle = load_discrete_flow(
+        ckpt_path=ckpt_path,
+        tokenizer_path=tokenizer_path,
+        freeze_backbone=freeze_backbone,
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        dropout=dropout,
+        n_conds=n_conds,
+        device=device,
+    )
+    adapter = Adapter(
+        d_backbone=bundle.n_embd,
+        n_backbone_layers=n_backbone_layers,
+        d_adapter=d_adapter,
+        n_layers=adapter_n_layers,
+    )
+    enc = DiscreteFlowEncoder(
+        bundle,
+        backbone_layer_start=backbone_layer_start,
+        backbone_layer_end=backbone_layer_end,
+        encode_time=encode_time,
+        learnable_time=learnable_time,
+        token_id_min=token_id_min,
+        adapter=adapter,
+    )
     enc.adapter.to(device)
+    # Stash the exact skeleton kwargs so a checkpoint can be made self-describing
+    # (see EBM/SSL ``on_save_checkpoint``). The hook layer range is *not* derivable
+    # from weights, so it must travel with the ckpt to avoid train/serve skew.
+    enc.build_config = {
+        "tokenizer_path": tokenizer_path,
+        "backbone_layer_start": int(backbone_layer_start),
+        "backbone_layer_end": int(backbone_layer_end),
+        "d_adapter": int(d_adapter),
+        "adapter_n_layers": int(adapter_n_layers),
+        "token_id_min": int(token_id_min),
+        "n_layer": int(bundle.n_layer),
+        "n_head": int(n_head),
+        "n_embd": int(bundle.n_embd),
+        "dropout": float(dropout),
+        "n_conds": int(n_conds),
+    }
     return enc
 
 
@@ -556,17 +642,33 @@ def _main() -> None:
     ap.add_argument("--tokenizer", required=True, help="path to SMILES tokenizer json")
     ap.add_argument("--smiles", nargs="*", default=["CCO", "c1ccccc1"], help="SMILES to encode")
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--n-backbone-layers", type=int, default=4)
+    ap.add_argument(
+        "--backbone-layer-start",
+        type=int,
+        default=8,
+        help="first DDiT block index to hook (0-indexed, inclusive)",
+    )
+    ap.add_argument(
+        "--backbone-layer-end",
+        type=int,
+        default=11,
+        help="last DDiT block index to hook (0-indexed, inclusive)",
+    )
     ap.add_argument("--train-step", action="store_true", help="run one discrete-flow training step")
     args = ap.parse_args()
 
-    cfg = DiscreteFlowConfig(
+    enc = build_discrete_flow_encoder(
         ckpt_path=None if args.from_scratch else args.ckpt,
         tokenizer_path=args.tokenizer,
-        n_backbone_layers=args.n_backbone_layers,
+        backbone_layer_start=args.backbone_layer_start,
+        backbone_layer_end=args.backbone_layer_end,
+        d_adapter=512,
+        adapter_n_layers=4,
+        encode_time=0.5,
+        learnable_time=False,
         freeze_backbone=not args.train_step,
+        device=args.device,
     )
-    enc = build_discrete_flow_encoder(cfg, device=args.device)
 
     z = enc.encode_views(args.smiles, device=args.device)
     print(f"[DiscreteFlow] encoded {len(args.smiles)} SMILES → z_m {tuple(z.shape)} "
@@ -582,6 +684,20 @@ def _main() -> None:
         loss.backward()
         opt.step()
         print(f"[DiscreteFlow] one discrete-flow train step: loss={loss.item():.4f}")
+
+
+def sync_encoder_device(
+    encoder: DiscreteFlowEncoder,
+    device: str | torch.device,
+    *,
+    head: nn.Module | None = None,
+) -> None:
+    """Align backbone + adapter (+ optional head) after ``Trainer.fit`` teardown."""
+    dev = torch.device(device)
+    encoder.adapter.to(dev)
+    encoder.backbone.to(dev)
+    if head is not None:
+        head.to(dev)
 
 
 if __name__ == "__main__":

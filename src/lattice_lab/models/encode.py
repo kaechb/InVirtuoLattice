@@ -1,8 +1,4 @@
-"""Binder SMILES → z_m encoding (with rBRICS fallback) and the per-target EF.
-
-Extracted verbatim from the original ``train_ebm`` so behaviour — including the
-fragmolize fallback and unparseable-SMILES placeholder — is byte-identical.
-"""
+"""Binder SMILES → z_m encoding and the per-target EF metric."""
 
 from __future__ import annotations
 
@@ -11,16 +7,16 @@ import logging
 import numpy as np
 import torch
 
-from lattice_lab.backbone.encoder import MoleculeEncoder
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
 
 logger = logging.getLogger(__name__)
 
-_fragmolize_fallback_count = 0
+_fragmentize_fallback_count = 0
 _unparseable_binder_count = 0
 
 
 def encode_binders(
-    encoder: MoleculeEncoder,
+    encoder: DiscreteFlowEncoder,
     smiles_list: list[str],
     device: torch.device | str,
     *,
@@ -29,20 +25,19 @@ def encode_binders(
     """Encode a list of SMILES (one view per molecule) → ``[B, d_m]``.
 
     ``grad=True`` keeps the adapter forward in the autograd graph (used with
-    adapter fine-tuning). FragMol always runs under ``no_grad``. For the small
-    fraction of molecules where rBRICS can't produce a round-tripping view we
-    fall back to the canonical SMILES; truly unparseable rows get a benign
-    placeholder so the batch stays aligned with its proteins/decoys.
+    adapter fine-tuning). The DDiT backbone stays frozen. Molecules that cannot
+    be fragmented fall back to canonical SMILES; truly unparseable rows get a
+    benign placeholder so the batch stays aligned with proteins/decoys.
     """
-    global _fragmolize_fallback_count, _unparseable_binder_count
+    global _fragmentize_fallback_count, _unparseable_binder_count
     from rdkit import Chem
 
-    from lattice_lab.preprocessing.molecules import smiles_to_fragmol_views
+    from lattice_lab.preprocessing.molecules import smiles_to_fragment_views
 
     views: list[str] = []
     n_fallback = 0
     for s in smiles_list:
-        v = smiles_to_fragmol_views(s, n_views=1)
+        v = smiles_to_fragment_views(s, n_views=1)
         if v:
             views.append(v[0])
             continue
@@ -61,12 +56,12 @@ def encode_binders(
         views.append(Chem.MolToSmiles(mol))
         n_fallback += 1
     if n_fallback:
-        _fragmolize_fallback_count += n_fallback
-        if _fragmolize_fallback_count <= 32 or _fragmolize_fallback_count % 100 == 0:
+        _fragmentize_fallback_count += n_fallback
+        if _fragmentize_fallback_count <= 32 or _fragmentize_fallback_count % 100 == 0:
             logger.info(
-                "fragmolize fallback used for %d/%d binders this batch "
+                "fragmentize fallback used for %d/%d binders this batch "
                 "(running total: %d)",
-                n_fallback, len(smiles_list), _fragmolize_fallback_count,
+                n_fallback, len(smiles_list), _fragmentize_fallback_count,
             )
     if grad:
         return encoder.encode_views(views, device=device)

@@ -1,21 +1,57 @@
-_target_: lattice_lab.models.DiscreteFlowSSLModule
+_target_: lattice_lab.models.discrete_flow_ssl.DiscreteFlowSSLModule
 
-ckpt_path: artifacts/checkpoints/invirtuo_gen.ckpt
-tokenizer_path: artifacts/tokenizer/smiles_new.json
+encoder:
+  _target_: lattice_lab.backbone.discrete_flow.build_discrete_flow_encoder
+  ckpt_path: artifacts/checkpoints/invirtuo_gen.ckpt
+  tokenizer_path: artifacts/tokenizer/smiles_new.json
+  # 0-indexed inclusive DDiT block indices whose hiddens are concatenated.
+  backbone_layer_start: 8
+  backbone_layer_end: 11
+  d_adapter: ${d_adapter}
+  adapter_n_layers: 4
+  learnable_time: true
+  encode_time: 0.98
+  freeze_backbone: true
+  token_id_min: 4
 
-d_adapter: ${d_adapter}
-n_adapter_layers: 4
-n_backbone_layers: 4
-
-# Encode-time is a shared, learnable parameter (sigmoid-bounded to (0,1)).
-learnable_time: true
-encode_time: 0.5
 # Token id of the fragment separator (space) in the discrete-flow tokenizer.
 frag_sep_id: 4
 
-learning_rate: 3.0e-4
+learning_rate: 1.0e-3
 weight_decay: 0.01
 warmup_steps: 500
 total_steps: 30000        # cosine-decay horizon (affects LR shape only)
-temperature: 0.1
+
+# ssl_loss: ntxent (InfoNCE) | lejepa (invariance + SIGReg) | hybrid (ntxent
+# annealed in favor of lejepa over hybrid_anneal_steps)
+ssl_loss: ntxent
+temperature: 0.1          # ntxent/hybrid only
+# Morgan-fingerprint similarity distillation. fp_weight>0 aligns cosine(z_m)
+# with Tanimoto similarity — the LATTICE baseline used 2.0. Works for ntxent,
+# lejepa, and hybrid (distillation runs on a normalized copy of z_m, so
+# lejepa/hybrid's unnormalized latents are untouched). Requires
+# data.return_smiles=true.
+fp_weight: 0.0
+fp_radius: 2
+fp_bits: 2048
+lejepa_lambda: 0.05       # lejepa/hybrid only: (1-eff)*inv + eff*sigreg, eff=lambda/batch_size
+lejepa_n_global_views: 2  # lejepa/hybrid: fragment-shuffle global views (hybrid needs >= 2)
+lejepa_n_local_views: 0    # lejepa/hybrid: one masked fragment per local view
+lejepa_mask_token_id: null  # default [UNK] (never PAD)
+sigreg_num_projections: 512
+sigreg_knots: 17
+sigreg_t_max: 5.0
+sigreg_eps: 1.0e-8
+hybrid_anneal_steps: 0  # hybrid only: alpha 1.0(ntxent)->0.0(lejepa) linearly by this step
+train_rank_every_n_steps: 50  # 0 disables; cheap covariance-rank diagnostic every N train steps
+log_grad_norms: false  # lejepa/hybrid only: per-term grad L2 norm (expensive; diagnostic runs only)
+
+# Val probes: t-SNE (QED, molWt) + Ridge R² (disable with val_probe_n_molecules=0)
+val_probe_n_molecules: 2000
+val_probe_every_n_epochs: 1
+val_probe_encode_batch_size: 128
+val_probe_ridge_alpha: 1.0
+val_probe_test_size: 0.2
+val_probe_tsne_perplexity: null
+
 seed: ${seed}

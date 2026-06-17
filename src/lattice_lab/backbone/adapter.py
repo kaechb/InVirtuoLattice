@@ -1,6 +1,6 @@
 """Stage 2 adapter module.
 
-Takes hidden states from the last ``L`` FragMol decoder layers, projects them to
+Takes hidden states from ``L`` backbone blocks, projects them to
 ``d_adapter``, runs a bidirectional Transformer encoder, mean-pools over real
 tokens, and returns ``z_m ∈ R^{d_adapter}``. A small projection head (MLP) is
 provided for SimCLR contrastive training; it is discarded after SSL.
@@ -9,28 +9,10 @@ Total parameter target: ~10M (4-layer, 8-head, d=512 encoder is the dominant
 chunk; linear projection contributes ~1.5M for 4×768 → 512).
 """
 
-#TODO: this the input_layer makes 0 sense - just take the normal layers of the pretrained transformers so we dont add a shitton of parameters for nothing
-
 from __future__ import annotations
-
-import math
-from dataclasses import dataclass, field
 
 import torch
 from torch import nn
-
-
-@dataclass(frozen=True)
-class AdapterConfig:
-    d_fragmol: int = 768
-    n_fragmol_layers: int = 4  # how many of FragMol's last layers to consume
-    d_adapter: int = 512
-    n_heads: int = 8
-    n_layers: int = 4
-    ff_mult: int = 4
-    dropout: float = 0.1
-    proj_dim: int = 128  # SimCLR projection-head output dim
-    proj_hidden: int = 512
 
 
 class Adapter(nn.Module):
@@ -40,28 +22,42 @@ class Adapter(nn.Module):
     forward through it during SSL but ignore it after training is frozen.
     """
 
-    def __init__(self, cfg: AdapterConfig | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        d_backbone: int = 768,
+        n_backbone_layers: int = 4,
+        d_adapter: int = 512,
+        n_heads: int = 8,
+        n_layers: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.1,
+        proj_dim: int = 128,
+        proj_hidden: int = 512,
+    ) -> None:
         super().__init__()
-        self.cfg = cfg or AdapterConfig()
-        in_dim = self.cfg.d_fragmol * self.cfg.n_fragmol_layers
+        self.d_backbone = d_backbone
+        self.n_backbone_layers = n_backbone_layers
+        self.d_adapter = d_adapter
+        in_dim = d_backbone * n_backbone_layers
 
-        self.input_proj = nn.Linear(in_dim, self.cfg.d_adapter)
+        self.input_proj = nn.Linear(in_dim, d_adapter)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.cfg.d_adapter,
-            nhead=self.cfg.n_heads,
-            dim_feedforward=self.cfg.d_adapter * self.cfg.ff_mult,
-            dropout=self.cfg.dropout,
+            d_model=d_adapter,
+            nhead=n_heads,
+            dim_feedforward=d_adapter * ff_mult,
+            dropout=dropout,
             activation="gelu",
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.cfg.n_layers)
-        self.norm = nn.LayerNorm(self.cfg.d_adapter)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(d_adapter)
 
         self.proj_head = nn.Sequential(
-            nn.Linear(self.cfg.d_adapter, self.cfg.proj_hidden),
+            nn.Linear(d_adapter, proj_hidden),
             nn.GELU(),
-            nn.Linear(self.cfg.proj_hidden, self.cfg.proj_dim),
+            nn.Linear(proj_hidden, proj_dim),
         )
 
         self._init_weights()
@@ -93,18 +89,21 @@ class Adapter(nn.Module):
         attention_mask: torch.Tensor,
         *,
         return_projection: bool = False,
+        normalize: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute ``z_m`` (and optionally the SimCLR projection ``z_p``).
 
         Args:
-            hidden_states_concat: ``[B, T, L*d_fragmol]`` — concatenated hidden
-                states from the last L FragMol layers.
+            hidden_states_concat: ``[B, T, L*d_backbone]`` — concatenated hidden
+                states from L backbone blocks.
             attention_mask: ``[B, T]`` with 1 at real-token positions, 0 at pads.
             return_projection: if True, also return the projection-head output.
+            normalize: L2-normalize outputs. LeJEPA needs raw pooled latents
+                (``normalize=False``); NT-Xent uses normalized projections.
 
         Returns:
-            ``z_m`` ``[B, d_adapter]`` (L2-normalized), or
-            ``(z_m, z_p)`` with ``z_p`` ``[B, proj_dim]`` also L2-normalized.
+            ``z_m`` ``[B, d_adapter]`` (L2-normalized when ``normalize=True``), or
+            ``(z_m, z_p)`` with ``z_p`` ``[B, proj_dim]`` (also normalized when enabled).
         """
         x = self.input_proj(hidden_states_concat)
         # nn.TransformerEncoder expects ``src_key_padding_mask`` where True = ignore.
@@ -116,11 +115,16 @@ class Adapter(nn.Module):
         # callers pass a mask where BOS and EOS positions are already zeroed; the
         # ``stack_views`` helper does that. If they aren't, masked_mean still works.
         pooled = self.masked_mean(x, attention_mask)
-        z_m = torch.nn.functional.normalize(pooled, dim=-1)
+        z_m = (
+            torch.nn.functional.normalize(pooled, dim=-1)
+            if normalize
+            else pooled
+        )
         if not return_projection:
             return z_m
         z_p = self.proj_head(pooled)
-        z_p = torch.nn.functional.normalize(z_p, dim=-1)
+        if normalize:
+            z_p = torch.nn.functional.normalize(z_p, dim=-1)
         return z_m, z_p
 
     @property
