@@ -5,7 +5,7 @@ Order of operations (each step is pure and unit-tested):
 1. ``standardize_smiles`` — largest fragment, neutralize, canonical tautomer.
 2. ``passes_property_filter`` — MW/logP/atom whitelist gate.
 3. ``inchikey_of`` — canonical key for deduplication.
-4. ``smiles_to_fragmol_views`` — produce K augmented FragMol-notation views per molecule.
+4. ``smiles_to_fragment_views`` — produce K augmented space-separated fragment views.
 5. ``morgan_fingerprint`` — Morgan FP for retrieval / sanity (NOT used for training).
 
 These functions are intentionally side-effect free; the orchestrator in
@@ -21,12 +21,8 @@ from typing import Iterable, Sequence
 
 import numpy as np
 from rdkit import Chem, RDLogger
-from rdkit.Chem import AllChem, Descriptors, Crippen, inchi
+from rdkit.Chem import AllChem, Descriptors, Crippen, QED, inchi
 from rdkit.Chem.MolStandardize import rdMolStandardize
-
-from lattice_lab.paths import ensure_fragmol_on_path
-
-ensure_fragmol_on_path()
 
 # Suppress RDKit chatter once at import time.
 RDLogger.DisableLog("rdApp.*")
@@ -115,7 +111,37 @@ def inchikey_of(smiles: str) -> str | None:
         return None
 
 
-def smiles_to_fragmol_views(
+def _brics_fragment_smiles(mol: Chem.Mol) -> list[str]:
+    """Return canonical SMILES for each BRICS fragment of ``mol``.
+
+    Falls back to an empty list when RDKit BRICS fails on pathological
+    structures (some cluster RDKit builds raise internally on certain scaffolds).
+    Callers treat ``[]`` as "use the whole molecule".
+    """
+    from rdkit.Chem import BRICS
+
+    try:
+        pieces = BRICS.BRICSDecompose(mol)
+    except Exception as exc:
+        logger.debug("BRICS decompose failed: %s", exc)
+        return []
+
+    out: list[str] = []
+    for piece in pieces:
+        if isinstance(piece, str):
+            smi = piece
+        elif isinstance(piece, Chem.Mol):
+            smi = Chem.MolToSmiles(piece)
+        else:
+            logger.debug("BRICS returned unexpected piece type: %r", type(piece))
+            continue
+        frag = Chem.MolFromSmiles(smi)
+        if frag is not None:
+            out.append(Chem.MolToSmiles(frag))
+    return out
+
+
+def smiles_to_fragment_views(
     smiles: str,
     n_views: int = 3,
     *,
@@ -123,93 +149,58 @@ def smiles_to_fragmol_views(
     seed: int | None = None,
     max_attempts: int = 64,
 ) -> list[str]:
-    """Generate ``n_views`` distinct FragMol-notation strings for ``smiles``.
+    """Generate ``n_views`` distinct space-separated fragment views for ``smiles``.
 
-    Each view cuts the molecule into a **random** number of rBRICS fragments,
-    drawn per view in ``[1, min(max_fragments, 7, n_possible)]``, then shuffles
-    and renumbers attachment points (``order_fragments_by_attachment_points``).
-    Varying the fragment count across views — not just the fragment order —
-    makes the SSL contrastive task harder: the two paired views of a molecule
-    can differ in granularity, so ``acc@1`` no longer saturates instantly.
-
-    A draw of 1 fragment yields the plain canonical SMILES (no cut), matching
-    FragMol's own ``genfrags.py`` handling of single-fragment molecules. The
-    7-fragment ceiling also matches ``genfrags.py``
-    (``num_fragments = min(num_frags(smiles), 7)``).
-
-    Fragmented views are validity-checked by round-trip canonicalization: only
-    views that reconstruct to the input's canonical SMILES are returned.
-
-    Returns at most ``n_views`` items, possibly fewer if rBRICS fails to produce
-    distinct valid views within ``max_attempts``.
+    Uses RDKit BRICS decomposition (no external fragmentation dependency). Each
+    view samples a random number of fragments in ``[1, min(max_fragments, 7)]``,
+    shuffles them, and joins with spaces — the format expected by the
+    discrete-flow tokenizer.
     """
-    # Local import: FragMol modules require sys.path entry that ``paths`` provides.
-    from utils.fragments import (
-        bridge_smiles_fragments,
-        num_frags,
-        order_fragments_by_attachment_points,
-        smiles2frags,
-    )
-
     rng = random.Random(seed)
-    # RDKit raises an (uncatchable) Boost.Python.ArgumentError if CanonSmiles is
-    # handed a SMILES that MolFromSmiles can't sanitize (e.g. hypervalent P that
-    # slipped past Stage-1 curation). Guard it so a single bad row can't kill a run.
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return []
     canon = Chem.MolToSmiles(mol)
-    n_possible = num_frags(canon)
-
-    # No rBRICS cut points: the canonical SMILES is the only possible view.
-    if n_possible <= 1:
+    frags = _brics_fragment_smiles(mol)
+    if len(frags) <= 1:
         return [canon]
 
-    # Per-view fragment count is sampled from [1, max_frags]; the 7 cap matches
-    # FragMol's genfrags.py training distribution.
-    max_frags = min(max_fragments, 7, n_possible)
+    max_frags = min(max_fragments, 7, len(frags))
     views: list[str] = []
     seen: set[str] = set()
-
-    # Reseed FragMol's global random so each call is reproducible if seed != None.
-    saved_state = random.getstate()
-    if seed is not None:
-        random.seed(seed)
-    try:
-        attempts = 0
-        while len(views) < n_views and attempts < max_attempts:
-            attempts += 1
-            num_fragments = rng.randint(1, max_frags)
-
-            # A draw of 1 means "no cut": the view is the whole molecule's
-            # canonical SMILES (same as genfrags.py for single-fragment mols).
-            if num_fragments == 1:
-                if canon not in seen:
-                    seen.add(canon)
-                    views.append(canon)
-                continue
-
-            frags = smiles2frags(canon, num_fragments)
-            if not frags:
-                continue
-            # FragMol convention: random shuffle then order by attachment points.
-            rng.shuffle(frags)
-            frags = order_fragments_by_attachment_points(frags)
-            try:
-                rebuilt = bridge_smiles_fragments(frags)
-                rebuilt_canon = Chem.CanonSmiles(rebuilt) if rebuilt else None
-            except Exception:
-                rebuilt_canon = None
-            if rebuilt_canon != canon:
-                continue
-            view = " ".join(frags)
-            if view in seen:
-                continue
+    attempts = 0
+    while len(views) < n_views and attempts < max_attempts:
+        attempts += 1
+        k = rng.randint(1, max_frags)
+        if k == 1:
+            if canon not in seen:
+                seen.add(canon)
+                views.append(canon)
+            continue
+        chosen = rng.sample(frags, min(k, len(frags)))
+        rng.shuffle(chosen)
+        view = " ".join(chosen)
+        if view not in seen:
             seen.add(view)
             views.append(view)
-    finally:
-        random.setstate(saved_state)
     return views
+
+
+def seeded_views(smiles: str, k: int) -> list[str]:
+    """Up to ``k`` deterministic seeded fragment views (per-molecule seed derived
+    from the SMILES, so runs are reproducible). Falls back to the canonical SMILES
+    for un-fragmentable molecules and ``[]`` for RDKit-unparseable ones.
+
+    Defined here (a torch-free module) so ``joblib``/``loky`` workers that call it
+    don't cold-import torch at spawn — the slow part of multi-view cache builds.
+    """
+    import hashlib
+
+    seed = int.from_bytes(hashlib.sha1(smiles.encode()).digest()[:4], "little")
+    views = smiles_to_fragment_views(smiles, n_views=k, seed=seed)
+    if views:
+        return views
+    return [Chem.CanonSmiles(smiles)] if Chem.MolFromSmiles(smiles) else []
 
 
 def morgan_fingerprint(smiles: str, radius: int = 2, n_bits: int = 2048) -> np.ndarray | None:
@@ -234,7 +225,7 @@ def process_smiles_record(
     """End-to-end per-molecule pipeline.
 
     Returns a record dict (or ``None`` if the molecule is rejected) with keys:
-    ``smiles`` (canonical), ``inchikey``, ``views`` (list of FragMol strings).
+    ``smiles`` (canonical), ``inchikey``, ``views`` (list of fragment strings).
 
     This is the unit dispatched to worker processes by the orchestrator.
     """
@@ -246,10 +237,37 @@ def process_smiles_record(
     key = inchikey_of(std)
     if key is None:
         return None
-    views = smiles_to_fragmol_views(std, n_views=n_views, seed=seed)
+    views = smiles_to_fragment_views(std, n_views=n_views, seed=seed)
     if not views:
         return None
     return {"smiles": std, "inchikey": key, "views": views}
+
+
+def molecule_qed_molwt(smiles: str) -> tuple[float, float] | None:
+    """Return ``(QED, MolWt)`` for a SMILES string, or ``None`` if invalid."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return float(QED.qed(mol)), float(Descriptors.MolWt(mol))
+
+
+def fragment_view_column(columns) -> str:
+    """Return the fragment-view column name (supports legacy ``fragmol_view``).
+
+    Accepts a DataFrame or any iterable of column names (e.g. parquet schema).
+    """
+    names = columns.columns if hasattr(columns, "columns") else columns
+    for col in ("fragment_view", "fragmol_view"):
+        if col in names:
+            return col
+    raise KeyError("expected fragment_view or fragmol_view column in parquet")
+
+
+def fragment_view_column_for_parquet(path) -> str:
+    """Resolve the view column from a parquet file schema (no row I/O)."""
+    import pyarrow.parquet as pq
+
+    return fragment_view_column(pq.read_schema(path).names)
 
 
 def dedup_records(records: Iterable[dict[str, object]]) -> list[dict[str, object]]:
@@ -279,7 +297,7 @@ def flatten_views_to_rows(records: Sequence[dict[str, object]]) -> list[dict[str
                     "smiles": r["smiles"],
                     "inchikey": r["inchikey"],
                     "view_idx": i,
-                    "fragmol_view": v,
+                    "fragment_view": v,
                 }
             )
     return rows

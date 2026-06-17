@@ -1,9 +1,10 @@
-"""lattice_lab — a clean Hydra + Lightning orchestration layer for LATTICE.
+"""lattice_lab — a self-contained Hydra + Lightning implementation of LATTICE.
 
-This package is a *thin, structured rewrite* of the training/eval entrypoints.
-It does not re-implement any of the science: the energy head, adapter, encoder,
-losses, datasets, protein store and ranking metrics are imported unchanged from
-the proven :mod:`lattice` package. What changed is only the orchestration:
+The package carries its own copy of every pipeline stage (preprocessing, the
+DDiT backbone + adapter, the ESM protein encoder/store, the energy head, losses,
+datasets, ranking metrics and inference). There is no ``import lattice``; the
+science kernels were re-homed from the original monorepo and the orchestration
+was rewritten around:
 
 - Hydra structured configs + ``hydra.utils.instantiate`` instead of the bespoke
   ``train_cli`` dataclass-flattening machinery.
@@ -12,8 +13,7 @@ the proven :mod:`lattice` package. What changed is only the orchestration:
 - Native ``ModelCheckpoint`` / ``WandbLogger`` / ``LearningRateMonitor`` instead
   of the hand-rolled callback that did ``torch.save`` + tqdm + ``wandb.log``.
 
-The original ``lattice.training.*`` entrypoints are left untouched so existing
-runs stay reproducible. See ``lattice_lab/README.md`` for the migration map.
+See ``lattice_lab/README.md`` for the full 7-stage pipeline map.
 """
 
 from __future__ import annotations

@@ -7,7 +7,7 @@ output directory is idempotent: existing shards are skipped.
 
 Usage::
 
-    python -m lattice.preprocessing.run_preprocessing \\
+    python -m lattice_lab.preprocessing.run_preprocessing \\
         --input data/raw.smi --output artifacts/processed/moses/ \\
         --n-views 3 --n-jobs 16
 """
@@ -125,7 +125,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path, help="SMILES file (.smi/.csv/.txt)")
     parser.add_argument("--output", required=True, type=Path, help="output directory for parquet shards")
-    parser.add_argument("--n-views", type=int, default=3, help="FragMol augmentations per molecule")
+    parser.add_argument("--n-views", type=int, default=3, help="fragment-view augmentations per molecule")
     parser.add_argument("--rows-per-shard", type=int, default=1_000_000)
     parser.add_argument("--n-jobs", type=int, default=None)
     parser.add_argument("--chunk-size", type=int, default=50_000)

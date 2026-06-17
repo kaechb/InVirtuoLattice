@@ -18,6 +18,7 @@ ckpt_path: ???
 n_decoys: 600
 d_adapter: 512
 d_protein: 1280
+ssl_run_id: ed7yw5vq
 
 hydra:
   run:

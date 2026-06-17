@@ -3,7 +3,7 @@
 The training loop consumes:
 - per-batch K binder rows, one per target. Each row has ``smiles`` + ``uniprot``;
   the loop encodes the binder on-the-fly through the frozen
-  FragMol+adapter and looks up ``z_p`` in :class:`lattice.protein.store.EmbeddingStore`.
+  DDiT+adapter and looks up ``z_p`` in :class:`lattice_lab.protein.store.EmbeddingStore`.
 - per-batch K × N decoy ``z_m`` vectors sampled from a precomputed pool.
 
 This module provides:
@@ -14,7 +14,7 @@ This module provides:
 - :func:`build_collator` — pulls N decoys per binder using a shared RNG and
   returns the tensors the training loop forwards into the energy head.
 
-The decoy pool is built by :mod:`lattice.ebm.precompute_decoys`; the format is
+The decoy pool is built by :mod:`lattice_lab.ebm.precompute_decoys`; the format is
 purposely the same
 ``mean.dat`` + ``pids.tsv`` + ``manifest.json`` layout as the protein store so
 we can reuse :class:`EmbeddingStore`.
@@ -47,7 +47,7 @@ def load_bdb_index(bdb_store_path: Path | str) -> pd.DataFrame:
     index_path = Path(bdb_store_path) / "index.parquet"
     if not index_path.is_file():
         raise FileNotFoundError(
-            f"missing {index_path}; rebuild with lattice.ebm.precompute_bdb_zm"
+            f"missing {index_path}; rebuild with lattice_lab.ebm.precompute_bdb_zm"
         )
     return pd.read_parquet(index_path)
 
@@ -122,7 +122,7 @@ class BinderDataset(Dataset):
 
     ``binder_threshold_nm`` overrides the binder label: when set, a row is a
     binder iff ``min(Ki, Kd, IC50) <= binder_threshold_nm`` (EC50 excluded, to
-    match :mod:`lattice.preprocessing.bindingdb`), instead of using the
+    match :mod:`lattice_lab.preprocessing.bindingdb`), instead of using the
     precomputed ``is_binder_10uM`` column. This drives affinity-threshold
     ablations (e.g. 1 µM actives) without re-running Stage-1 curation. The
     non-binder hard-neg pool keeps its own (10 µM) definition, so the
@@ -227,9 +227,21 @@ class EBMCollator:
             raise ValueError(f"n_decoys must be positive, got {n_decoys}")
         self.pool = decoy_pool
         self.n_decoys = n_decoys
+        self._base_seed = seed
         self._gen = torch.Generator().manual_seed(seed)
+        self._worker_seeded = False
+
+    def _ensure_worker_seed(self) -> None:
+        """Decorrelate RNG across DataLoader workers (fork copies the seed)."""
+        if self._worker_seeded:
+            return
+        info = torch.utils.data.get_worker_info()
+        if info is not None:
+            self._gen.manual_seed(self._base_seed + info.id + 1)
+        self._worker_seeded = True
 
     def __call__(self, rows: list[BinderRow]) -> EBMBatch:
+        self._ensure_worker_seed()
         b = len(rows)
         decoys = self.pool.sample(b * self.n_decoys, generator=self._gen)
         decoys = decoys.view(b, self.n_decoys, self.pool.dim)
@@ -248,6 +260,23 @@ def stack_z_p(
         [np.asarray(store.get_mean(u), dtype=np.float32) for u in uniprots], axis=0
     )
     return torch.from_numpy(rows).to(device)
+
+
+def stack_binder_z_m(
+    smiles: list[str], store: EmbeddingStore
+) -> torch.Tensor | None:
+    """Look up precomputed binder ``z_m`` for each SMILES → ``[B, d_m]`` (CPU).
+
+    Returns ``None`` if any SMILES is missing from the store, so the caller can
+    fall back to live encoding for that batch instead of crashing.
+    """
+    try:
+        rows = np.stack(
+            [np.asarray(store.get_mean(s), dtype=np.float32) for s in smiles], axis=0
+        )
+    except KeyError:
+        return None
+    return torch.from_numpy(rows)
 
 
 # --------------------------------------------------------------------------
@@ -341,8 +370,20 @@ class HardNegativeCollator:
         if self.n_non > 0 and self._nonbinder_rows.size == 0:
             raise ValueError("frac_non_binder > 0 but no non-binders in bdb_index_df")
 
+        self._base_seed = seed
         self._np_rng = np.random.default_rng(seed)
         self._gen = torch.Generator().manual_seed(seed + 1)
+        self._worker_seeded = False
+
+    def _ensure_worker_seed(self) -> None:
+        """Decorrelate RNG across DataLoader workers (fork copies the seed)."""
+        if self._worker_seeded:
+            return
+        info = torch.utils.data.get_worker_info()
+        if info is not None:
+            self._np_rng = np.random.default_rng(self._base_seed + info.id)
+            self._gen.manual_seed(self._base_seed + info.id + 1)
+        self._worker_seeded = True
 
     @classmethod
     def from_pools(
@@ -392,6 +433,7 @@ class HardNegativeCollator:
         )
 
     def __call__(self, rows: list[BinderRow]) -> EBMBatch:
+        self._ensure_worker_seed()
         b = len(rows)
         decoys = torch.empty(b, self.n_decoys, self.dim, dtype=torch.float32)
         offset = 0

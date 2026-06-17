@@ -4,7 +4,7 @@ Given a single protein **sequence** and a list of ligand **SMILES**, this
 script:
 
 1. Encodes the protein on the fly with frozen ESM-2 → ``z_p ∈ R^1280``.
-2. Encodes each ligand with frozen FragMol + the Stage-2 adapter →
+2. Encodes each ligand with frozen DDiT + the Stage-2 adapter →
    ``z_m ∈ R^512``.
 3. Scores every pair with the trained energy head ``E_θ(z_m, z_p)``.
 4. Writes a **CSV** ranked by predicted binding and a **PNG** violin plot of
@@ -30,7 +30,7 @@ precomputed protein store) and needs no activity labels.
 
 Example::
 
-    python -m lattice.inference.predict \\
+    python -m lattice_lab.inference.predict \\
         --target-fasta thrb.seq \\
         --smiles-file  my_library.csv \\
         --binders      known_binders.smi \\
@@ -48,7 +48,6 @@ import argparse
 import logging
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -57,16 +56,16 @@ import torch
 from rdkit import RDLogger
 from tqdm.auto import tqdm
 
-from lattice_lab.backbone.adapter import Adapter, AdapterConfig
-from lattice_lab.backbone.encoder import EncoderConfig, MoleculeEncoder
-from lattice_lab.backbone.fragmol_loader import load_fragmol
-from lattice_lab.ebm.head import EnergyHead, EnergyHeadConfig
-from lattice_lab.eval.lit_pcba import _fragmol_view, _inchikey_or_none, _safe_torch_load
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
+from lattice_lab.ebm.head import EnergyHead
+from lattice_lab.eval.lit_pcba import _inchikey_or_none
+from lattice_lab.models.builders import build_eval_encoder, load_energy_head
 from lattice_lab.protein.encoder import (
     ESM2_DEFAULT_DIM,
     ESM2_DEFAULT_MODEL,
-    ProteinEncoder,
-    ProteinEncoderConfig,
+    ESMC_DEFAULT_DIM,
+    ESMC_DEFAULT_MODEL,
+    build_protein_encoder,
 )
 
 RDLogger.DisableLog("rdApp.*")
@@ -80,28 +79,6 @@ def _phase(label: str):
     t0 = time.perf_counter()
     yield
     logger.info("%s done in %.1fs", label, time.perf_counter() - t0)
-
-
-@dataclass
-class PredictConfig:
-    target_seq: str
-    smiles_file: Path
-    binders_file: Path | None = None
-    nonbinders_file: Path | None = None
-    head_ckpt: Path = Path("artifacts/energy/checkpoints_gpu1/ebm_last.pt")
-    adapter_ckpt: Path = Path("artifacts/adapter/checkpoints/adapter_v1.pt")
-    output_csv: Path = Path("artifacts/predictions/predictions.csv")
-    output_png: Path = Path("artifacts/predictions/affinity_distribution.png")
-    target_name: str = "target"
-    esm_model: str = ESM2_DEFAULT_MODEL
-    batch_size: int = 256
-    n_jobs: int = 1
-    n_views: int = 4    # seeded rBRICS views averaged per molecule (multi-view TTA;
-                        # 4 matches the reported LIT-PCBA encoding, 1 = fast single-view)
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    n_fragmol_layers: int = 4
-    d_adapter: int = 512
-    d_protein: int = ESM2_DEFAULT_DIM
 
 
 # --------------------------------------------------------------------------
@@ -158,40 +135,17 @@ def read_target_sequence(seq: str | None, fasta: Path | None) -> str:
 # --------------------------------------------------------------------------
 
 
-def build_encoder(cfg: PredictConfig) -> MoleculeEncoder:
-    """Frozen FragMol backbone + Stage-2 adapter → ``MoleculeEncoder``."""
-    logger.info("loading FragMol backbone weights (device=%s)…", cfg.device)
-    bundle = load_fragmol(device=cfg.device)
-    adapter = Adapter(
-        AdapterConfig(
-            d_fragmol=bundle.n_embd,
-            n_fragmol_layers=cfg.n_fragmol_layers,
-            d_adapter=cfg.d_adapter,
-        )
-    )
-    state = _safe_torch_load(cfg.adapter_ckpt)
-    adapter.load_state_dict(state["adapter_state_dict"])
-    encoder = MoleculeEncoder(
-        fragmol=bundle, adapter=adapter,
-        config=EncoderConfig(n_fragmol_layers=cfg.n_fragmol_layers),
-    )
-    encoder.adapter.to(cfg.device).eval()
-    for p in encoder.adapter.parameters():
-        p.requires_grad = False
-    return encoder
+def build_encoder(args: argparse.Namespace) -> DiscreteFlowEncoder:
+    """Frozen DDiT backbone + Stage-2 adapter (loaded from the full ckpt)."""
+    logger.info("loading DDiT backbone + adapter (device=%s)…", args.device)
+    return build_eval_encoder(args.adapter_ckpt, device=args.device)
 
 
-def build_head(cfg: PredictConfig) -> EnergyHead:
-    """Load the trained energy head, honoring the ``head_arch`` saved in cfg."""
-    state = _safe_torch_load(cfg.head_ckpt)
-    arch = (state.get("cfg") or {}).get("head_arch", "cross_attn")
-    head = EnergyHead(EnergyHeadConfig(d_m=cfg.d_adapter, d_p=cfg.d_protein, arch=arch))
-    head.load_state_dict(state["head_state_dict"])
-    head.to(cfg.device).eval()
-    for p in head.parameters():
-        p.requires_grad = False
-    logger.info("loaded energy head arch=%s from %s", arch, cfg.head_ckpt)
-    return head
+def build_head(args: argparse.Namespace) -> EnergyHead:
+    """Load the trained energy head."""
+    return load_energy_head(
+        args.head_ckpt, d_adapter=args.d_adapter, d_protein=args.d_protein, device=args.device,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -199,26 +153,25 @@ def build_head(cfg: PredictConfig) -> EnergyHead:
 # --------------------------------------------------------------------------
 
 
-def encode_protein(cfg: PredictConfig, seq: str) -> np.ndarray:
+def encode_protein(args: argparse.Namespace, seq: str) -> np.ndarray:
     """Encode one protein sequence → ``[d_protein]`` float32 array."""
-    dtype = "float16" if cfg.device.startswith("cuda") else "float32"
-    encoder = ProteinEncoder(
-        ProteinEncoderConfig(
-            model_name=cfg.esm_model,
-            embedding_dim=cfg.d_protein,
-            device=cfg.device,
-            dtype=dtype,
-        )
+    dtype = "float16" if args.device.startswith("cuda") else "float32"
+    encoder = build_protein_encoder(
+        args.protein_backend,
+        model_name=args.esm_model,
+        embedding_dim=args.d_protein,
+        device=args.device,
+        dtype=dtype,
     )
-    logger.info("encoding target protein (%d residues) with %s", len(seq), cfg.esm_model)
+    logger.info("encoding target protein (%d residues) with %s", len(seq), args.esm_model)
     z_p = encoder.embed_protein(seq)  # [d_protein] CPU float32
     return z_p.numpy().astype(np.float32)
 
 
 def encode_ligands(
-    cfg: PredictConfig, encoder: MoleculeEncoder, smiles: list[str], *, desc: str,
+    args: argparse.Namespace, encoder: DiscreteFlowEncoder, smiles: list[str], *, desc: str,
 ) -> tuple[np.ndarray, list[bool]]:
-    """Fragmolize + encode every SMILES, averaging ``cfg.n_views`` seeded rBRICS
+    """Fragmentize + encode every SMILES, averaging ``cfg.n_views`` seeded rBRICS
     views per molecule (multi-view test-time augmentation, matching the LIT-PCBA
     eval encoding; ``n_views=1`` is plain single-view).
 
@@ -227,16 +180,16 @@ def encode_ligands(
     boolean mask (RDKit-unparseable SMILES are marked invalid and excluded from
     ``z_m``). An all-invalid input yields an empty ``z_m`` rather than raising.
     """
-    from lattice_lab.eval.lit_pcba import fragmol_views
+    from lattice_lab.eval.lit_pcba import fragment_views
 
-    n_views = max(1, getattr(cfg, "n_views", 1))
+    n_views = max(1, args.n_views)
     # Per molecule: a list of up to n_views deterministic views ([] if unparseable).
     # Spawning loky workers costs ~1 s each; only worth it for big libraries.
-    use_parallel = cfg.n_jobs not in (0, 1) and len(smiles) >= 1000
+    use_parallel = args.n_jobs not in (0, 1) and len(smiles) >= 1000
     if not use_parallel:
         view_lists = [
-            fragmol_views(s, n_views)
-            for s in tqdm(smiles, desc=f"fragmolize×{n_views} [{desc}]", unit="mol",
+            fragment_views(s, n_views)
+            for s in tqdm(smiles, desc=f"fragmentize×{n_views} [{desc}]", unit="mol",
                           dynamic_ncols=True)
         ]
     else:
@@ -244,10 +197,10 @@ def encode_ligands(
 
         view_lists = list(
             tqdm(
-                Parallel(n_jobs=cfg.n_jobs, backend="loky", return_as="generator")(
-                    delayed(fragmol_views)(s, n_views) for s in smiles
+                Parallel(n_jobs=args.n_jobs, backend="loky", return_as="generator")(
+                    delayed(fragment_views)(s, n_views) for s in smiles
                 ),
-                total=len(smiles), desc=f"fragmolize×{n_views} [{desc}]", unit="mol",
+                total=len(smiles), desc=f"fragmentize×{n_views} [{desc}]", unit="mol",
                 dynamic_ncols=True,
             )
         )
@@ -255,7 +208,7 @@ def encode_ligands(
     valid = [len(vl) > 0 for vl in view_lists]
     n_bad = sum(1 for ok in valid if not ok)
     if n_bad:
-        logger.warning("[%s] %d/%d SMILES could not be fragmolized; skipped",
+        logger.warning("[%s] %d/%d SMILES could not be fragmentized; skipped",
                         desc, n_bad, len(smiles))
 
     # Flatten the valid molecules' views, tracking how many views each contributed.
@@ -267,13 +220,13 @@ def encode_ligands(
             flat.extend(vl)
     if not flat:
         logger.warning("[%s] no valid SMILES", desc)
-        return np.zeros((0, cfg.d_adapter), dtype=np.float32), valid
+        return np.zeros((0, args.d_adapter), dtype=np.float32), valid
 
     enc: list[np.ndarray] = []
-    for i in tqdm(range(0, len(flat), cfg.batch_size),
+    for i in tqdm(range(0, len(flat), args.batch_size),
                   desc=f"encode z_m [{desc}]", unit="batch", dynamic_ncols=True):
         with torch.no_grad():
-            z_m = encoder.encode_views(flat[i : i + cfg.batch_size], device=cfg.device)
+            z_m = encoder.encode_views(flat[i : i + args.batch_size], device=args.device)
         enc.append(z_m.detach().cpu().to(torch.float32).numpy())
     all_z = np.concatenate(enc, axis=0)  # [sum(offs), d]
 
@@ -287,14 +240,14 @@ def encode_ligands(
 
 
 def score(
-    head: EnergyHead, z_m: np.ndarray, z_p: np.ndarray, cfg: PredictConfig
+    head: EnergyHead, z_m: np.ndarray, z_p: np.ndarray, args: argparse.Namespace
 ) -> np.ndarray:
     """Return raw energies ``E`` for ``[n, d_m]`` ``z_m`` against one ``z_p``."""
-    z_p_t = torch.from_numpy(z_p.astype(np.float32)).to(cfg.device)
+    z_p_t = torch.from_numpy(z_p.astype(np.float32)).to(args.device)
     out = np.empty(z_m.shape[0], dtype=np.float32)
-    for i in range(0, z_m.shape[0], cfg.batch_size):
-        chunk = z_m[i : i + cfg.batch_size]
-        z_m_t = torch.from_numpy(chunk.astype(np.float32)).to(cfg.device)
+    for i in range(0, z_m.shape[0], args.batch_size):
+        chunk = z_m[i : i + args.batch_size]
+        z_m_t = torch.from_numpy(chunk.astype(np.float32)).to(args.device)
         z_p_b = z_p_t.unsqueeze(0).expand(z_m_t.shape[0], -1)
         with torch.no_grad():
             e = head(z_m_t, z_p_b)
@@ -303,8 +256,8 @@ def score(
 
 
 def score_smiles_set(
-    cfg: PredictConfig,
-    encoder: MoleculeEncoder,
+    args: argparse.Namespace,
+    encoder: DiscreteFlowEncoder,
     head: EnergyHead,
     z_p: np.ndarray,
     smiles: list[str],
@@ -316,8 +269,8 @@ def score_smiles_set(
     Returns ``(energy, valid)`` where ``energy`` has one entry per input SMILES
     (``NaN`` where the SMILES was unparseable) and ``valid`` is the parse mask.
     """
-    z_m, valid = encode_ligands(cfg, encoder, smiles, desc=desc)
-    energies = score(head, z_m, z_p, cfg)
+    z_m, valid = encode_ligands(args, encoder, smiles, desc=desc)
+    energies = score(head, z_m, z_p, args)
     full = np.full(len(smiles), np.nan, dtype=np.float32)
     full[np.array(valid, dtype=bool)] = energies
     return full, valid
@@ -329,11 +282,11 @@ def score_smiles_set(
 
 
 def plot_violin(
-    cfg: PredictConfig,
+    *,
+    target_name: str,
     screened: np.ndarray | None,
     binders: np.ndarray | None,
     nonbinders: np.ndarray | None,
-    *,
     path: Path,
     ylabel: str,
     ylim: tuple[float, float] | None = None,
@@ -410,7 +363,7 @@ def plot_violin(
     ax.set_ylabel(ylabel)
     if ylim is not None:
         ax.set_ylim(*ylim)
-    ax.set_title(f"Predicted affinity distribution, target: {cfg.target_name}")
+    ax.set_title(f"Predicted affinity distribution, target: {target_name}")
     ax.spines[["top", "right"]].set_visible(False)
     ax.grid(axis="y", ls=":", alpha=0.4)
     fig.tight_layout()
@@ -419,31 +372,33 @@ def plot_violin(
     logger.info("wrote affinity violin plot (%d series) to %s", len(series), path)
 
 
-def predict(cfg: PredictConfig) -> pd.DataFrame:
+def predict(args: argparse.Namespace) -> pd.DataFrame:
     """Run the full prediction pipeline; return the ranked results frame."""
-    cfg.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    smiles = read_smiles(cfg.smiles_file)
-    logger.info("pipeline: 1) encode target  2) load FragMol+adapter  "
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    smiles = read_smiles(args.smiles_file)
+    logger.info("pipeline: 1) encode target  2) load DDiT+adapter  "
                 "3) load head  4) encode+score ligands")
 
     with _phase("[1/4] encode target protein with ESM-2 "
                 "(loads a ~2.5 GB model; first run also downloads it)"):
-        z_p = encode_protein(cfg, cfg.target_seq)
-    with _phase("[2/4] load FragMol backbone + Stage-2 adapter"):
-        encoder = build_encoder(cfg)
+        z_p = encode_protein(args, args.target_seq)
+    with _phase("[2/4] load DDiT backbone + Stage-2 adapter"):
+        encoder = build_encoder(args)
+        # The ckpt is the source of truth for the latent dim.
+        args.d_adapter = encoder.adapter.d_adapter
     with _phase("[3/4] load energy head"):
-        head = build_head(cfg)
+        head = build_head(args)
 
     # --- screened library: the molecules we actually report on ----------
     with _phase(f"[4/4] encode + score {len(smiles)} screened ligands"):
         energy, valid = score_smiles_set(
-            cfg, encoder, head, z_p, smiles, desc="screened"
+            args, encoder, head, z_p, smiles, desc="screened"
         )
     if not any(valid):
-        raise ValueError(f"no valid SMILES to score in {cfg.smiles_file}")
+        raise ValueError(f"no valid SMILES to score in {args.smiles_file}")
 
     df = pd.DataFrame({
-        "target": cfg.target_name,
+        "target": args.target_name,
         "smiles": smiles,
         "inchikey": [_inchikey_or_none(s) for s in smiles],
         "valid": valid,
@@ -452,8 +407,8 @@ def predict(cfg: PredictConfig) -> pd.DataFrame:
     })
     df["rank"] = df["score"].rank(ascending=False, method="min").astype("Int64")
     df = df.sort_values("score", ascending=False, na_position="last").reset_index(drop=True)
-    df.to_csv(cfg.output_csv, index=False)
-    logger.info("wrote %d predictions to %s", len(df), cfg.output_csv)
+    df.to_csv(args.output_csv, index=False)
+    logger.info("wrote %d predictions to %s", len(df), args.output_csv)
 
     screened_scores = df.loc[df["valid"], "score"].to_numpy(dtype=np.float32)
 
@@ -462,22 +417,25 @@ def predict(cfg: PredictConfig) -> pd.DataFrame:
         if path is None:
             return None
         ref_smiles = read_smiles(path)
-        ref_energy, _ = score_smiles_set(cfg, encoder, head, z_p, ref_smiles, desc=desc)
+        ref_energy, _ = score_smiles_set(args, encoder, head, z_p, ref_smiles, desc=desc)
         s = -ref_energy[np.isfinite(ref_energy)]
         logger.info("[%s] scored %d valid molecules (median score=%.3f)",
                     desc, s.size, float(np.median(s)) if s.size else float("nan"))
         return s
 
-    binder_scores = _ref_scores(cfg.binders_file, "binders")
-    nonbinder_scores = _ref_scores(cfg.nonbinders_file, "nonbinders")
+    binder_scores = _ref_scores(args.binders_file, "binders")
+    nonbinder_scores = _ref_scores(args.nonbinders_file, "nonbinders")
 
     # Violin PNG of the predicted ENERGY E (lower = stronger binder).
     def _neg(s: np.ndarray | None) -> np.ndarray | None:
         return None if s is None else -s
 
     plot_violin(
-        cfg, _neg(screened_scores), _neg(binder_scores), _neg(nonbinder_scores),
-        path=cfg.output_png,
+        target_name=args.target_name,
+        screened=_neg(screened_scores),
+        binders=_neg(binder_scores),
+        nonbinders=_neg(nonbinder_scores),
+        path=args.output_png,
         ylabel="energy E   (lower = stronger binder)",
     )
 
@@ -489,7 +447,7 @@ def predict(cfg: PredictConfig) -> pd.DataFrame:
         pct = float((nonbinder_scores < np.median(screened_scores)).mean() * 100.0)
         logger.info("screened median sits above %.1f%% of the non-binder reference", pct)
     top = df.loc[df["valid"]].head(5)
-    logger.info("top predicted binders for %s:", cfg.target_name)
+    logger.info("top predicted binders for %s:", args.target_name)
     for _, r in top.iterrows():
         logger.info("  rank=%-3d score=%+.3f  %s",
                      int(r["rank"]), r["score"], r["smiles"])
@@ -518,19 +476,35 @@ def main() -> None:
                         help="optional SMILES file of KNOWN NON-BINDERS / random "
                              "molecules; added as a reference violin")
     parser.add_argument("--head-ckpt", type=Path,
-                        default=Path("artifacts/energy/checkpoints_gpu1/ebm_last.pt"))
-    parser.add_argument("--adapter-ckpt", type=Path,
-                        default=Path("artifacts/adapter/checkpoints/adapter_v1.pt"))
+                        default=Path("artifacts/energy/checkpoints_gpu1/ebm_last.pt"),
+                        help="trained EBM checkpoint (Stage-5 Lightning .ckpt). The "
+                             "adapter is read from this same file unless --adapter-ckpt "
+                             "is given.")
+    parser.add_argument("--adapter-ckpt", type=Path, default=None,
+                        help="optional Stage-2 adapter ckpt; defaults to --head-ckpt so "
+                             "the encoder always matches the trained head.")
     parser.add_argument("--output-csv", type=Path,
                         default=Path("artifacts/predictions/predictions.csv"))
     parser.add_argument("--output-png", type=Path,
                         default=Path("artifacts/predictions/affinity_distribution.png"))
     parser.add_argument("--target-name", type=str, default="target",
                         help="label used in the CSV and the plot title")
-    parser.add_argument("--esm-model", type=str, default=ESM2_DEFAULT_MODEL)
+    parser.add_argument(
+        "--protein-backend",
+        default="esm2",
+        choices=["esm2", "esmc"],
+        help="protein encoder; must match the backend the head was trained on "
+        "(esm2: d=1280, esmc: ESM C 600M d=1152)",
+    )
+    parser.add_argument(
+        "--esm-model",
+        type=str,
+        default=None,
+        help="override the backend's default checkpoint",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-jobs", type=int, default=1,
-                        help="parallel workers for the CPU fragmolize step")
+                        help="parallel workers for the CPU fragmentize step")
     parser.add_argument("--n-views", type=int, default=4,
                         help="seeded rBRICS views averaged per molecule (multi-view "
                              "test-time augmentation). 4 matches the reported LIT-PCBA "
@@ -543,24 +517,21 @@ def main() -> None:
         level=args.log_level,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    seq = read_target_sequence(args.target_seq, args.target_fasta)
-    cfg = PredictConfig(
-        target_seq=seq,
-        smiles_file=args.smiles_file,
-        binders_file=args.binders,
-        nonbinders_file=args.nonbinders,
-        head_ckpt=args.head_ckpt,
-        adapter_ckpt=args.adapter_ckpt,
-        output_csv=args.output_csv,
-        output_png=args.output_png,
-        target_name=args.target_name,
-        esm_model=args.esm_model,
-        batch_size=args.batch_size,
-        n_jobs=args.n_jobs,
-        n_views=args.n_views,
-        device=args.device,
-    )
-    predict(cfg)
+    args.adapter_ckpt = args.adapter_ckpt or args.head_ckpt
+    args.target_seq = read_target_sequence(args.target_seq, args.target_fasta)
+    args.binders_file = args.binders
+    args.nonbinders_file = args.nonbinders
+    # Provisional latent dim; overwritten from the ckpt once the encoder loads.
+    args.d_adapter = 512
+    if args.protein_backend == "esmc":
+        args.d_protein = ESMC_DEFAULT_DIM
+        if args.esm_model is None:
+            args.esm_model = ESMC_DEFAULT_MODEL
+    else:
+        args.d_protein = ESM2_DEFAULT_DIM
+        if args.esm_model is None:
+            args.esm_model = ESM2_DEFAULT_MODEL
+    predict(args)
 
 
 if __name__ == "__main__":

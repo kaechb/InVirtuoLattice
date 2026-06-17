@@ -22,7 +22,7 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 
-from lattice_lab.backbone.encoder import MoleculeEncoder
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
 from lattice_lab.eval.encode_utils import encode_smiles_batched
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def _load_qm9(path: Path | str, targets: Sequence[str]) -> tuple[list[str], np.n
 
 @torch.no_grad()
 def evaluate_qm9_probe(
-    encoder: MoleculeEncoder,
+    encoder: DiscreteFlowEncoder,
     qm9_csv: Path | str,
     *,
     targets: Sequence[str] = ("homo", "lumo"),

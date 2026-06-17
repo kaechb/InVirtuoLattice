@@ -1,7 +1,7 @@
 """Unified Hydra + Lightning training entrypoint.
 
     python -m lattice_lab.train experiment=ebm_baseline
-    python -m lattice_lab.train experiment=adapter_ssl trainer=smoke
+    python -m lattice_lab.train experiment=adapter_discrete_flow trainer=smoke
 
 Everything downstream of the config is built with ``hydra.utils.instantiate``:
 the datamodule, the LightningModule, the trainer, and the lists of callbacks /
@@ -12,6 +12,12 @@ config tree *is* the wiring.
 from __future__ import annotations
 
 import logging
+import os
+
+# Silence the HF tokenizers fork warning and avoid the fork-after-parallelism
+# deadlock risk: the SMILES tokenizer is only used (single-threaded) on the main
+# process, while the DataLoader forks worker processes for decoy assembly.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import hydra
 import lightning as L
@@ -22,6 +28,7 @@ from lattice_lab.utils import (
     instantiate_loggers,
     log_hyperparameters,
     seed_everything,
+    wire_checkpoint_dirs_to_wandb,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +46,7 @@ def train(cfg: DictConfig) -> dict[str, float]:
 
     callbacks = instantiate_callbacks(cfg.get("callbacks"))
     loggers = instantiate_loggers(cfg.get("logger"))
+    wire_checkpoint_dirs_to_wandb(loggers, callbacks)
 
     logger.info("instantiating trainer <%s>", cfg.trainer._target_)
     trainer: L.Trainer = hydra.utils.instantiate(

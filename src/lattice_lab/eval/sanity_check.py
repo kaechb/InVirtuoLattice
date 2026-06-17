@@ -20,9 +20,8 @@ from pathlib import Path
 
 import torch
 
-from lattice_lab.backbone.adapter import Adapter, AdapterConfig
-from lattice_lab.backbone.encoder import EncoderConfig, MoleculeEncoder
-from lattice_lab.backbone.fragmol_loader import load_fragmol
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
+from lattice_lab.models.builders import build_eval_encoder
 from lattice_lab.eval.baselines import (
     LITERATURE_REFERENCES,
     format_reference_table,
@@ -88,7 +87,7 @@ class SanityReport:
 
 
 def run_sanity_checks(
-    encoder: MoleculeEncoder,
+    encoder: DiscreteFlowEncoder,
     *,
     val_shards: list[Path] | None,
     val_ratio: float = 0.005,
@@ -219,29 +218,7 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    bundle = load_fragmol(device=args.device)
-    # ``pathlib.PosixPath`` (and ``WindowsPath`` on win) appear in saved configs;
-    # allowlist them so ``weights_only=True`` still works on legacy checkpoints
-    # that were written before we started serializing paths as strings.
-    import pathlib
-    path_classes = [pathlib.PosixPath, pathlib.WindowsPath, pathlib.Path]
-    with torch.serialization.safe_globals(path_classes):
-        ck = torch.load(args.adapter, map_location="cpu", weights_only=True)
-    saved_cfg = ck.get("cfg", {})
-    adapter = Adapter(
-        AdapterConfig(
-            d_fragmol=bundle.n_embd,
-            n_fragmol_layers=saved_cfg.get("n_fragmol_layers", 4),
-            d_adapter=saved_cfg.get("d_adapter", 512),
-            n_layers=saved_cfg.get("n_adapter_layers", 4),
-        )
-    )
-    adapter.load_state_dict(ck["adapter_state_dict"])
-    adapter.to(args.device).eval()
-    encoder = MoleculeEncoder(bundle, adapter=adapter,
-                              config=EncoderConfig(
-                                  n_fragmol_layers=saved_cfg.get("n_fragmol_layers", 4)
-                              ))
+    encoder = build_eval_encoder(args.adapter, device=args.device)
 
     val_shards = sorted(args.val_shards.glob("shard_*.parquet")) if args.val_shards else []
     qm9_subset = None if args.qm9_n_subset < 0 else args.qm9_n_subset
@@ -251,7 +228,7 @@ def main() -> None:
     with RunLogger(
         project=args.wandb_project,
         run_name=args.wandb_run_name or "sanity-check",
-        config={"adapter_path": str(args.adapter), **saved_cfg},
+        config={"adapter_path": str(args.adapter), **(encoder.build_config or {})},
         tags=["stage2", "sanity"],
     ) as rl:
         report = run_sanity_checks(

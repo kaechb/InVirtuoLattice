@@ -15,7 +15,7 @@ echo ">>> temp outputs: $TMP   (canonical 0X_ dirs are read-only)"
 PSTORE=artifacts/protein_store/embeddings/esm2_650M
 DZM=artifacts/decoys/decoy_zm_ssl2
 BDB=artifacts/decoys/bdb_zm_ssl2
-ADP=artifacts/adapter/checkpoints_ssl2/adapter_v1.pt
+ADP="${ADP:-artifacts/adapter/ntxent/checkpoints/ed7yw5vq/last.ckpt}"
 SRC=artifacts/processed/bindingdb/threshold_90
 
 # 1. Sample the real parquet (read-only) into the temp dir.
@@ -34,7 +34,7 @@ echo "===================== NEW: lattice_lab.train (experiment=ebm_hardneg) ====
 python -m lattice_lab.train experiment=ebm_hardneg logger=csv \
   data.train_parquet="$TMP/train.parquet" data.val_parquet="$TMP/val.parquet" \
   data.protein_store="$PSTORE" data.decoy_store="$DZM" data.bdb_store="$BDB" \
-  model.adapter_ckpt="$ADP" \
+  model.encoder.adapter_ckpt="$ADP" \
   n_decoys=64 data.batch_size=16 trainer.max_steps=20 \
   trainer.val_check_interval=10 trainer.limit_val_batches=20 $COMMON_GPU \
   hydra.run.dir="$TMP/new" callbacks.model_checkpoint.dirpath="$TMP/new/ckpt"

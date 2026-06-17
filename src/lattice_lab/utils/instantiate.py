@@ -8,13 +8,51 @@ disable all callbacks or loggers with ``callbacks: null`` / ``logger: null``.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import hydra
 from lightning.pytorch import Callback
-from lightning.pytorch.loggers import Logger
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import Logger, WandbLogger
 from omegaconf import DictConfig
 
 logger = logging.getLogger(__name__)
+
+
+def checkpoint_dir_for_run(base_dirpath: str | Path | None, run_id: str) -> Path:
+    """Return ``{base}/{run_id}``, idempotent if ``base`` already ends with ``run_id``."""
+    base = Path(base_dirpath or "checkpoints")
+    if base.name == run_id:
+        return base
+    return base / run_id
+
+
+def wandb_run_id(loggers: list[Logger]) -> str | None:
+    """Return the active W&B run id from the first ``WandbLogger``, if any."""
+    for lg in loggers:
+        if isinstance(lg, WandbLogger):
+            return str(lg.experiment.id)
+    return None
+
+
+def wire_checkpoint_dirs_to_wandb(
+    loggers: list[Logger],
+    callbacks: list[Callback],
+) -> str | None:
+    """Append ``/{wandb_run_id}`` to every ``ModelCheckpoint.dirpath``.
+
+    W&B run ids are only known after the logger initializes, so this runs after
+    ``instantiate_loggers`` / ``instantiate_callbacks`` and before ``Trainer.fit``.
+    """
+    run_id = wandb_run_id(loggers)
+    if run_id is None:
+        return None
+    for cb in callbacks:
+        if isinstance(cb, ModelCheckpoint):
+            ckpt_dir = checkpoint_dir_for_run(cb.dirpath, run_id)
+            cb.dirpath = str(ckpt_dir)
+            logger.info("ModelCheckpoint dirpath → %s", ckpt_dir)
+    return run_id
 
 
 def instantiate_callbacks(callbacks_cfg: DictConfig | None) -> list[Callback]:

@@ -20,15 +20,12 @@ import pandas as pd
 import torch
 from rdkit import Chem, RDLogger
 
-from lattice_lab.backbone.encoder import MoleculeEncoder
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
 from lattice_lab.eval.encode_utils import encode_smiles_batched
-from lattice_lab.paths import REPO_ROOT
 
 RDLogger.DisableLog("rdApp.*")
 
-DEFAULT_BIOISOSTERE_CSV: Path = (
-    REPO_ROOT / "lattice" / "eval" / "data" / "bioisosteres.csv"
-)
+DEFAULT_BIOISOSTERE_CSV: Path = Path(__file__).resolve().parent / "data" / "bioisosteres.csv"
 
 
 @dataclass(frozen=True)
@@ -84,7 +81,7 @@ def _build_partner_index(df: pd.DataFrame) -> tuple[list[str], dict[int, set[int
 
 @torch.no_grad()
 def evaluate_bioisostere_retrieval(
-    encoder: MoleculeEncoder,
+    encoder: DiscreteFlowEncoder,
     csv_path: Path | str = DEFAULT_BIOISOSTERE_CSV,
     *,
     batch_size: int = 64,

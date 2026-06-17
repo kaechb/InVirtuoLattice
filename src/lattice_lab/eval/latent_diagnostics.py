@@ -57,7 +57,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-from dataclasses import dataclass
+import argparse
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -65,13 +66,12 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from lattice_lab.backbone.adapter import Adapter, AdapterConfig
-from lattice_lab.backbone.encoder import EncoderConfig, MoleculeEncoder
-from lattice_lab.backbone.fragmol_loader import load_fragmol
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
 from lattice_lab.ebm.dataset import DecoyZmPool
-from lattice_lab.ebm.head import EnergyHead, EnergyHeadConfig
+from lattice_lab.ebm.head import EnergyHead
 from lattice_lab.ebm.losses import sample_target_prior
-from lattice_lab.eval.lit_pcba import _fragmol_view, _safe_torch_load
+from lattice_lab.eval.lit_pcba import _fragment_view
+from lattice_lab.models.builders import build_eval_encoder, load_energy_head
 from lattice_lab.protein.store import EmbeddingStore
 
 logger = logging.getLogger(__name__)
@@ -81,31 +81,6 @@ _C_ACTIVE = "#2C7FB8"   # actives / focal series
 _C_INACTIVE = "#9E9E9E"  # inactives / reference
 _C_GUIDE = "#555555"    # diagonal / guide lines
 _C_PRIOR = "#E07B39"    # target prior q*
-
-
-@dataclass
-class DiagnosticsConfig:
-    head_ckpt: Path
-    adapter_ckpt: Path
-    source: str = "lit-pcba"             # "lit-pcba" (held-out test) or "val"
-    test_parquet: Path = Path(
-        "artifacts/processed/bindingdb/test_lit_pcba.parquet"
-    )
-    protein_store: Path = Path("artifacts/protein_store/embeddings/esm2_650M/")
-    decoy_store: Path | None = None      # decoy z_m pool, enables figure 6
-    output_dir: Path = Path("artifacts/evaluation/latent_diagnostics/")
-    n_inactives: int = 1500              # inactives sampled for the t-SNE
-    n_targets: int = 40                  # cap on targets used
-    actives_per_target: int = 60         # actives sampled per target
-    min_actives_per_target: int = 10     # val mode: drop proteins below this
-    n_energy_panels: int = 9             # proteins shown in figure 6
-    decoy_sample: int = 4000             # decoys scored per panel in figure 6
-    batch_size: int = 512
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    seed: int = 0
-    n_fragmol_layers: int = 4
-    d_adapter: int = 512
-    d_protein: int = 1280
 
 
 # --------------------------------------------------------------------------
@@ -147,39 +122,21 @@ def _apply_pub_style() -> None:
 # --------------------------------------------------------------------------
 
 
-def _build_encoder(cfg: DiagnosticsConfig) -> MoleculeEncoder:
-    bundle = load_fragmol(device=cfg.device)
-    adapter = Adapter(AdapterConfig(
-        d_fragmol=bundle.n_embd,
-        n_fragmol_layers=cfg.n_fragmol_layers,
-        d_adapter=cfg.d_adapter,
-    ))
-    adapter.load_state_dict(_safe_torch_load(cfg.adapter_ckpt)["adapter_state_dict"])
-    encoder = MoleculeEncoder(
-        fragmol=bundle, adapter=adapter,
-        config=EncoderConfig(n_fragmol_layers=cfg.n_fragmol_layers),
-    )
-    encoder.adapter.to(cfg.device).eval()
-    for p in encoder.adapter.parameters():
-        p.requires_grad = False
-    logger.info("loaded adapter from %s", cfg.adapter_ckpt)
+def _build_encoder(args: argparse.Namespace) -> DiscreteFlowEncoder:
+    encoder = build_eval_encoder(args.adapter_ckpt, device=args.device)
+    args.d_adapter = encoder.adapter.d_adapter
+    logger.info("loaded adapter from %s", args.adapter_ckpt)
     return encoder
 
 
-def _build_head(cfg: DiagnosticsConfig) -> EnergyHead:
-    state = _safe_torch_load(cfg.head_ckpt)
-    arch = (state.get("cfg") or {}).get("head_arch", "cross_attn")
-    head = EnergyHead(EnergyHeadConfig(d_m=cfg.d_adapter, d_p=cfg.d_protein, arch=arch))
-    head.load_state_dict(state["head_state_dict"])
-    head.to(cfg.device).eval()
-    for p in head.parameters():
-        p.requires_grad = False
-    logger.info("loaded energy head arch=%s from %s", arch, cfg.head_ckpt)
-    return head
+def _build_head(args: argparse.Namespace) -> EnergyHead:
+    return load_energy_head(
+        args.head_ckpt, d_adapter=args.d_adapter, d_protein=args.d_protein, device=args.device,
+    )
 
 
 def _load_eval_frame(
-    cfg: DiagnosticsConfig, protein_store: EmbeddingStore, rng: np.random.Generator
+    args: argparse.Namespace, protein_store: EmbeddingStore, rng: np.random.Generator
 ) -> tuple[pd.DataFrame, str]:
     """Load + normalize the evaluation frame to ``(target_name, smiles, is_active)``.
 
@@ -189,19 +146,19 @@ def _load_eval_frame(
     subset of ``n_targets`` proteins, keeping only those with at least
     ``min_actives_per_target`` actives so every panel has signal.
     """
-    if cfg.source == "lit-pcba":
-        df = pd.read_parquet(cfg.test_parquet,
+    if args.source == "lit-pcba":
+        df = pd.read_parquet(args.test_parquet,
                              columns=["target_name", "smiles", "is_active"])
         label = "LIT-PCBA"
-    elif cfg.source == "val":
-        df = pd.read_parquet(cfg.test_parquet,
+    elif args.source == "val":
+        df = pd.read_parquet(args.test_parquet,
                              columns=["uniprot", "smiles", "is_binder_10uM"])
         df = df.rename(columns={"uniprot": "target_name",
                                 "is_binder_10uM": "is_active"})
         label = "BindingDB val"
     else:
         raise ValueError(
-            f"unknown source={cfg.source!r}; expected 'lit-pcba' or 'val'"
+            f"unknown source={args.source!r}; expected 'lit-pcba' or 'val'"
         )
 
     df["target_name"] = df["target_name"].astype(str)
@@ -215,16 +172,16 @@ def _load_eval_frame(
                         len(missing), shown)
     df = df[present].reset_index(drop=True)
 
-    if cfg.source == "val":
+    if args.source == "val":
         act_counts = df.loc[df["is_active"]].groupby("target_name").size()
-        eligible = sorted(act_counts[act_counts >= cfg.min_actives_per_target].index)
+        eligible = sorted(act_counts[act_counts >= args.min_actives_per_target].index)
         if len(eligible) < 2:
             raise ValueError(
                 f"only {len(eligible)} val proteins have >= "
-                f"{cfg.min_actives_per_target} actives; lower "
+                f"{args.min_actives_per_target} actives; lower "
                 "--min-actives-per-target"
             )
-        n_pick = min(cfg.n_targets, len(eligible))
+        n_pick = min(args.n_targets, len(eligible))
         picked = set(rng.choice(np.array(eligible), size=n_pick, replace=False).tolist())
         df = df[df["target_name"].isin(picked)].reset_index(drop=True)
         logger.info("val mode: drew %d random proteins from %d eligible",
@@ -239,31 +196,31 @@ def _load_eval_frame(
 
 
 def _encode_smiles(
-    encoder: MoleculeEncoder, smiles: list[str], cfg: DiagnosticsConfig
+    encoder: DiscreteFlowEncoder, smiles: list[str], args: argparse.Namespace
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fragmolize + encode SMILES → ``(z_m [n_valid, d], valid_mask)``."""
-    views = [_fragmol_view(s) for s in
-             tqdm(smiles, desc="fragmolize", unit="mol", dynamic_ncols=True)]
+    """Fragmentize + encode SMILES → ``(z_m [n_valid, d], valid_mask)``."""
+    views = [_fragment_view(s) for s in
+             tqdm(smiles, desc="fragmentize", unit="mol", dynamic_ncols=True)]
     valid = np.array([v is not None for v in views])
     good = [v for v in views if v is not None]
     chunks: list[np.ndarray] = []
-    for i in tqdm(range(0, len(good), cfg.batch_size), desc="encode z_m",
+    for i in tqdm(range(0, len(good), args.batch_size), desc="encode z_m",
                   unit="batch", dynamic_ncols=True):
         with torch.no_grad():
-            z = encoder.encode_views(good[i:i + cfg.batch_size], device=cfg.device)
+            z = encoder.encode_views(good[i:i + args.batch_size], device=args.device)
         chunks.append(z.detach().cpu().to(torch.float32).numpy())
-    z_m = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, cfg.d_adapter))
+    z_m = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, args.d_adapter))
     return z_m, valid
 
 
 def _paired_energy(
-    head: EnergyHead, z_m: np.ndarray, z_p: np.ndarray, cfg: DiagnosticsConfig
+    head: EnergyHead, z_m: np.ndarray, z_p: np.ndarray, args: argparse.Namespace
 ) -> np.ndarray:
     """Energy for row-aligned ``z_m [N,d_m]`` and ``z_p [N,d_p]``."""
     out = np.empty(len(z_m), dtype=np.float32)
-    for i in range(0, len(z_m), cfg.batch_size):
-        zm = torch.from_numpy(z_m[i:i + cfg.batch_size]).float().to(cfg.device)
-        zp = torch.from_numpy(z_p[i:i + cfg.batch_size]).float().to(cfg.device)
+    for i in range(0, len(z_m), args.batch_size):
+        zm = torch.from_numpy(z_m[i:i + args.batch_size]).float().to(args.device)
+        zp = torch.from_numpy(z_p[i:i + args.batch_size]).float().to(args.device)
         with torch.no_grad():
             out[i:i + zm.shape[0]] = head(zm, zp).cpu().numpy()
     return out
@@ -393,42 +350,42 @@ def plot_zm_binders_by_target(
 
 def _energy_distribution_panels(
     head: EnergyHead, decoy_store: Path, z_p_t: np.ndarray, tgt_used: list[str],
-    a_label: np.ndarray, e_correct: np.ndarray, cfg: DiagnosticsConfig,
+    a_label: np.ndarray, e_correct: np.ndarray, args: argparse.Namespace,
     rng: np.random.Generator,
 ) -> list[dict]:
     """Score one fixed random draw of decoy ``z_m`` under a random subset of
     proteins, returning per-protein energy clouds plus a ``q*`` reference.
 
     The decoy ``z_m`` are precomputed, so this only forwards the energy head,
-    no FragMol. The pool must have been built with the *same* adapter as
+    no live encoding. The pool must have been built with the *same* adapter as
     ``--adapter-ckpt``, hence the dimension check.
     """
     pool = DecoyZmPool.open(decoy_store)
-    if pool.dim != cfg.d_adapter:
+    if pool.dim != args.d_adapter:
         raise ValueError(
-            f"decoy pool dim {pool.dim} != d_adapter {cfg.d_adapter}; rebuild "
+            f"decoy pool dim {pool.dim} != d_adapter {args.d_adapter}; rebuild "
             "the pool with the matching adapter"
         )
-    gen = torch.Generator().manual_seed(cfg.seed)
-    decoy_z_m = pool.sample(cfg.decoy_sample, generator=gen).numpy().astype(np.float32)
+    gen = torch.Generator().manual_seed(args.seed)
+    decoy_z_m = pool.sample(args.decoy_sample, generator=gen).numpy().astype(np.float32)
 
-    n_panels = min(cfg.n_energy_panels, len(tgt_used))
+    n_panels = min(args.n_energy_panels, len(tgt_used))
     panel_j = sorted(
         rng.choice(len(tgt_used), size=n_panels, replace=False).tolist()
     )
     logger.info("figure 6: scoring %d decoys under %d random proteins",
-                cfg.decoy_sample, n_panels)
+                args.decoy_sample, n_panels)
 
     panels: list[dict] = []
     for j in panel_j:
-        zp = np.broadcast_to(z_p_t[j], (cfg.decoy_sample, cfg.d_protein)).copy()
+        zp = np.broadcast_to(z_p_t[j], (args.decoy_sample, args.d_protein)).copy()
         e_decoy = _paired_energy(head, decoy_z_m, zp, cfg)
         e_active = e_correct[a_label == j]
         # q*: anchor the binder delta on this protein's actual active energies
         # (fall back to the decoy cloud if the protein has no encoded actives).
         anchor = e_active if len(e_active) else e_decoy
-        binder_e = anchor[rng.integers(0, len(anchor), size=cfg.decoy_sample)]
-        q_gen = torch.Generator().manual_seed(cfg.seed + j + 1)
+        binder_e = anchor[rng.integers(0, len(anchor), size=args.decoy_sample)]
+        q_gen = torch.Generator().manual_seed(args.seed + j + 1)
         q_star = sample_target_prior(
             1, torch.from_numpy(binder_e).float(), generator=q_gen,
         ).numpy().reshape(-1)
@@ -495,14 +452,14 @@ def plot_energy_distributions(
 # --------------------------------------------------------------------------
 
 
-def run(cfg: DiagnosticsConfig) -> None:
+def run(args: argparse.Namespace) -> None:
     _apply_pub_style()
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(cfg.seed)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
 
-    protein_store = EmbeddingStore.open(cfg.protein_store, mode="r")
+    protein_store = EmbeddingStore.open(args.protein_store, mode="r")
     df, source_label = _load_eval_frame(cfg, protein_store, rng)
-    targets = sorted(df["target_name"].unique())[:cfg.n_targets]
+    targets = sorted(df["target_name"].unique())[:args.n_targets]
     logger.info("%s, targets used: %d", source_label, len(targets))
     if len(targets) < 2:
         raise ValueError(
@@ -520,8 +477,8 @@ def run(cfg: DiagnosticsConfig) -> None:
     for t in targets:
         sub = actives[actives["target_name"] == t]
         if not sub.empty:
-            act_rows.append(sub.sample(n=min(cfg.actives_per_target, len(sub)),
-                                       random_state=cfg.seed))
+            act_rows.append(sub.sample(n=min(args.actives_per_target, len(sub)),
+                                       random_state=args.seed))
     act_df = pd.concat(act_rows, ignore_index=True)
     z_m_a, valid_a = _encode_smiles(encoder, act_df["smiles"].tolist(), cfg)
     act_df = act_df[valid_a].reset_index(drop=True)
@@ -536,58 +493,58 @@ def run(cfg: DiagnosticsConfig) -> None:
     logger.info("actives encoded: %d over %d targets", n_act, k)
 
     # --- inactives (figure 1) ------------------------------------------
-    ina_s = inactives.sample(n=min(cfg.n_inactives, len(inactives)), random_state=cfg.seed)
+    ina_s = inactives.sample(n=min(args.n_inactives, len(inactives)), random_state=args.seed)
     z_m_i, _ = _encode_smiles(encoder, ina_s["smiles"].tolist(), cfg)
 
     # --- one t-SNE of [actives ; inactives] ----------------------------
-    emb = _tsne(np.concatenate([z_m_a, z_m_i], axis=0), cfg.seed)
+    emb = _tsne(np.concatenate([z_m_a, z_m_i], axis=0), args.seed)
     emb_a = emb[:n_act]
 
     # Figure 1: actives vs inactives
-    plot_zm_binders_vs_decoys(emb, n_act, cfg.output_dir / "zm_binders_vs_decoys.png",
+    plot_zm_binders_vs_decoys(emb, n_act, args.output_dir / "zm_binders_vs_decoys.png",
                               source_label)
 
     # --- full active × target energy table (reused by figures 2 & 4) ---
     e_full = np.empty((n_act, k), dtype=np.float32)
     for j in range(k):
-        zp_j = np.broadcast_to(z_p_t[j], (n_act, cfg.d_protein)).copy()
+        zp_j = np.broadcast_to(z_p_t[j], (n_act, args.d_protein)).copy()
         e_full[:, j] = _paired_energy(head, z_m_a, zp_j, cfg)
 
     # Figure 2: K×K target×target mean-energy heatmap
     e_mat = np.stack([e_full[a_label == i].mean(axis=0) for i in range(k)])
-    plot_energy_heatmap(e_mat, tgt_used, cfg.output_dir / "energy_heatmap.png",
+    plot_energy_heatmap(e_mat, tgt_used, args.output_dir / "energy_heatmap.png",
                         source_label)
 
     # Figure 3: cross-target, active vs its protein / a wrong protein
     wrong = (a_label + 1 + rng.integers(0, k - 1, size=n_act)) % k
     e_correct = _paired_energy(head, z_m_a, z_p_a, cfg)
     e_wrong = _paired_energy(head, z_m_a, z_p_t[wrong], cfg)
-    plot_cross_target(e_correct, e_wrong, cfg.output_dir / "cross_target_scatter.png")
+    plot_cross_target(e_correct, e_wrong, args.output_dir / "cross_target_scatter.png")
 
     # Figure 4: active z_m t-SNE colored by energy under two proteins
     plot_zm_energy_two_proteins(emb_a, e_full[:, 0], e_full[:, 1],
                                 tgt_used[0], tgt_used[1],
-                                cfg.output_dir / "zm_energy_two_proteins.png")
+                                args.output_dir / "zm_energy_two_proteins.png")
 
     # Figure 5: active z_m t-SNE colored by target
     plot_zm_binders_by_target(emb_a, a_label, tgt_used,
-                              cfg.output_dir / "zm_binders_by_target.png",
+                              args.output_dir / "zm_binders_by_target.png",
                               source_label)
 
     # Figure 6: per-protein energy distribution vs the prior q*
     n_figs = 5
-    if cfg.decoy_store is not None:
+    if args.decoy_store is not None:
         panels = _energy_distribution_panels(
-            head, cfg.decoy_store, z_p_t, tgt_used, a_label, e_correct, cfg, rng,
+            head, args.decoy_store, z_p_t, tgt_used, a_label, e_correct, cfg, rng,
         )
         plot_energy_distributions(panels, source_label,
-                                  cfg.output_dir / "energy_distribution_grid.png")
+                                  args.output_dir / "energy_distribution_grid.png")
         n_figs = 6
     else:
         logger.warning("figure 6 (energy_distribution_grid) skipped; pass "
                         "--decoy-store to enable it")
 
-    logger.info("done: %d figures in %s", n_figs, cfg.output_dir)
+    logger.info("done: %d figures in %s", n_figs, args.output_dir)
 
 
 def main() -> None:
@@ -637,24 +594,10 @@ def main() -> None:
             else Path("artifacts/processed/bindingdb/threshold_90/val.parquet")
         )
 
-    run(DiagnosticsConfig(
-        head_ckpt=args.head_ckpt,
-        adapter_ckpt=args.adapter_ckpt,
-        source=args.source,
-        test_parquet=test_parquet,
-        protein_store=args.protein_store,
-        decoy_store=args.decoy_store,
-        output_dir=args.output_dir,
-        n_inactives=args.n_inactives,
-        n_targets=args.n_targets,
-        actives_per_target=args.actives_per_target,
-        min_actives_per_target=args.min_actives_per_target,
-        n_energy_panels=args.n_energy_panels,
-        decoy_sample=args.decoy_sample,
-        batch_size=args.batch_size,
-        device=args.device,
-        seed=args.seed,
-    ))
+    args.test_parquet = test_parquet
+    args.d_adapter = 512  # provisional; overwritten from the ckpt by _build_encoder
+    args.d_protein = 1280
+    run(args)
 
 
 if __name__ == "__main__":

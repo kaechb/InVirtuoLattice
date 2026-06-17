@@ -14,7 +14,7 @@ from lattice_lab.ebm.dataset import (
     HardNegativeCollator,
     stack_z_p,
 )
-from lattice_lab.ebm.head import EnergyHead, EnergyHeadConfig
+from lattice_lab.ebm.head import EnergyHead
 from lattice_lab.ebm.losses import (
     InfoNCEEnergyLoss,
     SinkhornEnergyLoss,
@@ -30,7 +30,6 @@ __all__ = [
     "EBMBatch",
     "EBMCollator",
     "EnergyHead",
-    "EnergyHeadConfig",
     "HardNegativeCollator",
     "InfoNCEEnergyLoss",
     "SinkhornEnergyLoss",

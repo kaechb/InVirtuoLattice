@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 import random
+from pathlib import Path
 
-from lattice_lab.data.fragment_views import shuffle_fragment_ids
+import pandas as pd
+import pytest
+
+from lattice_lab.data.fragment_views import (
+    FragmentViewDataset,
+    mask_fragment_ids,
+    shuffle_fragment_ids,
+    split_fragment_ids,
+)
+from lattice_lab.preprocessing.molecules import fragment_view_column
 
 SEP = 4
 
@@ -40,8 +50,37 @@ def test_shuffle_actually_reorders_with_enough_fragments() -> None:
         assert sorted(_fragments(list(o))) == sorted(_fragments(ids))
 
 
+def test_mask_fragment_replaces_one_fragment() -> None:
+    ids = [10, SEP, 20, 21, SEP, 30]
+    masked = mask_fragment_ids(ids, SEP, mask_id=99, rng=random.Random(0), frag_idx=1)
+    frags = split_fragment_ids(masked, SEP)
+    assert frags[0] == [10]
+    assert frags[1] == [99, 99]
+    assert frags[2] == [30]
+
+
+def test_mask_fragment_single_fragment_sequence() -> None:
+    ids = [5, 6, 7]
+    masked = mask_fragment_ids(ids, SEP, mask_id=42, rng=random.Random(1))
+    assert masked == [42, 42, 42]
+
+
 def test_deterministic_given_rng() -> None:
     ids = [5, SEP, 6, SEP, 7]
     a = shuffle_fragment_ids(ids, SEP, random.Random(42))
     b = shuffle_fragment_ids(ids, SEP, random.Random(42))
     assert a == b
+
+
+@pytest.mark.parametrize("view_col", ["fragment_view", "fragmol_view"])
+def test_fragment_view_dataset_reads_view_column(tmp_path: Path, view_col: str) -> None:
+    rows = [
+        {"smiles": "CCO", "inchikey": "IK1", "view_idx": 0, view_col: "a b"},
+        {"smiles": "CCO", "inchikey": "IK1", "view_idx": 1, view_col: "a c"},
+        {"smiles": "CCC", "inchikey": "IK2", "view_idx": 0, view_col: "d e"},
+    ]
+    shard = tmp_path / "shard_0000.parquet"
+    pd.DataFrame(rows).to_parquet(shard, index=False)
+    assert fragment_view_column(pd.read_parquet(shard).head(0)) == view_col
+    ds = FragmentViewDataset([shard], split="train", val_ratio=0.0, test_ratio=0.0)
+    assert len(ds) == 2

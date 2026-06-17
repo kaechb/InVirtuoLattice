@@ -1,7 +1,7 @@
 """Stage 6 — evaluate the trained EBM head on LIT-PCBA.
 
 Pipeline:
-1. Load the frozen FragMol + Stage-2 adapter and the Stage-5 energy head.
+1. Load the frozen DDiT + Stage-2 adapter and the Stage-5 energy head.
 2. For each LIT-PCBA target with an ESM-2 embedding in the protein store,
    encode every ligand SMILES → ``z_m`` (cached on disk by InChIKey so
    re-runs are fast and idempotent).
@@ -13,7 +13,7 @@ Pipeline:
 
 Targets whose pid is missing from the protein store are listed in the
 output but skipped from metrics (Stage-3 likely rejected non-canonical
-residues; pass ``--allow-non-canonical`` to ``lattice.protein.precompute``
+residues; pass ``--no-canonical-filter`` to ``lattice_lab.protein.precompute``
 and re-embed to recover them).
 """
 
@@ -23,7 +23,6 @@ import argparse
 import hashlib
 import json
 import logging
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -32,39 +31,58 @@ import torch
 from rdkit import Chem, RDLogger
 from tqdm.auto import tqdm
 
-from lattice_lab.backbone.adapter import Adapter, AdapterConfig
-from lattice_lab.backbone.encoder import EncoderConfig, MoleculeEncoder
-from lattice_lab.backbone.fragmol_loader import load_fragmol
-from lattice_lab.ebm.head import EnergyHead, EnergyHeadConfig
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
+from lattice_lab.ebm.head import EnergyHead
 from lattice_lab.eval.metrics import auroc, bedroc, ef_at_k
-from lattice_lab.preprocessing.molecules import smiles_to_fragmol_views
+from lattice_lab.models.builders import (
+    adapter_fingerprint,
+    build_eval_encoder,
+    load_energy_head,
+)
+from lattice_lab.preprocessing.molecules import smiles_to_fragment_views
 from lattice_lab.protein.store import EmbeddingStore
 from lattice_lab.training.run_logger import RunLogger
 
 RDLogger.DisableLog("rdApp.*")
 logger = logging.getLogger(__name__)
 
+ADAPTER_FP_KEY = "adapter_fp"
 
-@dataclass
-class LitPcbaEvalConfig:
-    test_parquet: Path = Path("artifacts/processed/bindingdb/test_lit_pcba.parquet")
-    head_ckpt: Path = Path("artifacts/energy/checkpoints/ebm_last.pt")
-    adapter_ckpt: Path = Path("artifacts/adapter/checkpoints/adapter_v1.pt")
-    protein_store: Path = Path("artifacts/protein_store/embeddings/esm2_650M/")
-    zm_cache: Path = Path("artifacts/evaluation/lit_pcba_zm/")
-    output_csv: Path = Path("artifacts/evaluation/lit_pcba_results.csv")
-    violin_dir: Path | None = None      # if set, write a per-target energy violin PNG
-    batch_size: int = 256
-    n_jobs: int = 1                     # parallel workers for CPU fragmolize step
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    bedroc_alpha: float = 80.5
-    ef_percents: tuple[float, ...] = (0.5, 1.0, 5.0)
-    n_fragmol_layers: int = 4
-    d_adapter: int = 512
-    d_protein: int = 1280
-    wandb_project: str = "lattice"
-    wandb_run_name: str | None = None
-    extra: dict[str, str] = field(default_factory=dict)
+
+def enforce_cache_adapter(store: EmbeddingStore, adapter_ckpt: Path | str) -> None:
+    """Guard that a z_m cache was built by the SAME adapter we're scoring with.
+
+    Compares a fingerprint of the adapter *weights* (robust to path differences).
+    - matching fingerprint: no-op.
+    - mismatched fingerprint: raise (the cache lives in a different latent space).
+    - cache predates fingerprinting: record it when the store is writable, else
+      warn that it can't be verified.
+    """
+    fp = adapter_fingerprint(adapter_ckpt)
+    recorded = store.manifest.extra.get(ADAPTER_FP_KEY)
+    if recorded == fp:
+        return
+    if recorded is None:
+        store.manifest.extra[ADAPTER_FP_KEY] = fp
+        store.manifest.extra.setdefault("adapter_ckpt", str(adapter_ckpt))
+        if store.mode != "r":
+            store.save_manifest()
+            logger.warning(
+                "z_m cache %s had no adapter fingerprint; recorded the current "
+                "adapter's (%s…). If this cache was built with a DIFFERENT adapter, "
+                "delete it and rebuild.", store.path, fp[:12],
+            )
+        else:
+            logger.warning(
+                "z_m cache %s has no adapter fingerprint and is read-only; cannot "
+                "verify it matches the scoring adapter (%s…).", store.path, fp[:12],
+            )
+        return
+    raise ValueError(
+        f"z_m cache {store.path} was built with a DIFFERENT adapter than the "
+        f"checkpoint being scored (cache fp={recorded[:12]}…, scorer fp={fp[:12]}…). "
+        f"Delete the cache and rebuild it with the matching adapter."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -72,51 +90,22 @@ class LitPcbaEvalConfig:
 # --------------------------------------------------------------------------
 
 
-def _safe_torch_load(path: Path) -> dict:
-    """``torch.load(weights_only=True)`` with ``PosixPath`` allowlisted.
-
-    Old checkpoints (pre-stringified cfg) embedded ``pathlib.PosixPath``;
-    PyTorch ≥ 2.6 refuses those by default. Weights are still strict-loaded.
-    """
-    from pathlib import PosixPath, WindowsPath
-
-    with torch.serialization.safe_globals([PosixPath, WindowsPath]):
-        return torch.load(path, map_location="cpu", weights_only=True)
+def _build_encoder(
+    *,
+    adapter_ckpt: Path | str,
+    device: str = "cpu",
+) -> DiscreteFlowEncoder:
+    return build_eval_encoder(adapter_ckpt, device=device)
 
 
-def _build_encoder(cfg: LitPcbaEvalConfig) -> MoleculeEncoder:
-    bundle = load_fragmol(device=cfg.device)
-    adapter = Adapter(
-        AdapterConfig(
-            d_fragmol=bundle.n_embd,
-            n_fragmol_layers=cfg.n_fragmol_layers,
-            d_adapter=cfg.d_adapter,
-        )
-    )
-    state = _safe_torch_load(cfg.adapter_ckpt)
-    adapter.load_state_dict(state["adapter_state_dict"])
-    encoder = MoleculeEncoder(
-        fragmol=bundle, adapter=adapter,
-        config=EncoderConfig(n_fragmol_layers=cfg.n_fragmol_layers),
-    )
-    encoder.adapter.to(cfg.device).eval()
-    for p in encoder.adapter.parameters():
-        p.requires_grad = False
-    return encoder
-
-
-def _build_head(cfg: LitPcbaEvalConfig) -> EnergyHead:
-    state = _safe_torch_load(cfg.head_ckpt)
-    arch = (state.get("cfg") or {}).get("head_arch", "cross_attn")
-    head = EnergyHead(
-        EnergyHeadConfig(d_m=cfg.d_adapter, d_p=cfg.d_protein, arch=arch)
-    )
-    head.load_state_dict(state["head_state_dict"])
-    head.to(cfg.device).eval()
-    for p in head.parameters():
-        p.requires_grad = False
-    logger.info("loaded head arch=%s from %s", arch, cfg.head_ckpt)
-    return head
+def _build_head(
+    head_ckpt: Path | str,
+    *,
+    d_adapter: int = 512,
+    d_protein: int = 1280,
+    device: str = "cpu",
+) -> EnergyHead:
+    return load_energy_head(head_ckpt, d_adapter=d_adapter, d_protein=d_protein, device=device)
 
 
 # --------------------------------------------------------------------------
@@ -132,7 +121,7 @@ def _inchikey_or_none(smiles: str) -> str | None:
     return Chem.MolToInchiKey(mol) or None
 
 
-def fragmol_views(smiles: str, n_views: int = 1) -> list[str]:
+def fragment_views(smiles: str, n_views: int = 1) -> list[str]:
     """Up to ``n_views`` distinct **deterministic** rBRICS views of ``smiles``.
 
     The fragmentation is seeded with a per-molecule hash of the SMILES, so the
@@ -149,21 +138,18 @@ def fragmol_views(smiles: str, n_views: int = 1) -> list[str]:
     if Chem.MolFromSmiles(smiles) is None:
         return []
     seed = int.from_bytes(hashlib.sha1(smiles.encode("utf-8")).digest()[:4], "little")
-    vs = smiles_to_fragmol_views(smiles, n_views=n_views, seed=seed)
+    vs = smiles_to_fragment_views(smiles, n_views=n_views, seed=seed)
     return vs if vs else [Chem.CanonSmiles(smiles)]
 
 
-def _fragmol_view(smiles: str) -> str | None:
-    """One deterministic FragMol view, or ``None`` if unparseable.
-
-    Thin single-view wrapper over :func:`fragmol_views` (used by the
-    single-view z_m cache in :func:`precompute_zm_for_smiles`)."""
-    vs = fragmol_views(smiles, n_views=1)
+def _fragment_view(smiles: str) -> str | None:
+    """One deterministic fragment view, or ``None`` if unparseable."""
+    vs = fragment_views(smiles, n_views=1)
     return vs[0] if vs else None
 
 
 def precompute_zm_for_smiles(
-    encoder: MoleculeEncoder,
+    encoder: DiscreteFlowEncoder,
     smiles_list: list[str],
     inchikeys: list[str],
     store: EmbeddingStore,
@@ -178,10 +164,10 @@ def precompute_zm_for_smiles(
 
     1. **Dedupe**: drop rows whose InChIKey is already cached or seen earlier
        in this run. O(N) with a set.
-    2. **Fragmolize**: convert each surviving SMILES to a FragMol view (or
+    2. **Fragmentize**: convert each surviving SMILES to a DDiT view (or
        canonical-SMILES fallback). This is the slow CPU step; runs in parallel
        across ``n_jobs`` worker processes via joblib.
-    3. **Encode**: batch the views through FragMol+adapter on the configured
+    3. **Encode**: batch the views through DDiT+adapter on the configured
        device and append ``(InChIKey, z_m)`` to the cache.
 
     Idempotent: re-running skips already-cached InChIKeys. Returns the number
@@ -206,24 +192,24 @@ def precompute_zm_for_smiles(
     if not unique:
         return 0
 
-    # --- Phase 2: fragmolize, optionally parallel ------------------------
+    # --- Phase 2: fragmentize, optionally parallel ------------------------
     unique_smiles = [s for _, s in unique]
-    logger.info("fragmolizing %d unique ligands with n_jobs=%d", len(unique), n_jobs)
+    logger.info("fragmentizing %d unique ligands with n_jobs=%d", len(unique), n_jobs)
     if n_jobs in (0, 1):
         views_out: list[str | None] = []
-        for s in tqdm(unique_smiles, desc="fragmolize",
+        for s in tqdm(unique_smiles, desc="fragmentize",
                       unit="mol", dynamic_ncols=True):
-            views_out.append(_fragmol_view(s))
+            views_out.append(_fragment_view(s))
     else:
         from joblib import Parallel, delayed
 
         views_out = list(
             tqdm(
                 Parallel(n_jobs=n_jobs, backend="loky", return_as="generator")(
-                    delayed(_fragmol_view)(s) for s in unique_smiles
+                    delayed(_fragment_view)(s) for s in unique_smiles
                 ),
                 total=len(unique_smiles),
-                desc="fragmolize",
+                desc="fragmentize",
                 unit="mol",
                 dynamic_ncols=True,
             )
@@ -231,16 +217,16 @@ def precompute_zm_for_smiles(
 
     pending_ids: list[str] = []
     pending_views: list[str] = []
-    n_skipped_fragmol = 0
+    n_skipped_fragment = 0
     for (ik, _), v in zip(unique, views_out):
         if v is None:
-            n_skipped_fragmol += 1
+            n_skipped_fragment += 1
             continue
         pending_ids.append(ik)
         pending_views.append(v)
     logger.info(
-        "fragmolize: %d valid views, %d rdkit-rejected",
-        len(pending_ids), n_skipped_fragmol,
+        "fragmentize: %d valid views, %d rdkit-rejected",
+        len(pending_ids), n_skipped_fragment,
     )
     if not pending_ids:
         return 0
@@ -293,7 +279,7 @@ def _plot_target_energy_violin(
     *non-binder* reference (no screened library). ``y_score`` is ``-E``, so the
     plotted energy is ``E = -y_score`` (lower = stronger binder)."""
     # Local import avoids a module-level cycle (predict imports from this module).
-    from lattice_lab.inference.predict import PredictConfig, plot_violin
+    from lattice_lab.inference.predict import plot_violin
 
     energy = -y_score
     e_active = energy[y_true == 1]
@@ -303,24 +289,26 @@ def _plot_target_energy_violin(
                        "(have %d/%d); skipping", target, e_active.size, e_inactive.size)
         return
     out_dir.mkdir(parents=True, exist_ok=True)
-    pcfg = PredictConfig(target_seq="", smiles_file=Path("-"), target_name=target)
     plot_violin(
-        pcfg, None, e_active, e_inactive,
+        target_name=target,
+        screened=None,
+        binders=e_active,
+        nonbinders=e_inactive,
         path=out_dir / f"{target}_energy_violin.png",
         ylabel="energy E   (lower = stronger binder)",
     )
 
 
 def _per_target_metrics(
-    y_true: np.ndarray, y_score: np.ndarray, cfg: LitPcbaEvalConfig
+    y_true: np.ndarray, y_score: np.ndarray, args: argparse.Namespace
 ) -> dict[str, float]:
     out: dict[str, float] = {
         "n": float(y_true.size),
         "n_active": float(int(y_true.sum())),
         "auroc": auroc(y_true, y_score),
-        "bedroc": bedroc(y_true, y_score, alpha=cfg.bedroc_alpha),
+        "bedroc": bedroc(y_true, y_score, alpha=args.bedroc_alpha),
     }
-    for p in cfg.ef_percents:
+    for p in args.ef_percents:
         out[f"ef@{p}%"] = ef_at_k(y_true, y_score, p)
     return out
 
@@ -330,92 +318,133 @@ def _per_target_metrics(
 # --------------------------------------------------------------------------
 
 
-def evaluate(cfg: LitPcbaEvalConfig) -> pd.DataFrame:
+def evaluate(args: argparse.Namespace) -> pd.DataFrame:
     """Run the whole Stage-6 pipeline. Returns the per-target results frame."""
-    cfg.zm_cache.mkdir(parents=True, exist_ok=True)
-    cfg.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    args.zm_cache.mkdir(parents=True, exist_ok=True)
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info("loading test parquet: %s", cfg.test_parquet)
-    df = pd.read_parquet(cfg.test_parquet, columns=["target_name", "smiles", "is_active"])
+    logger.info("loading test parquet: %s", args.test_parquet)
+    df = pd.read_parquet(args.test_parquet, columns=["target_name", "smiles", "is_active"])
     df["smiles"] = df["smiles"].astype(str)
     df["target_name"] = df["target_name"].astype(str)
     df["is_active"] = df["is_active"].astype(int)
     targets = sorted(df["target_name"].unique())
     logger.info("targets in test set: %d", len(targets))
 
-    protein_store = EmbeddingStore.open(cfg.protein_store, mode="r")
+    protein_store = EmbeddingStore.open(args.protein_store, mode="r")
     present_targets = [t for t in targets if t in protein_store.pid_to_row]
     missing_targets = [t for t in targets if t not in protein_store.pid_to_row]
     if missing_targets:
         logger.warning(
             "skipping %d/%d targets missing from protein store: %s. "
-            "Re-run Stage 3 with --allow-non-canonical to embed them.",
+            "Re-run Stage 3 with --no-canonical-filter to embed them.",
             len(missing_targets), len(targets), missing_targets,
         )
 
-    # Compute InChIKeys for the rows we will actually score.
-    work = df[df["target_name"].isin(present_targets)].copy()
-    logger.info("computing InChIKeys for %d rows (n_jobs=%d)…",
-                len(work), cfg.n_jobs)
-    smiles_for_keys = work["smiles"].tolist()
-    if cfg.n_jobs in (0, 1):
-        keys = [
-            _inchikey_or_none(s) for s in tqdm(
-                smiles_for_keys, desc="inchikey", unit="mol", dynamic_ncols=True
-            )
-        ]
-    else:
-        from joblib import Parallel, delayed
+    # Diagnostic: map each target to a DIFFERENT target's z_p (cyclic derangement)
+    # so every ligand set is scored against the wrong protein. If the metrics
+    # barely move vs the normal run, the head is ignoring z_p (target-independent
+    # "binder-likeness"), which explains high val EF but random LIT-PCBA.
+    zp_target = {t: t for t in present_targets}
+    if args.shuffle_zp:
+        n = len(present_targets)
+        zp_target = {present_targets[i]: present_targets[(i + 1) % n] for i in range(n)}
+        logger.warning("DIAGNOSTIC --shuffle-zp: scoring ligands against PERMUTED z_p")
 
-        keys = list(
-            tqdm(
-                Parallel(n_jobs=cfg.n_jobs, backend="loky", return_as="generator")(
-                    delayed(_inchikey_or_none)(s) for s in smiles_for_keys
-                ),
-                total=len(smiles_for_keys),
-                desc="inchikey", unit="mol", dynamic_ncols=True,
+    # The InChIKey is the z_m cache key, so we need one per row. But it is a
+    # deterministic, expensive function of SMILES, and LIT-PCBA decoys are shared
+    # across targets — so compute keys only for *unique* SMILES and persist them
+    # to a sidecar parquet keyed by the test set (reused across zm-cache variants
+    # and across reruns).
+    work = df[df["target_name"].isin(present_targets)].copy()
+    key_cache = args.test_parquet.with_suffix(".inchikeys.parquet")
+    unique_smiles = work["smiles"].unique().tolist()
+    mapping: dict[str, str | None] = {}
+    if key_cache.exists():
+        cached = pd.read_parquet(key_cache)
+        mapping = dict(zip(cached["smiles"], cached["inchikey"]))
+    todo = [s for s in unique_smiles if s not in mapping]
+    logger.info("InChIKeys: %d rows, %d unique SMILES (%d cached, %d to compute, n_jobs=%d)…",
+                len(work), len(unique_smiles), len(unique_smiles) - len(todo),
+                len(todo), args.n_jobs)
+    if todo:
+        if args.n_jobs in (0, 1):
+            new_keys = [
+                _inchikey_or_none(s) for s in tqdm(
+                    todo, desc="inchikey", unit="mol", dynamic_ncols=True
+                )
+            ]
+        else:
+            from joblib import Parallel, delayed
+
+            new_keys = list(
+                tqdm(
+                    Parallel(n_jobs=args.n_jobs, backend="loky", return_as="generator")(
+                        delayed(_inchikey_or_none)(s) for s in todo
+                    ),
+                    total=len(todo),
+                    desc="inchikey", unit="mol", dynamic_ncols=True,
+                )
             )
+        mapping.update(zip(todo, new_keys))
+        key_cache.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"smiles": list(mapping), "inchikey": list(mapping.values())}).to_parquet(
+            key_cache, index=False
         )
-    work["inchikey"] = keys
+        logger.info("wrote InChIKey cache: %s (%d entries)", key_cache, len(mapping))
+    work["inchikey"] = work["smiles"].map(mapping)
     n_dropped_parse = int(work["inchikey"].isna().sum())
     work = work.dropna(subset=["inchikey"]).reset_index(drop=True)
     if n_dropped_parse:
         logger.warning("dropped %d rows whose SMILES did not parse", n_dropped_parse)
 
+    encoder = _build_encoder(adapter_ckpt=args.adapter_ckpt, device=args.device)
+    d_adapter = encoder.adapter.d_adapter
+
     # z_m cache: same store layout as the protein store, keyed on InChIKey.
     zm_store = EmbeddingStore.create(
-        cfg.zm_cache,
-        embedding_dim=cfg.d_adapter,
+        args.zm_cache,
+        embedding_dim=d_adapter,
         model_name="lattice-adapter-v1",
         dtype="float16",
         per_residue=False,
-        extra={"source": str(cfg.test_parquet), "adapter_ckpt": str(cfg.adapter_ckpt)},
+        extra={
+            "source": str(args.test_parquet),
+            "adapter_ckpt": str(args.adapter_ckpt),
+            ADAPTER_FP_KEY: adapter_fingerprint(args.adapter_ckpt),
+        },
     )
+    # Reject (or backfill) a reused cache that was built by a different adapter.
+    enforce_cache_adapter(zm_store, args.adapter_ckpt)
 
-    encoder = _build_encoder(cfg)
     n_new = precompute_zm_for_smiles(
         encoder,
         smiles_list=work["smiles"].tolist(),
         inchikeys=work["inchikey"].tolist(),
         store=zm_store,
-        batch_size=cfg.batch_size,
-        device=cfg.device,
-        n_jobs=cfg.n_jobs,
+        batch_size=args.batch_size,
+        device=args.device,
+        n_jobs=args.n_jobs,
     )
     logger.info("z_m cache: %d entries (%d newly written)", zm_store.manifest.count, n_new)
 
-    head = _build_head(cfg)
+    head = _build_head(
+        args.head_ckpt,
+        d_adapter=d_adapter,
+        d_protein=args.d_protein,
+        device=args.device,
+    )
 
     rows: list[dict[str, float | str]] = []
     with RunLogger(
-        project=cfg.wandb_project,
-        run_name=cfg.wandb_run_name,
-        config=vars(cfg),
+        project=args.wandb_project,
+        run_name=args.wandb_run_name,
+        config=vars(args),
         tags=["stage6", "lit_pcba"],
     ) as run_logger:
         for t in tqdm(present_targets, desc="targets", dynamic_ncols=True):
             sub = work[work["target_name"] == t]
-            z_p = protein_store.get_mean(t)
+            z_p = protein_store.get_mean(zp_target[t])
             # Pull z_m for the InChIKeys this target sees, in the row order.
             idx = np.fromiter((zm_store.pid_to_row[k] for k in sub["inchikey"]),
                               dtype=np.int64, count=len(sub))
@@ -423,13 +452,13 @@ def evaluate(cfg: LitPcbaEvalConfig) -> pd.DataFrame:
             y_true = sub["is_active"].to_numpy(dtype=int)
             y_score = _score_target(
                 head, z_m_rows, z_p,
-                batch_size=cfg.batch_size, device=cfg.device,
+                batch_size=args.batch_size, device=args.device,
             )
-            m = _per_target_metrics(y_true, y_score, cfg)
+            m = _per_target_metrics(y_true, y_score, args)
             m["target"] = t
             rows.append(m)
-            if cfg.violin_dir is not None:
-                _plot_target_energy_violin(t, y_true, y_score, cfg.violin_dir)
+            if args.violin_dir is not None:
+                _plot_target_energy_violin(t, y_true, y_score, args.violin_dir)
             run_logger.log({f"lit_pcba/{t}/{k}": v
                             for k, v in m.items() if k != "target"})
             logger.info("%-8s n=%d n_a=%d auc=%.3f bedroc=%.3f ef0.5=%.2f ef1=%.2f ef5=%.2f",
@@ -440,18 +469,18 @@ def evaluate(cfg: LitPcbaEvalConfig) -> pd.DataFrame:
         for t in missing_targets:
             rows.append({"target": t, "n": float("nan"), "n_active": float("nan"),
                          "auroc": float("nan"), "bedroc": float("nan"),
-                         **{f"ef@{p}%": float("nan") for p in cfg.ef_percents}})
+                         **{f"ef@{p}%": float("nan") for p in args.ef_percents}})
 
         results = pd.DataFrame(rows)
         results = results[
             ["target", "n", "n_active", "auroc", "bedroc"]
-            + [f"ef@{p}%" for p in cfg.ef_percents]
+            + [f"ef@{p}%" for p in args.ef_percents]
         ]
         # Averages over scored targets only.
         scored = results[results["target"].isin(present_targets)]
         avg_row: dict[str, float | str] = {"target": "_mean"}
         median_row: dict[str, float | str] = {"target": "_median"}
-        for col in ["auroc", "bedroc", *[f"ef@{p}%" for p in cfg.ef_percents]]:
+        for col in ["auroc", "bedroc", *[f"ef@{p}%" for p in args.ef_percents]]:
             avg_row[col] = float(scored[col].mean(skipna=True))
             median_row[col] = float(scored[col].median(skipna=True))
         avg_row["n"] = int(scored["n"].sum())
@@ -461,12 +490,12 @@ def evaluate(cfg: LitPcbaEvalConfig) -> pd.DataFrame:
         results = pd.concat(
             [results, pd.DataFrame([avg_row, median_row])], ignore_index=True
         )
-        results.to_csv(cfg.output_csv, index=False)
-        logger.info("wrote per-target results to %s", cfg.output_csv)
+        results.to_csv(args.output_csv, index=False)
+        logger.info("wrote per-target results to %s", args.output_csv)
 
         # W&B summary metrics — one number per (avg, metric) on the same panel.
         summary: dict[str, float] = {}
-        for col in ["auroc", "bedroc", *[f"ef@{p}%" for p in cfg.ef_percents]]:
+        for col in ["auroc", "bedroc", *[f"ef@{p}%" for p in args.ef_percents]]:
             summary[f"lit_pcba/avg/{col}"] = float(avg_row[col])
             summary[f"lit_pcba/median/{col}"] = float(median_row[col])
         summary["lit_pcba/n_targets_scored"] = float(len(present_targets))
@@ -501,12 +530,16 @@ def main() -> None:
                              "PNG (actives vs inactives) here, matching Stage-7 inference")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-jobs", type=int, default=1,
-                        help="Parallel workers for the CPU fragmolize step "
+                        help="Parallel workers for the CPU fragmentize step "
                              "(set to e.g. cpu_count() - 1 to speed up the first run)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--bedroc-alpha", type=float, default=80.5)
     parser.add_argument("--ef-percents", type=str, default="0.5,1,5",
                         help="comma-separated EF cutoffs in %% of the ranked list")
+    parser.add_argument("--shuffle-zp", action="store_true",
+                        help="DIAGNOSTIC: score each target's ligands against a "
+                             "different target's z_p. If metrics barely drop, the "
+                             "head is ignoring the protein.")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--wandb-project", default="lattice")
     parser.add_argument("--wandb-run-name", default=None)
@@ -515,23 +548,9 @@ def main() -> None:
         level=args.log_level,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    cfg = LitPcbaEvalConfig(
-        test_parquet=args.test_parquet,
-        head_ckpt=args.head_ckpt,
-        adapter_ckpt=args.adapter_ckpt,
-        protein_store=args.protein_store,
-        zm_cache=args.zm_cache,
-        output_csv=args.output_csv,
-        violin_dir=args.violin_dir,
-        batch_size=args.batch_size,
-        n_jobs=args.n_jobs,
-        device=args.device,
-        bedroc_alpha=args.bedroc_alpha,
-        ef_percents=tuple(float(x) for x in args.ef_percents.split(",")),
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-    )
-    evaluate(cfg)
+    args.ef_percents = tuple(float(x) for x in args.ef_percents.split(","))
+    args.d_protein = 1280
+    evaluate(args)
 
 
 if __name__ == "__main__":

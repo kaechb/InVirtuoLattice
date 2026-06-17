@@ -15,7 +15,7 @@ project-specific cleaning so the rows are usable for LATTICE's EBM:
 2.  Standardise ligand SMILES (largest fragment, neutralise, canonical tautomer)
     and gate on the same MW/logP/atom whitelist used in Stage 1.
 3.  Length-filter the target chain sequence to 50..1500 residues (matches
-    ``lattice.preprocessing.proteins.filter_length``).
+    ``lattice_lab.preprocessing.proteins.filter_length``).
 4.  Parse all four affinity columns (Ki/Kd/IC50/EC50), stripping qualifiers
     such as ``>``, ``<``, ``~``. Keep the *minimum* numeric nM value as the
     representative affinity and remember which assay produced it.
@@ -27,7 +27,7 @@ project-specific cleaning so the rows are usable for LATTICE's EBM:
     column lets default training subset to binders only.
 
 The output is a list of ``BindingDbRow`` dataclasses; the orchestrator in
-``lattice.preprocessing.run_bindingdb`` materialises them into parquet shards.
+``lattice_lab.preprocessing.run_bindingdb`` materialises them into parquet shards.
 """
 
 from __future__ import annotations

@@ -22,6 +22,7 @@ ckpt_path: null
 n_decoys: 600
 d_adapter: 512
 d_protein: 1280
+ssl_run_id: ed7yw5vq   # Stage-2 W&B run id; override per experiment (e.g. lejepa)
 
 hydra:
   run:

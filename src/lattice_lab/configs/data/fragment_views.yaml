@@ -1,9 +1,12 @@
-_target_: lattice_lab.data.FragmentViewDataModule
+_target_: lattice_lab.data.fragment_views.FragmentViewDataModule
 
 shard_dir: artifacts/processed/moses
-batch_size: 256
+batch_size: 64
 val_ratio: 0.005
 test_ratio: 0.005
 split_seed: 0
 run_validation: true
 num_workers: 0
+# Yield (view, smiles) pairs so the module can build Morgan fingerprints for the
+# similarity-distillation loss. Enable together with model.fp_weight > 0.
+return_smiles: false

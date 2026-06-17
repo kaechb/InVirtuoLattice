@@ -23,14 +23,14 @@ import lightning as L
 import numpy as np
 import torch
 
-from lattice_lab.backbone.encoder import sync_encoder_device
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder, sync_encoder_device
 from lattice_lab.ebm.losses import (
     InfoNCEEnergyLoss,
     SinkhornEnergyLoss,
     cross_target_margin_loss,
 )
 from lattice_lab.eval.metrics import bedroc
-from lattice_lab.models.builders import build_ebm_encoder, build_energy_head
+from lattice_lab.models.builders import build_energy_head
 from lattice_lab.models.encode import ef_at, encode_binders
 from lattice_lab.models.schedules import cosine_with_warmup, lambda_sink_schedule
 
@@ -40,13 +40,11 @@ logger = logging.getLogger(__name__)
 class EBMLitModule(L.LightningModule):
     def __init__(
         self,
+        encoder: DiscreteFlowEncoder,
         *,
-        adapter_ckpt: str | Path,
         resume_from: str | Path | None = None,
         d_adapter: int = 512,
         d_protein: int = 1280,
-        n_fragmol_layers: int = 4,
-        head_arch: str = "cross_attn",
         n_decoys: int = 600,
         learning_rate: float = 3e-4,
         weight_decay: float = 0.01,
@@ -66,23 +64,21 @@ class EBMLitModule(L.LightningModule):
         seed: int = 0,
     ) -> None:
         super().__init__()
-        # Heavy submodules (encoder/head) are excluded from the saved hparams.
-        self.save_hyperparameters()
-
-        self.encoder = build_ebm_encoder(
-            adapter_ckpt=adapter_ckpt,
-            n_fragmol_layers=n_fragmol_layers,
-            d_adapter=d_adapter,
-        )
-        self.head = build_energy_head(
-            d_adapter=d_adapter, d_protein=d_protein, head_arch=head_arch
-        )
-        logger.info("energy head: arch=%s params=%d", head_arch, self.head.num_trainable_params)
+        self.save_hyperparameters(ignore=["encoder"])
+        self.encoder = encoder
+        self.head = build_energy_head(d_adapter=d_adapter, d_protein=d_protein)
+        logger.info("energy head: params=%d", self.head.num_trainable_params)
 
         self.info_loss = InfoNCEEnergyLoss(temperature=temperature)
         self.sink_loss = SinkhornEnergyLoss()
         self._cross_rng = random.Random(seed + 7)
         self._val: dict[str, list[float]] = defaultdict(list)
+        # When the adapter is frozen, binder embeddings are a deterministic
+        # function of the SMILES, so we encode each unique binder through the
+        # DDiT backbone + adapter exactly once and reuse it. This removes the
+        # per-step RDKit fragmentation + full backbone forward that made Stage-5
+        # look "frozen". Kept on CPU (a few KB/row) to spare GPU memory.
+        self._zm_cache: dict[str, torch.Tensor] = {}
 
         if finetune_adapter:
             for p in self.encoder.adapter.parameters():
@@ -97,21 +93,84 @@ class EBMLitModule(L.LightningModule):
             self._load_resume(Path(resume_from), finetune_adapter)
 
     def _load_resume(self, path: Path, finetune_adapter: bool) -> None:
-        from pathlib import PosixPath, WindowsPath
+        """Warm-start head (and optionally adapter) from a full EBM ``.ckpt``."""
+        from lattice_lab.models.builders import (
+            parse_adapter_state,
+            parse_head_checkpoint,
+            safe_torch_load,
+        )
 
-        with torch.serialization.safe_globals([PosixPath, WindowsPath]):
-            state = torch.load(path, map_location="cpu", weights_only=True)
-        self.head.load_state_dict(state["head_state_dict"])
-        if finetune_adapter and "adapter_state_dict" in state:
-            self.encoder.adapter.load_state_dict(state["adapter_state_dict"])
-        logger.info("resumed head from %s (prior step=%s)", path, state.get("global_step"))
+        raw = safe_torch_load(path, weights_only=False)
+        self.head.load_state_dict(parse_head_checkpoint(raw))
+        if finetune_adapter:
+            self.encoder.adapter.load_state_dict(parse_adapter_state(raw))
+        logger.info("resumed from full checkpoint %s", path)
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """Embed the encoder skeleton config so the ckpt is self-describing.
+
+        Lets :func:`load_encoder_from_ckpt` rebuild the exact encoder (including
+        the DDiT hook layer range) from this one file — no base DDiT, no
+        per-caller layer range that could drift from training.
+        """
+        cfg = getattr(self.encoder, "build_config", None)
+        if cfg is not None:
+            checkpoint["encoder_config"] = dict(cfg)
 
     # -- lifecycle -------------------------------------------------------
+    def _freeze_eval_modes(self) -> None:
+        """Force frozen sub-modules into ``eval()``.
+
+        Lightning calls ``self.train()`` at the start of fit/each epoch, which
+        recursively re-enables dropout on the (always-frozen) DDiT backbone and,
+        when not fine-tuning, the adapter. Keeping them in ``eval()`` makes
+        binder embeddings deterministic — required for the z_m cache to be valid
+        and to stop noise leaking into the energy head.
+        """
+        self.encoder.backbone.eval()
+        if not self.hparams.finetune_adapter:
+            self.encoder.adapter.eval()
+
     def on_fit_start(self) -> None:
         sync_encoder_device(self.encoder, self.device, head=self.head)
+        self._freeze_eval_modes()
+
+    def on_train_epoch_start(self) -> None:
+        self._freeze_eval_modes()
 
     def on_validation_start(self) -> None:
         sync_encoder_device(self.encoder, self.device, head=self.head)
+        self._freeze_eval_modes()
+
+    def _encode_binders(self, batch: dict) -> torch.Tensor:
+        """Resolve binder ``z_m`` → ``[B, d_m]``.
+
+        Resolution order (frozen adapter):
+        1. precomputed ``binder_z_m`` from the Stage-4b store (no encoding),
+        2. an in-process SMILES→z_m cache (fallback when no store is wired),
+        3. a live DDiT+adapter forward (when fine-tuning, embeddings change).
+        """
+        if not self.hparams.finetune_adapter and batch.get("binder_z_m") is not None:
+            return batch["binder_z_m"].to(self.device, non_blocking=True)
+
+        smiles = batch["binder_smiles"]
+        if self.hparams.finetune_adapter:
+            # Adapter weights change every step; embeddings are not cacheable.
+            # ``self.training`` keeps the adapter forward in the graph for the
+            # train pass and detaches it during validation.
+            return encode_binders(
+                self.encoder, smiles, self.device, grad=self.training
+            )
+        missing = [s for s in dict.fromkeys(smiles) if s not in self._zm_cache]
+        if missing:
+            z = encode_binders(self.encoder, missing, self.device, grad=False)
+            # Single batched D2H copy (one sync) instead of one per row — the
+            # per-row transfer is what dragged the warm-up epoch down.
+            z_cpu = z.detach().to("cpu")
+            for s, row in zip(missing, z_cpu):
+                self._zm_cache[s] = row
+        rows = [self._zm_cache[s] for s in smiles]
+        return torch.stack(rows, dim=0).to(self.device, non_blocking=True)
 
     # -- training --------------------------------------------------------
     def _mine_hard_negatives(self, z_m_dec: torch.Tensor, z_p: torch.Tensor) -> torch.Tensor:
@@ -129,9 +188,7 @@ class EBMLitModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         hp = self.hparams
-        z_m_pos = encode_binders(
-            self.encoder, batch["binder_smiles"], self.device, grad=hp.finetune_adapter
-        )
+        z_m_pos = self._encode_binders(batch)
         z_p = batch["z_p"].to(self.device)
         z_m_dec = batch["decoy_z_m"].to(self.device)
         if hp.hard_mining_mult > 1:
@@ -175,7 +232,7 @@ class EBMLitModule(L.LightningModule):
     # -- validation ------------------------------------------------------
     def validation_step(self, batch, batch_idx):
         hp = self.hparams
-        z_m_pos = encode_binders(self.encoder, batch["binder_smiles"], self.device)
+        z_m_pos = self._encode_binders(batch)
         z_p = batch["z_p"].to(self.device)
         z_m_dec = batch["decoy_z_m"].to(self.device)
         n = z_m_dec.shape[1]

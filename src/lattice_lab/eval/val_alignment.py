@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from lattice_lab.backbone.encoder import MoleculeEncoder
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
 from lattice_lab.eval.encode_utils import encode_views_batched
 from lattice_lab.training.ssl_dataset import PairedViewDataset
 
@@ -39,7 +39,7 @@ class ValAlignmentResult:
 
 @torch.no_grad()
 def evaluate_val_alignment(
-    encoder: MoleculeEncoder,
+    encoder: DiscreteFlowEncoder,
     val_dataset: PairedViewDataset,
     *,
     batch_size: int = 64,

@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
 
 import torch
 from torch import nn
+
+
+def _prior_default(name: str, fallback: str) -> float:
+    return float(os.environ.get(name, fallback))
 
 
 def _flatten_pair(
@@ -151,66 +154,60 @@ def _entropic_ot(
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class TargetPriorConfig:
-    """Mixture defining the target distribution ``q*`` on energies.
+def sample_target_prior(
+    n_samples: int,
+    binder_e: torch.Tensor,
+    *,
+    alpha: float | None = None,
+    pi: float | None = None,
+    mu_neg: float | None = None,
+    sigma_neg: float = 0.3,
+    student_t_df: float | None = None,
+    student_t_scale: float = 1.0,
+    student_t_loc: float = 0.0,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Draw ``n_samples`` per row from the target prior ``q*``.
 
-    Defaults follow README §Stage 4:
+    Mixture (README §Stage 4):
     - ``alpha`` mass on the binder delta (placed at the empirical binder energy).
     - ``(1 - alpha) * pi`` mass on a narrow Gaussian for true non-binders.
     - ``(1 - alpha) * (1 - pi)`` mass on a Student-t heavy tail to absorb
       false negatives (decoys that are actually binders).
-    """
-
-    alpha: float = float(os.environ.get("LATTICE_PRIOR_ALPHA", 0.1))
-    pi: float = float(os.environ.get("LATTICE_PRIOR_PI", 0.97))
-    mu_neg: float = float(os.environ.get("LATTICE_PRIOR_MU_NEG", 1.0))
-    sigma_neg: float = 0.3
-    student_t_df: float = float(os.environ.get("LATTICE_PRIOR_DF", 3.0))
-    student_t_scale: float = 1.0
-    student_t_loc: float = 0.0
-
-
-def sample_target_prior(
-    n_samples: int,
-    binder_e: torch.Tensor,
-    cfg: TargetPriorConfig | None = None,
-    *,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    """Draw ``n_samples`` per row from the target prior described above.
 
     Args:
         n_samples: how many points to draw per target.
         binder_e: ``[B]`` — the binder energies, used to place the delta and to
             anchor the device/dtype.
-        cfg: mixture parameters (defaults from README).
 
     Returns:
         ``[B, n_samples]`` samples from ``q*``.
     """
-    cfg = cfg or TargetPriorConfig()
+    alpha = _prior_default("LATTICE_PRIOR_ALPHA", "0.1") if alpha is None else alpha
+    pi = _prior_default("LATTICE_PRIOR_PI", "0.97") if pi is None else pi
+    mu_neg = _prior_default("LATTICE_PRIOR_MU_NEG", "1.0") if mu_neg is None else mu_neg
+    student_t_df = _prior_default("LATTICE_PRIOR_DF", "3.0") if student_t_df is None else student_t_df
     device = binder_e.device
     dtype = binder_e.dtype
     b = binder_e.shape[0]
 
     # Per-(target, slot) Bernoulli draws for the mixture component.
     u = torch.rand(b, n_samples, generator=generator, device=device, dtype=dtype)
-    is_binder = u < cfg.alpha
-    is_neg = (u >= cfg.alpha) & (u < cfg.alpha + (1 - cfg.alpha) * cfg.pi)
+    is_binder = u < alpha
+    is_neg = (u >= alpha) & (u < alpha + (1 - alpha) * pi)
     # Else: heavy-tail.
 
     # Gaussian negatives.
     gaussian = (
         torch.randn(b, n_samples, generator=generator, device=device, dtype=dtype)
-        * cfg.sigma_neg
-        + cfg.mu_neg
+        * sigma_neg
+        + mu_neg
     )
     # Student-t heavy tail = Normal / sqrt(ChiSquared / df).
     z = torch.randn(b, n_samples, generator=generator, device=device, dtype=dtype)
-    df = cfg.student_t_df
+    df = student_t_df
     chi2 = torch.distributions.Chi2(df).sample((b, n_samples)).to(device=device, dtype=dtype)
-    student = cfg.student_t_loc + cfg.student_t_scale * z / (chi2 / df).sqrt()
+    student = student_t_loc + student_t_scale * z / (chi2 / df).sqrt()
 
     binder_delta = binder_e.detach().unsqueeze(1).expand(b, n_samples)
     out = torch.where(is_binder, binder_delta, torch.where(is_neg, gaussian, student))
@@ -226,13 +223,25 @@ class SinkhornEnergyLoss(nn.Module):
 
     def __init__(
         self,
-        prior: TargetPriorConfig | None = None,
         *,
+        prior_alpha: float | None = None,
+        prior_pi: float | None = None,
+        prior_mu_neg: float | None = None,
+        prior_sigma_neg: float = 0.3,
+        prior_student_t_df: float | None = None,
+        prior_student_t_scale: float = 1.0,
+        prior_student_t_loc: float = 0.0,
         blur: float = 0.05,
         n_iter: int = 50,
     ) -> None:
         super().__init__()
-        self.prior = prior or TargetPriorConfig()
+        self.prior_alpha = prior_alpha
+        self.prior_pi = prior_pi
+        self.prior_mu_neg = prior_mu_neg
+        self.prior_sigma_neg = prior_sigma_neg
+        self.prior_student_t_df = prior_student_t_df
+        self.prior_student_t_scale = prior_student_t_scale
+        self.prior_student_t_loc = prior_student_t_loc
         self.blur = blur
         self.n_iter = n_iter
 
@@ -243,7 +252,15 @@ class SinkhornEnergyLoss(nn.Module):
         # Detach the binder when seeding the prior so gradients to the prior
         # only flow through the structure of q*, not the live binder value.
         target_samples = sample_target_prior(
-            n_samples=all_e.shape[1], binder_e=binder_e.detach(), cfg=self.prior
+            n_samples=all_e.shape[1],
+            binder_e=binder_e.detach(),
+            alpha=self.prior_alpha,
+            pi=self.prior_pi,
+            mu_neg=self.prior_mu_neg,
+            sigma_neg=self.prior_sigma_neg,
+            student_t_df=self.prior_student_t_df,
+            student_t_scale=self.prior_student_t_scale,
+            student_t_loc=self.prior_student_t_loc,
         )
         div = sinkhorn_divergence_1d(
             all_e, target_samples, blur=self.blur, n_iter=self.n_iter

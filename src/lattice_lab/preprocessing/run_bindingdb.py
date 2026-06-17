@@ -32,7 +32,7 @@ End-to-end pipeline:
             <out>/test_lit_pcba.parquet + lit_pcba_targets.fasta       # LIT-PCBA only
 
     The DUD-E **test** parquet + FASTA are produced separately by
-    ``lattice.preprocessing.run_dude`` (→ ``artifacts/processed/moses_dude/``);
+    ``lattice_lab.preprocessing.run_dude`` (→ ``artifacts/processed/moses_dude/``);
     this script only needs the DUD-E target *sequences* to filter against.
 
 The script is **idempotent**: parquet files that already exist are skipped
@@ -41,14 +41,14 @@ unless ``--overwrite`` is set.
 Examples::
 
     # 90 % split held out against LIT-PCBA (the released default).
-    python -m lattice.preprocessing.run_bindingdb \\
+    python -m lattice_lab.preprocessing.run_bindingdb \\
         --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \\
         --lit-pcba-dir  artifacts/raw/lit_pcba \\
         --output-dir    artifacts/processed/bindingdb \\
         --identity      all --n-jobs 16
 
     # 90 % split held out against DUD-E (reuses the cached curated parquet).
-    python -m lattice.preprocessing.run_bindingdb \\
+    python -m lattice_lab.preprocessing.run_bindingdb \\
         --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \\
         --dude-dir      artifacts/raw/dude \\
         --output-dir    artifacts/processed/bindingdb \\
@@ -217,7 +217,7 @@ def main() -> None:
         ref_targets = dude.load_all(args.dude_dir)
         if not ref_targets:
             raise SystemExit(f"no DUD-E targets found in {args.dude_dir}")
-        # DUD-E's test parquet + FASTA are written by lattice.preprocessing.run_dude
+        # DUD-E's test parquet + FASTA are written by lattice_lab.preprocessing.run_dude
         # (-> artifacts/processed/moses_dude/); here we only need the sequences.
     else:
         bench, suffix = "lit_pcba", ""

@@ -17,7 +17,7 @@ Idempotent: existing outputs are reused unless ``--overwrite`` is set.
 
 Example::
 
-    python -m lattice.preprocessing.run_dude \\
+    python -m lattice_lab.preprocessing.run_dude \\
         --dude-dir   artifacts/raw/dude \\
         --output-dir artifacts/processed/moses_dude
 """

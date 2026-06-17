@@ -52,7 +52,7 @@ class SanityGateCallback(Callback):
             logger.warning("skip_sanity set: not running Stage-2 sanity checks")
             return
         ckpt_cb = trainer.checkpoint_callback
-        best = getattr(ckpt_cb, "best_model_path", "") if ckpt_cb else ""
+        best = ckpt_cb.best_model_path if ckpt_cb else ""
         encoder = pl_module.encoder  # type: ignore[attr-defined]
         if best:
             state = torch.load(best, map_location=pl_module.device, weights_only=True)

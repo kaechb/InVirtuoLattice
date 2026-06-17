@@ -6,7 +6,7 @@ Runs ``Trainer.validate`` so the same ``validation_step`` /
 ``on_validation_epoch_end`` used during training produces the held-out ranking
 metrics (``val/ef1``, ``val/ef5``, ``val/top1``, ``val/bedroc``). For the full
 LIT-PCBA / DUD-E external benchmarks, keep using the proven CLI in
-``lattice.eval.lit_pcba`` — those harnesses are already self-contained.
+``lattice_lab.eval.lit_pcba`` — those harnesses are already self-contained.
 """
 
 from __future__ import annotations

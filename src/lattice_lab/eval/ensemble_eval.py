@@ -2,22 +2,22 @@
 
 Scores LIT-PCBA with the mean per-ligand energy of N seed heads (lower energy =
 stronger binder), then computes AUROC / BEDROC / EF the same way as
-``lattice.eval.lit_pcba``. This is the protocol behind the released 3-seed
+``lattice_lab.eval.lit_pcba``. This is the protocol behind the released 3-seed
 number: average the per-ligand energies, then compute metrics once.
 
-Reuses an already-built z_m cache (InChIKey-keyed EmbeddingStore), so no FragMol
+Reuses an already-built z_m cache (InChIKey-keyed EmbeddingStore), so no live encoding
 encoding is needed and the whole thing runs comfortably on CPU — handy when both
 GPUs are busy training. Optionally writes a per-target actives-vs-inactives
 energy violin (``--violin-dir``) for the separation check.
 
-    python artifacts/energy/ensemble_eval.py \
-        --ckpts artifacts/energy/exp_hardneg_seed0/ebm_best_ef1.pt \
-                artifacts/energy/exp_hardneg_seed1/ebm_best_ef1.pt \
-                artifacts/energy/exp_hardneg_seed2/ebm_best_ef1.pt \
-        --zm-cache      artifacts/evaluation/lit_pcba_zm_hardneg \
+    python -m lattice_lab.eval.ensemble_eval \
+        --ckpts artifacts/energy/lejepa/<run_id0>/last.ckpt \
+                artifacts/energy/lejepa/<run_id1>/last.ckpt \
+                artifacts/energy/lejepa/<run_id2>/last.ckpt \
+        --zm-cache      artifacts/evaluation/lit_pcba_zm_mv4_lejepa \
         --protein-store artifacts/protein_store/embeddings/esm2_650M \
         --test-parquet  artifacts/processed/bindingdb/test_lit_pcba.parquet \
-        --out           artifacts/evaluation/ensemble_hardneg.json
+        --out           artifacts/evaluation/ensemble_hardneg_mv4_lejepa.json
 """
 from __future__ import annotations
 
@@ -30,9 +30,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from lattice_lab.ebm.head import EnergyHead, EnergyHeadConfig
-from lattice_lab.eval.lit_pcba import _inchikey_or_none
+from lattice_lab.ebm.head import EnergyHead
+from lattice_lab.eval.lit_pcba import _inchikey_or_none, enforce_cache_adapter
 from lattice_lab.eval.metrics import auroc, bedroc, ef_at_k
+from lattice_lab.models.builders import adapter_fingerprint, load_energy_head
 from lattice_lab.protein.store import EmbeddingStore
 
 logging.basicConfig(level=logging.INFO,
@@ -41,17 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 def _load_head(ckpt: Path, d_m: int, d_p: int, device: str) -> EnergyHead:
-    from pathlib import PosixPath, WindowsPath
-    with torch.serialization.safe_globals([PosixPath, WindowsPath]):
-        state = torch.load(ckpt, map_location="cpu", weights_only=True)
-    arch = (state.get("cfg") or {}).get("head_arch", "cross_attn")
-    head = EnergyHead(EnergyHeadConfig(d_m=d_m, d_p=d_p, arch=arch))
-    head.load_state_dict(state["head_state_dict"])
-    head.to(device).eval()
-    for p in head.parameters():
-        p.requires_grad = False
-    logger.info("loaded head arch=%s from %s", arch, ckpt)
-    return head
+    return load_energy_head(ckpt, d_adapter=d_m, d_protein=d_p, device=device)
 
 
 def _mean_energy(heads, z_m: np.ndarray, z_p: np.ndarray, device: str,
@@ -108,11 +99,22 @@ def main() -> None:
     zm = EmbeddingStore.open(a.zm_cache, mode="r")
     work = work[work["inchikey"].isin(zm.pid_to_row)].reset_index(drop=True)
 
+    # Guard: every ensemble member must share one adapter (else their z_m live in
+    # different latent spaces), and that adapter must match the z_m cache.
+    fps = [adapter_fingerprint(c) for c in a.ckpts]
+    if len(set(fps)) > 1:
+        raise ValueError(
+            "ensemble checkpoints were trained with DIFFERENT adapters "
+            f"(fingerprints {[f[:12] for f in fps]}); refusing to average their "
+            "energies across mismatched latent spaces."
+        )
+    enforce_cache_adapter(zm, a.ckpts[0])
+
     heads = [_load_head(c, a.d_adapter, a.d_protein, a.device) for c in a.ckpts]
 
     if a.violin_dir is not None:
         a.violin_dir.mkdir(parents=True, exist_ok=True)
-        from lattice_lab.inference.predict import PredictConfig, plot_violin
+        from lattice_lab.inference.predict import plot_violin
 
     rows = []
     for t in present:
@@ -140,10 +142,14 @@ def main() -> None:
         if a.violin_dir is not None:
             ea, ei = energy[y_true == 1], energy[y_true == 0]
             if ea.size >= 2 and ei.size >= 2:
-                pcfg = PredictConfig(target_seq="", smiles_file=Path("-"), target_name=t)
-                plot_violin(pcfg, None, ea, ei,
-                            path=a.violin_dir / f"{t}_energy_violin.png",
-                            ylabel="energy E   (lower = stronger binder)")
+                plot_violin(
+                    target_name=t,
+                    screened=None,
+                    binders=ea,
+                    nonbinders=ei,
+                    path=a.violin_dir / f"{t}_energy_violin.png",
+                    ylabel="energy E   (lower = stronger binder)",
+                )
 
     res = pd.DataFrame(rows)
     summary = {f"mean/{k}": float(res[k].mean()) for k in
