@@ -110,13 +110,17 @@ def test_ijepa_total_is_predict_plus_pooled_reg() -> None:
 
 
 def test_vicreg_penalizes_collapse() -> None:
-    """VICReg's variance hinge fires on collapsed rows, near-zero on spread rows."""
+    """VICReg's variance hinge fires on collapsed rows, ~0 on unit-variance rows."""
     torch.manual_seed(0)
-    reg = VICReg(gamma=1.0, cov_coeff=1.0)
-    collapsed = torch.zeros(64, 32) + 0.01 * torch.randn(1, 32)
+    collapsed = torch.zeros(64, 32) + 0.01 * torch.randn(1, 32)  # identical rows
     spread = torch.randn(64, 32)
-    assert float(reg(collapsed)) > float(reg(spread))
-    assert float(reg(spread)) < 0.5
+    # Isolate the variance hinge (cov_coeff=0): std≈0.01 -> ~0.99; std≈1 -> ~0.
+    var_only = VICReg(gamma=1.0, cov_coeff=0.0)
+    assert float(var_only(collapsed)) > 0.9
+    assert float(var_only(spread)) < 0.1
+    # Full reg (with the covariance penalty) still ranks collapse above spread.
+    full = VICReg(gamma=1.0, cov_coeff=1.0)
+    assert float(full(collapsed)) > float(full(spread))
 
 
 def test_ijepa_use_vicreg_swaps_regularizer() -> None:
@@ -147,7 +151,7 @@ def test_gather_visible_tokens() -> None:
     tok = torch.tensor(
         [[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]], [[4.0, 0.0], [5.0, 0.0], [6.0, 0.0]]]
     )
-    hole = torch.tensor([[False, True, True], [True, False, False]])
+    hole = torch.tensor([[False, True, True], [False, False, True]])
     valid = torch.ones(2, 3, dtype=torch.bool)
     out = DiscreteFlowSSLModule._gather_visible_tokens(tok, hole, valid)
     assert out.shape == (3, 2)
@@ -167,6 +171,7 @@ def test_ijepa_has_predictor_and_trains() -> None:
 def test_ijepa_predict_invariant_to_target_scale() -> None:
     """Cosine regression is invariant to the target's magnitude."""
     loss_fn = IJEPALoss(dim=16, lejepa_lambda=0.0, sigreg_num_projections=8, sigreg_knots=9)
+    loss_fn.eval()  # disable predictor dropout so the two passes differ only by target scale
     tok, hole, valid, target, z_pooled = _ijepa_batch(d=16)
     base = loss_fn(tok, hole, target, z_pooled, valid=valid).predict.item()
     scaled = loss_fn(tok, hole, target * 100.0, z_pooled, valid=valid).predict.item()
