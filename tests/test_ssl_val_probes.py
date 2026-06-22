@@ -23,14 +23,36 @@ def test_molecule_qed_molwt_ethanol() -> None:
 
 
 def test_molecule_probe_props_ethanol() -> None:
-    from lattice_lab.preprocessing.molecules import molecule_probe_props
+    import math
+
+    from lattice_lab.preprocessing.molecules import (
+        PROBE_DESCRIPTOR_NAMES,
+        molecule_probe_props,
+    )
 
     row = molecule_probe_props("CCO")
     assert row is not None
-    qed, mw, logp = row
-    assert 0.0 < qed <= 1.0
-    assert 40.0 < mw < 50.0
-    assert -1.0 < logp < 1.0
+    assert len(row) == len(PROBE_DESCRIPTOR_NAMES)
+    d = dict(zip(PROBE_DESCRIPTOR_NAMES, row))
+    assert 0.0 < d["qed"] <= 1.0
+    assert 40.0 < d["molwt"] < 50.0
+    assert -1.0 < d["logp"] < 1.0
+    assert d["fraction_csp3"] == 1.0  # ethanol: both carbons sp3
+    assert d["bertz_ct"] >= 0.0
+    assert math.isfinite(d["balaban_j"])
+
+
+def test_probe_result_as_metrics_keys() -> None:
+    from lattice_lab.preprocessing.molecules import PROBE_DESCRIPTOR_NAMES
+    from lattice_lab.training.ssl_val_probes import _build_probe_result
+
+    r2 = {name: 0.5 for name in PROBE_DESCRIPTOR_NAMES}
+    result = _build_probe_result(r2, n_probe=100, n_train=80, n_test=20, r2_molwt_sum=0.4)
+    metrics = result.as_metrics()
+    for name in PROBE_DESCRIPTOR_NAMES:
+        assert metrics[f"r2/{name}"] == 0.5
+    assert "r2/mean" in metrics and "r2/mean_structural" in metrics
+    assert metrics["r2/molwt_sum"] == 0.4
 
 
 def test_ridge_r2_perfect_linear_relation() -> None:

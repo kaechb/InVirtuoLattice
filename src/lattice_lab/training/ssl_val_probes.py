@@ -1,10 +1,16 @@
 """Validation probes for Stage-2 SSL (t-SNE + linear R² on chemistry props).
 
 Each validation epoch (configurable) samples molecules from the MOSES val split,
-encodes them to ``z_m``, fits Ridge probes for QED, molecular weight, logP, and
-sum-pooled molWt, and logs 2D t-SNE scatter plots (after PCA to 50 components)
-colored by QED, molWt, logP, and sum-pool molWt to W&B. LeJEPA and hybrid (which anneals toward LeJEPA) use unnormalized ``z_m``
-(matching SIGReg); NT-Xent uses L2-normalized ``z_m`` (matching downstream deploy).
+encodes them to ``z_m``, fits Ridge probes for every descriptor in
+:data:`PROBE_DESCRIPTOR_NAMES` (QED, molWt, logP plus the non-additive
+FractionCSP3 / BertzCT / BalabanJ) and for sum-pooled molWt, and logs a 2D t-SNE
+scatter (PCA→t-SNE) colored by each descriptor to W&B. The additive descriptors
+(QED/molWt/logP) are ~linear in fingerprint bits, so they mainly detect collapse;
+the structural ones are non-linear graph functions a linear probe cannot recover
+from a fingerprint-aligned space, so ``r2/mean_structural`` is the less-circular
+signal of representation quality. LeJEPA and hybrid (which anneals toward LeJEPA)
+use unnormalized ``z_m`` (matching SIGReg); NT-Xent uses L2-normalized ``z_m``
+(matching downstream deploy).
 
 Rank diagnostics are logged for BOTH the raw and L2-normalized ``z_m`` for every
 method (``rank/{effective,numerical}_{raw,norm}``), so the InfoNCE-vs-LeJEPA rank
@@ -29,7 +35,11 @@ from sklearn.model_selection import train_test_split
 
 from lattice_lab.data.fragment_views import load_fragment_split_df
 from lattice_lab.eval.encode_utils import encode_views_batched, encode_views_sum_pooled_batched
-from lattice_lab.preprocessing.molecules import molecule_probe_props
+from lattice_lab.preprocessing.molecules import (
+    PROBE_DESCRIPTOR_NAMES,
+    PROBE_STRUCTURAL_NAMES,
+    molecule_probe_props,
+)
 from lattice_lab.training.denoising_jepa import encode_pooled_latent
 
 if TYPE_CHECKING:
@@ -106,26 +116,23 @@ def _l2_normalize_rows(z: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
 
 @dataclass(frozen=True)
 class SslValProbeResult:
-    r2_qed: float
-    r2_molwt: float
-    mean_r2: float
+    r2: dict[str, float]  # per-descriptor R², keyed by PROBE_DESCRIPTOR_NAMES
+    mean_r2: float  # legacy summary: mean over (qed, molwt) — kept for run continuity
+    mean_r2_structural: float  # mean over the non-additive descriptors (the real signal)
     n_probe: int
     n_train: int
     n_test: int
-    r2_logp: float
     r2_molwt_sum: float
 
     def as_metrics(self) -> dict[str, float | int]:
-        return {
-            "r2/qed": self.r2_qed,
-            "r2/molwt": self.r2_molwt,
-            "r2/mean": self.mean_r2,
-            "r2/logp": self.r2_logp,
-            "r2/molwt_sum": self.r2_molwt_sum,
-            "val/probe_n": self.n_probe,
-            "val/probe_n_train": self.n_train,
-            "val/probe_n_test": self.n_test,
-        }
+        out: dict[str, float | int] = {f"r2/{name}": v for name, v in self.r2.items()}
+        out["r2/mean"] = self.mean_r2
+        out["r2/mean_structural"] = self.mean_r2_structural
+        out["r2/molwt_sum"] = self.r2_molwt_sum
+        out["val/probe_n"] = self.n_probe
+        out["val/probe_n_train"] = self.n_train
+        out["val/probe_n_test"] = self.n_test
+        return out
 
 
 def _tsne_2d(x: np.ndarray, *, seed: int, perplexity: float | None) -> np.ndarray:
@@ -206,6 +213,45 @@ def _tsne_figure(
     return fig
 
 
+_PROBE_LABELS: dict[str, str] = {
+    "qed": "QED",
+    "molwt": "molWt",
+    "logp": "logP",
+    "fraction_csp3": "FractionCSP3",
+    "bertz_ct": "BertzCT",
+    "balaban_j": "BalabanJ",
+}
+
+
+def _descriptor_tsne_figures(
+    emb: np.ndarray, props: np.ndarray, *, space: str
+) -> dict[str, Any]:
+    """One PCA→t-SNE embedding (``emb``) recolored by each probe descriptor."""
+    return {
+        f"t-sne/{name}": _tsne_figure(
+            emb,
+            props[:, i],
+            title=f"Val ${space}$ PCA(50)→t-SNE ({_PROBE_LABELS[name]})",
+            cbar_label=_PROBE_LABELS[name],
+        )
+        for i, name in enumerate(PROBE_DESCRIPTOR_NAMES)
+    }
+
+
+def _build_probe_result(
+    r2: dict[str, float], *, n_probe: int, n_train: int, n_test: int, r2_molwt_sum: float
+) -> SslValProbeResult:
+    return SslValProbeResult(
+        r2=r2,
+        mean_r2=float(np.mean([r2[n] for n in ("qed", "molwt")])),
+        mean_r2_structural=float(np.mean([r2[n] for n in PROBE_STRUCTURAL_NAMES])),
+        n_probe=n_probe,
+        n_train=n_train,
+        n_test=n_test,
+        r2_molwt_sum=r2_molwt_sum,
+    )
+
+
 class SSLValProbes:
     """Cached val-split probe set + epoch-end diagnostics."""
 
@@ -234,7 +280,7 @@ class SSLValProbes:
         self.probe_test_size = float(probe_test_size)
         self.tsne_perplexity = tsne_perplexity
         self._views: list[str] | None = None
-        self._props: np.ndarray | None = None  # [N, 3] = qed, molwt, logp
+        self._props: np.ndarray | None = None  # [N, len(PROBE_DESCRIPTOR_NAMES)]
 
     def prepare(self, shard_dir) -> None:
         """Load and cache a fixed val-split probe subset (idempotent)."""
@@ -267,7 +313,7 @@ class SSLValProbes:
             df = df.iloc[rng.choice(len(df), size=self.n_molecules, replace=False)]
 
         views: list[str] = []
-        props: list[tuple[float, float, float]] = []
+        props: list[tuple[float, ...]] = []
         view_col = "fragment_view" if "fragment_view" in df.columns else "fragmol_view"
         for smi, view in zip(df["smiles"].astype(str), df[view_col].astype(str)):
             row = molecule_probe_props(smi)
@@ -319,69 +365,41 @@ class SSLValProbes:
 
         r2_map, n_tr, n_te = _ridge_r2(
             z,
-            self._props[:, :2],
+            self._props,
+            names=PROBE_DESCRIPTOR_NAMES,
             seed=self.seed,
             test_size=self.probe_test_size,
             ridge_alpha=self.ridge_alpha,
         )
-        r2_logp, _, _ = _ridge_r2(
-            z,
-            self._props[:, [2]],
-            names=("logp",),
-            seed=self.seed,
-            test_size=self.probe_test_size,
-            ridge_alpha=self.ridge_alpha,
-        )
+        mw_col = PROBE_DESCRIPTOR_NAMES.index("molwt")
         r2_mw_sum, _, _ = _ridge_r2(
             z_sum,
-            self._props[:, [1]],
+            self._props[:, [mw_col]],
             names=("molwt",),
             seed=self.seed,
             test_size=self.probe_test_size,
             ridge_alpha=self.ridge_alpha,
         )
-        result = SslValProbeResult(
-            r2_qed=r2_map["qed"],
-            r2_molwt=r2_map["molwt"],
-            mean_r2=float(np.mean(list(r2_map.values()))),
+        result = _build_probe_result(
+            r2_map,
             n_probe=len(self._views),
             n_train=n_tr,
             n_test=n_te,
-            r2_logp=r2_logp["logp"],
             r2_molwt_sum=r2_mw_sum["molwt"],
         )
 
         emb = _pca_tsne_2d(z, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50)
-        qed = self._props[:, 0]
-        molwt = self._props[:, 1]
-        logp = self._props[:, 2]
-        fig_qed = _tsne_figure(
-            emb, qed, title="Val $z_m$ PCA(50)→t-SNE (QED)", cbar_label="QED",
-        )
-        fig_mw = _tsne_figure(
-            emb, molwt, title="Val $z_m$ PCA(50)→t-SNE (molWt)", cbar_label="molWt",
-        )
-        fig_logp = _tsne_figure(
-            emb, logp, title="Val $z_m$ PCA(50)→t-SNE (logP)", cbar_label="logP",
-        )
+        figures = _descriptor_tsne_figures(emb, self._props, space="z_m")
         emb_sum = _pca_tsne_2d(
             z_sum, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50,
         )
-        fig_mw_sum = _tsne_figure(
+        figures["t-sne/molwt_sum"] = _tsne_figure(
             emb_sum,
-            molwt,
+            self._props[:, mw_col],
             title="Val sum-pool $z_m$ PCA(50)→t-SNE (molWt)",
             cbar_label="molWt",
         )
-        _log_wandb_figures(
-            module,
-            {
-                "t-sne/qed": fig_qed,
-                "t-sne/molwt": fig_mw,
-                "t-sne/logp": fig_logp,
-                "t-sne/molwt_sum": fig_mw_sum,
-            },
-        )
+        _log_wandb_figures(module, figures)
         return result
 
     def maybe_run(self, module: DiscreteFlowSSLModule) -> dict[str, float | int]:
@@ -446,48 +464,23 @@ class JepaValProbes(SSLValProbes):
 
         r2_map, n_tr, n_te = _ridge_r2(
             z,
-            self._props[:, :2],
+            self._props,
+            names=PROBE_DESCRIPTOR_NAMES,
             seed=self.seed,
             test_size=self.probe_test_size,
             ridge_alpha=self.ridge_alpha,
         )
-        r2_logp, _, _ = _ridge_r2(
-            z,
-            self._props[:, [2]],
-            names=("logp",),
-            seed=self.seed,
-            test_size=self.probe_test_size,
-            ridge_alpha=self.ridge_alpha,
-        )
-        result = SslValProbeResult(
-            r2_qed=r2_map["qed"],
-            r2_molwt=r2_map["molwt"],
-            mean_r2=float(np.mean(list(r2_map.values()))),
+        result = _build_probe_result(
+            r2_map,
             n_probe=len(self._views),
             n_train=n_tr,
             n_test=n_te,
-            r2_logp=r2_logp["logp"],
             r2_molwt_sum=float("nan"),  # sum-pool probe is discrete-flow adapter only
         )
 
         emb = _pca_tsne_2d(z, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50)
-        fig_qed = _tsne_figure(
-            emb, self._props[:, 0], title="Val $z_s$ PCA(50)→t-SNE (QED)", cbar_label="QED",
-        )
-        fig_mw = _tsne_figure(
-            emb, self._props[:, 1], title="Val $z_s$ PCA(50)→t-SNE (molWt)", cbar_label="molWt",
-        )
-        fig_logp = _tsne_figure(
-            emb, self._props[:, 2], title="Val $z_s$ PCA(50)→t-SNE (logP)", cbar_label="logP",
-        )
-        _log_wandb_figures(
-            module,
-            {
-                "t-sne/qed": fig_qed,
-                "t-sne/molwt": fig_mw,
-                "t-sne/logp": fig_logp,
-            },
-        )
+        figures = _descriptor_tsne_figures(emb, self._props, space="z_s")
+        _log_wandb_figures(module, figures)
         return result
 
 

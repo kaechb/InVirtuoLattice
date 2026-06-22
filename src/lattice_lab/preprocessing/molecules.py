@@ -15,14 +15,23 @@ These functions are intentionally side-effect free; the orchestrator in
 from __future__ import annotations
 
 import logging
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 from rdkit import Chem, RDLogger
-from rdkit.Chem import AllChem, Descriptors, Crippen, QED, inchi
+from rdkit.Chem import (
+    AllChem,
+    Crippen,
+    Descriptors,
+    GraphDescriptors,
+    QED,
+    inchi,
+    rdMolDescriptors,
+)
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
 # Suppress RDKit chatter once at import time.
@@ -283,16 +292,45 @@ def process_smiles_record(
     return {"smiles": std, "inchikey": key, "views": views}
 
 
-def molecule_probe_props(smiles: str) -> tuple[float, float, float] | None:
-    """Return ``(QED, MolWt, logP)`` for a SMILES string, or ``None`` if invalid."""
+# Ordered registry of cheap (2D, no-conformer) RDKit probe descriptors.
+#
+# ``qed`` and ``molwt`` MUST stay first: ``molecule_qed_molwt`` and the sum-pool
+# probe index by position. The split below is the point of the set: the
+# "additive" descriptors are ~linear in Morgan-fingerprint bits (weighted
+# substructure counts), so a fingerprint-aligned embedding predicts them
+# trivially with a *linear* probe — high R² there is near-circular. The
+# "structural" descriptors are non-linear functions of the molecular graph
+# (saturation / complexity / topology), which a linear probe cannot read off a
+# fingerprint-aligned space; a high R² on them is real evidence the encoder
+# captured global structure rather than just distilling substructure presence.
+_PROBE_DESCRIPTORS: tuple[tuple[str, Callable[[Chem.Mol], float]], ...] = (
+    ("qed", QED.qed),
+    ("molwt", Descriptors.MolWt),
+    ("logp", Crippen.MolLogP),
+    ("fraction_csp3", rdMolDescriptors.CalcFractionCSP3),
+    ("bertz_ct", GraphDescriptors.BertzCT),
+    ("balaban_j", GraphDescriptors.BalabanJ),
+)
+
+PROBE_DESCRIPTOR_NAMES: tuple[str, ...] = tuple(name for name, _ in _PROBE_DESCRIPTORS)
+PROBE_ADDITIVE_NAMES: tuple[str, ...] = ("qed", "molwt", "logp")
+PROBE_STRUCTURAL_NAMES: tuple[str, ...] = ("fraction_csp3", "bertz_ct", "balaban_j")
+
+
+def molecule_probe_props(smiles: str) -> tuple[float, ...] | None:
+    """Return the probe descriptors for ``smiles`` in :data:`PROBE_DESCRIPTOR_NAMES`
+    order, or ``None`` if the SMILES is invalid or any descriptor is non-finite
+    (e.g. ``BalabanJ`` on a degenerate graph)."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    return (
-        float(QED.qed(mol)),
-        float(Descriptors.MolWt(mol)),
-        float(Crippen.MolLogP(mol)),
-    )
+    vals: list[float] = []
+    for _, fn in _PROBE_DESCRIPTORS:
+        v = float(fn(mol))
+        if not math.isfinite(v):
+            return None
+        vals.append(v)
+    return tuple(vals)
 
 
 def molecule_qed_molwt(smiles: str) -> tuple[float, float] | None:
