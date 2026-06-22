@@ -9,6 +9,8 @@ import torch
 
 from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
 
+from lattice_lab.eval.encode_utils import encode_views_inference
+
 logger = logging.getLogger(__name__)
 
 _fragmentize_fallback_count = 0
@@ -21,6 +23,7 @@ def encode_binders(
     device: torch.device | str,
     *,
     grad: bool = False,
+    views: list[str | None] | None = None,
 ) -> torch.Tensor:
     """Encode a list of SMILES (one view per molecule) → ``[B, d_m]``.
 
@@ -28,18 +31,33 @@ def encode_binders(
     adapter fine-tuning). The DDiT backbone stays frozen. Molecules that cannot
     be fragmented fall back to canonical SMILES; truly unparseable rows get a
     benign placeholder so the batch stays aligned with proteins/decoys.
+
+    When ``views`` is set (same length as ``smiles_list``), each non-``None``
+    entry is used as-is; ``None`` entries fall back to runtime fragmentization.
     """
     global _fragmentize_fallback_count, _unparseable_binder_count
     from rdkit import Chem
 
-    from lattice_lab.preprocessing.molecules import smiles_to_fragment_views
+    from lattice_lab.preprocessing.molecules import fragment_view_for_smiles
 
-    views: list[str] = []
+    if views is None:
+        view_in: list[str | None] = [None] * len(smiles_list)
+    elif len(views) != len(smiles_list):
+        raise ValueError("views must be None or the same length as smiles_list")
+    else:
+        view_in = list(views)
+
+    encoded: list[str] = []
     n_fallback = 0
-    for s in smiles_list:
-        v = smiles_to_fragment_views(s, n_views=1)
-        if v:
-            views.append(v[0])
+    for s, v in zip(smiles_list, view_in):
+        if v is not None:
+            encoded.append(v)
+            continue
+        fv = fragment_view_for_smiles(s)
+        if fv is not None:
+            encoded.append(fv)
+            if fv != s:
+                n_fallback += 1
             continue
         mol = Chem.MolFromSmiles(s)
         if mol is None:
@@ -50,10 +68,10 @@ def encode_binders(
                     "(running total: %d)",
                     s, _unparseable_binder_count,
                 )
-            views.append("C")
+            encoded.append("C")
             n_fallback += 1
             continue
-        views.append(Chem.MolToSmiles(mol))
+        encoded.append(Chem.MolToSmiles(mol))
         n_fallback += 1
     if n_fallback:
         _fragmentize_fallback_count += n_fallback
@@ -64,9 +82,8 @@ def encode_binders(
                 n_fallback, len(smiles_list), _fragmentize_fallback_count,
             )
     if grad:
-        return encoder.encode_views(views, device=device)
-    with torch.no_grad():
-        return encoder.encode_views(views, device=device)
+        return encoder.encode_views(encoded, device=device)
+    return encode_views_inference(encoder, encoded, device=device)
 
 
 def ef_at(percent: float, scores: np.ndarray, labels: np.ndarray) -> float:

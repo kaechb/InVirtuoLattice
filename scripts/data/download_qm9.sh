@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-RAW_DIR="${REPO}/artifacts/raw"
+RAW_DIR="${REPO}/artifacts/preprocessing/raw"
 DEST="${RAW_DIR}/qm9.csv"
 URL="https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/qm9.csv"
 

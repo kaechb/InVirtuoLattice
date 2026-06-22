@@ -589,9 +589,9 @@ def main() -> None:
     test_parquet = args.test_parquet
     if test_parquet is None:
         test_parquet = (
-            Path("artifacts/processed/bindingdb/test_lit_pcba.parquet")
+            Path("artifacts/preprocessing/processed/bindingdb/test_lit_pcba.parquet")
             if args.source == "lit-pcba"
-            else Path("artifacts/processed/bindingdb/threshold_90/val.parquet")
+            else Path("artifacts/preprocessing/processed/bindingdb/threshold_90/val.parquet")
         )
 
     args.test_parquet = test_parquet

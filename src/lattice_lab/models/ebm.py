@@ -58,8 +58,6 @@ class EBMLitModule(L.LightningModule):
         cross_target_margin: float = 2.0,
         hard_mining_mult: int = 1,
         hard_skip_frac: float = 0.05,
-        finetune_adapter: bool = False,
-        adapter_lr: float = 3e-5,
         bedroc_alpha: float = 80.5,
         seed: int = 0,
     ) -> None:
@@ -73,37 +71,19 @@ class EBMLitModule(L.LightningModule):
         self.sink_loss = SinkhornEnergyLoss()
         self._cross_rng = random.Random(seed + 7)
         self._val: dict[str, list[float]] = defaultdict(list)
-        # When the adapter is frozen, binder embeddings are a deterministic
-        # function of the SMILES, so we encode each unique binder through the
-        # DDiT backbone + adapter exactly once and reuse it. This removes the
-        # per-step RDKit fragmentation + full backbone forward that made Stage-5
-        # look "frozen". Kept on CPU (a few KB/row) to spare GPU memory.
+        # Binder embeddings are a deterministic function of SMILES under the
+        # frozen encoder, so encode each unique binder once and reuse it.
         self._zm_cache: dict[str, torch.Tensor] = {}
 
-        if finetune_adapter:
-            for p in self.encoder.adapter.parameters():
-                p.requires_grad = True
-            self.encoder.adapter.train()
-            logger.info(
-                "adapter fine-tuning ON: adapter_lr=%.1e head_lr=%.1e",
-                adapter_lr, learning_rate,
-            )
-
         if resume_from is not None:
-            self._load_resume(Path(resume_from), finetune_adapter)
+            self._load_resume(Path(resume_from))
 
-    def _load_resume(self, path: Path, finetune_adapter: bool) -> None:
-        """Warm-start head (and optionally adapter) from a full EBM ``.ckpt``."""
-        from lattice_lab.models.builders import (
-            parse_adapter_state,
-            parse_head_checkpoint,
-            safe_torch_load,
-        )
+    def _load_resume(self, path: Path) -> None:
+        """Warm-start the energy head from a full EBM ``.ckpt``."""
+        from lattice_lab.models.builders import parse_head_checkpoint, safe_torch_load
 
         raw = safe_torch_load(path, weights_only=False)
         self.head.load_state_dict(parse_head_checkpoint(raw))
-        if finetune_adapter:
-            self.encoder.adapter.load_state_dict(parse_adapter_state(raw))
         logger.info("resumed from full checkpoint %s", path)
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
@@ -119,17 +99,15 @@ class EBMLitModule(L.LightningModule):
 
     # -- lifecycle -------------------------------------------------------
     def _freeze_eval_modes(self) -> None:
-        """Force frozen sub-modules into ``eval()``.
+        """Force the frozen encoder into ``eval()``.
 
         Lightning calls ``self.train()`` at the start of fit/each epoch, which
-        recursively re-enables dropout on the (always-frozen) DDiT backbone and,
-        when not fine-tuning, the adapter. Keeping them in ``eval()`` makes
-        binder embeddings deterministic — required for the z_m cache to be valid
-        and to stop noise leaking into the energy head.
+        recursively re-enables dropout on the DDiT backbone and adapter. Keeping
+        them in ``eval()`` makes binder embeddings deterministic — required for
+        the z_m cache and precomputed binder store to stay valid.
         """
         self.encoder.backbone.eval()
-        if not self.hparams.finetune_adapter:
-            self.encoder.adapter.eval()
+        self.encoder.adapter.eval()
 
     def on_fit_start(self) -> None:
         sync_encoder_device(self.encoder, self.device, head=self.head)
@@ -145,22 +123,13 @@ class EBMLitModule(L.LightningModule):
     def _encode_binders(self, batch: dict) -> torch.Tensor:
         """Resolve binder ``z_m`` → ``[B, d_m]``.
 
-        Resolution order (frozen adapter):
-        1. precomputed ``binder_z_m`` from the Stage-4b store (no encoding),
-        2. an in-process SMILES→z_m cache (fallback when no store is wired),
-        3. a live DDiT+adapter forward (when fine-tuning, embeddings change).
+        1. precomputed ``binder_z_m`` from the Stage-4 binder store, else
+        2. an in-process SMILES→z_m cache (one frozen encode per unique SMILES).
         """
-        if not self.hparams.finetune_adapter and batch.get("binder_z_m") is not None:
+        if batch.get("binder_z_m") is not None:
             return batch["binder_z_m"].to(self.device, non_blocking=True)
 
         smiles = batch["binder_smiles"]
-        if self.hparams.finetune_adapter:
-            # Adapter weights change every step; embeddings are not cacheable.
-            # ``self.training`` keeps the adapter forward in the graph for the
-            # train pass and detaches it during validation.
-            return encode_binders(
-                self.encoder, smiles, self.device, grad=self.training
-            )
         missing = [s for s in dict.fromkeys(smiles) if s not in self._zm_cache]
         if missing:
             z = encode_binders(self.encoder, missing, self.device, grad=False)
@@ -194,14 +163,29 @@ class EBMLitModule(L.LightningModule):
         if hp.hard_mining_mult > 1:
             z_m_dec = self._mine_hard_negatives(z_m_dec, z_p)
 
-        e_pos = self.head(z_m_pos, z_p)
-        z_p_dec = z_p.unsqueeze(1).expand(-1, z_m_dec.shape[1], -1)
-        e_dec = self.head(z_m_dec, z_p_dec)
+        # ponytail: bf16 InfoNCE+Sinkhorn over ~600 decoys underflows head grads to 0;
+        # encoder is frozen so fp32 head is free.
+        ct_log: dict[str, float] | None = None
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            e_pos = self.head(z_m_pos, z_p)
+            z_p_dec = z_p.unsqueeze(1).expand(-1, z_m_dec.shape[1], -1)
+            e_dec = self.head(z_m_dec, z_p_dec)
 
-        l_info, info_log = self.info_loss(e_pos, e_dec)
-        l_sink, sink_log = self.sink_loss(e_pos, e_dec)
-        lam = lambda_sink_schedule(self.global_step, hp.lambda_sink_warmup, hp.lambda_sink)
-        total = l_info + lam * l_sink
+            l_info, info_log = self.info_loss(e_pos, e_dec)
+            l_sink, sink_log = self.sink_loss(e_pos, e_dec)
+            lam = lambda_sink_schedule(self.global_step, hp.lambda_sink_warmup, hp.lambda_sink)
+            total = l_info + lam * l_sink
+
+            if self._cross_rng.random() < hp.cross_target_p:
+                bs = z_p.shape[0]
+                perm = torch.randperm(bs, device=self.device)
+                if torch.equal(perm, torch.arange(bs, device=self.device)):
+                    perm = torch.roll(perm, shifts=1)
+                e_wrong = self.head(z_m_pos, z_p[perm])
+                l_ct, ct_log = cross_target_margin_loss(
+                    e_pos, e_wrong, margin=hp.cross_target_margin
+                )
+                total = total + hp.lambda_neg * l_ct
 
         bs = z_p.shape[0]
         log = {
@@ -213,15 +197,7 @@ class EBMLitModule(L.LightningModule):
             "train/binder_e_mean": e_pos.detach().mean(),
             "train/decoy_e_mean": e_dec.detach().mean(),
         }
-        if self._cross_rng.random() < hp.cross_target_p:
-            perm = torch.randperm(bs, device=self.device)
-            if torch.equal(perm, torch.arange(bs, device=self.device)):
-                perm = torch.roll(perm, shifts=1)
-            e_wrong = self.head(z_m_pos, z_p[perm])
-            l_ct, ct_log = cross_target_margin_loss(
-                e_pos, e_wrong, margin=hp.cross_target_margin
-            )
-            total = total + hp.lambda_neg * l_ct
+        if ct_log is not None:
             log["train/cross_target"] = ct_log["cross_target/loss"]
             log["train/cross_target_viol"] = ct_log["cross_target/violation_rate"]
 
@@ -241,7 +217,7 @@ class EBMLitModule(L.LightningModule):
         z_p_dec = z_p.unsqueeze(1).expand(-1, n, -1)
         e_dec = self.head(z_m_dec, z_p_dec)
 
-        scores = -torch.cat([e_pos, e_dec], dim=1).cpu().numpy()
+        scores = -torch.cat([e_pos, e_dec], dim=1).float().cpu().numpy()
         labels = np.zeros_like(scores)
         labels[:, 0] = 1
         for s_row, l_row in zip(scores, labels):
@@ -265,18 +241,9 @@ class EBMLitModule(L.LightningModule):
     # -- optim -----------------------------------------------------------
     def configure_optimizers(self):
         hp = self.hparams
-        if hp.finetune_adapter:
-            optim = torch.optim.AdamW(
-                [
-                    {"params": list(self.head.parameters()), "lr": hp.learning_rate},
-                    {"params": list(self.encoder.adapter.parameters()), "lr": hp.adapter_lr},
-                ],
-                weight_decay=hp.weight_decay,
-            )
-        else:
-            optim = torch.optim.AdamW(
-                self.head.parameters(), lr=hp.learning_rate, weight_decay=hp.weight_decay
-            )
+        optim = torch.optim.AdamW(
+            self.head.parameters(), lr=hp.learning_rate, weight_decay=hp.weight_decay
+        )
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optim, lambda s: cosine_with_warmup(s, hp.warmup_steps, hp.num_steps)
         )

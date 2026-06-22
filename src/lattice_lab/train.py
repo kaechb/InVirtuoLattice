@@ -23,6 +23,7 @@ import hydra
 import lightning as L
 from omegaconf import DictConfig
 
+from lattice_lab.training.run_logger import log_wandb_code
 from lattice_lab.utils import (
     instantiate_callbacks,
     instantiate_loggers,
@@ -56,6 +57,7 @@ def train(cfg: DictConfig) -> dict[str, float]:
     log_hyperparameters(
         cfg=cfg, model=model, datamodule=datamodule, trainer=trainer, loggers=loggers
     )
+    log_wandb_code(loggers, root=cfg.paths.root_dir)
 
     # Optional cross-check: decoy latent dim must match the head's d_m. Test the
     # *class* for the property (reading the instance attr would assert before

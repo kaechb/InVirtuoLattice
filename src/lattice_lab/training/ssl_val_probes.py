@@ -1,9 +1,9 @@
 """Validation probes for Stage-2 SSL (t-SNE + linear R² on chemistry props).
 
 Each validation epoch (configurable) samples molecules from the MOSES val split,
-encodes them to ``z_m``, fits Ridge probes for QED and molecular weight, and logs
-2D t-SNE scatter plots (after PCA to 50 components) colored by those properties
-to W&B. LeJEPA and hybrid (which anneals toward LeJEPA) use unnormalized ``z_m``
+encodes them to ``z_m``, fits Ridge probes for QED, molecular weight, logP, and
+sum-pooled molWt, and logs 2D t-SNE scatter plots (after PCA to 50 components)
+colored by QED, molWt, logP, and sum-pool molWt to W&B. LeJEPA and hybrid (which anneals toward LeJEPA) use unnormalized ``z_m``
 (matching SIGReg); NT-Xent uses L2-normalized ``z_m`` (matching downstream deploy).
 
 Rank diagnostics are logged for BOTH the raw and L2-normalized ``z_m`` for every
@@ -28,8 +28,9 @@ from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 
 from lattice_lab.data.fragment_views import load_fragment_split_df
-from lattice_lab.eval.encode_utils import encode_views_batched
-from lattice_lab.preprocessing.molecules import molecule_qed_molwt
+from lattice_lab.eval.encode_utils import encode_views_batched, encode_views_sum_pooled_batched
+from lattice_lab.preprocessing.molecules import molecule_probe_props
+from lattice_lab.training.denoising_jepa import encode_pooled_latent
 
 if TYPE_CHECKING:
     from lattice_lab.models.discrete_flow_ssl import DiscreteFlowSSLModule
@@ -70,6 +71,33 @@ def embedding_covariance_rank(
     return effective, numerical
 
 
+def embedding_batch_collapse_diag(
+    z: np.ndarray,
+    *,
+    top_k: int = 5,
+    eps: float = 1e-12,
+) -> tuple[float, list[float]]:
+    """Collapse diagnostics for a batch of embeddings ``[N, D]``.
+
+    Returns ``(std_mean, top_eigs)`` where ``std_mean`` is the mean per-feature
+    standard deviation across the batch (shrinks as embeddings tighten) and
+    ``top_eigs`` are the largest sample-covariance eigenvalues (a spiky spectrum
+    — one large ``eig_1``, tiny tail — signals low-rank collapse).
+    """
+    arr = np.asarray(z, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] < 2:
+        nan = float("nan")
+        return nan, [nan] * top_k
+
+    std_mean = float(arr.std(axis=0).mean())
+    n = arr.shape[0]
+    centered = arr - arr.mean(axis=0, keepdims=True)
+    singular = np.linalg.svd(centered, compute_uv=False)
+    eig = np.sort((singular ** 2) / max(n - 1, 1))[::-1]
+    top = [float(eig[i]) if i < eig.size and eig[i] > eps else 0.0 for i in range(top_k)]
+    return std_mean, top
+
+
 def _l2_normalize_rows(z: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
     arr = np.asarray(z, dtype=np.float64)
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -84,29 +112,19 @@ class SslValProbeResult:
     n_probe: int
     n_train: int
     n_test: int
-    rank_effective: float
-    rank_numerical: float
-    rank_effective_raw: float
-    rank_numerical_raw: float
-    rank_effective_norm: float
-    rank_numerical_norm: float
+    r2_logp: float
+    r2_molwt_sum: float
 
     def as_metrics(self) -> dict[str, float | int]:
         return {
-            "val/probe_r2_qed": self.r2_qed,
-            "val/probe_r2_molwt": self.r2_molwt,
-            "val/probe_r2_mean": self.mean_r2,
+            "r2/qed": self.r2_qed,
+            "r2/molwt": self.r2_molwt,
+            "r2/mean": self.mean_r2,
+            "r2/logp": self.r2_logp,
+            "r2/molwt_sum": self.r2_molwt_sum,
             "val/probe_n": self.n_probe,
             "val/probe_n_train": self.n_train,
             "val/probe_n_test": self.n_test,
-            # Primary (method-appropriate): normalized for NT-Xent, raw for LeJEPA.
-            "rank/effective": self.rank_effective,
-            "rank/numerical": self.rank_numerical,
-            # Fair side-by-side: both spaces logged for every method.
-            "rank/effective_raw": self.rank_effective_raw,
-            "rank/numerical_raw": self.rank_numerical_raw,
-            "rank/effective_norm": self.rank_effective_norm,
-            "rank/numerical_norm": self.rank_numerical_norm,
         }
 
 
@@ -147,12 +165,17 @@ def _ridge_r2(
     z: np.ndarray,
     y: np.ndarray,
     *,
+    names: tuple[str, ...] = ("qed", "molwt"),
     seed: int,
     test_size: float,
     ridge_alpha: float,
 ) -> tuple[dict[str, float], int, int]:
     """Fit independent Ridge heads per target column; return per-target R²."""
-    names = ("qed", "molwt")
+    y = np.asarray(y, dtype=np.float64)
+    if y.ndim == 1:
+        y = y[:, None]
+    if y.shape[1] != len(names):
+        raise ValueError(f"expected {len(names)} target columns, got {y.shape[1]}")
     x_tr, x_te, y_tr, y_te = train_test_split(z, y, test_size=test_size, random_state=seed)
     r2: dict[str, float] = {}
     for j, name in enumerate(names):
@@ -211,7 +234,7 @@ class SSLValProbes:
         self.probe_test_size = float(probe_test_size)
         self.tsne_perplexity = tsne_perplexity
         self._views: list[str] | None = None
-        self._props: np.ndarray | None = None  # [N, 2] = qed, molwt
+        self._props: np.ndarray | None = None  # [N, 3] = qed, molwt, logp
 
     def prepare(self, shard_dir) -> None:
         """Load and cache a fixed val-split probe subset (idempotent)."""
@@ -244,10 +267,10 @@ class SSLValProbes:
             df = df.iloc[rng.choice(len(df), size=self.n_molecules, replace=False)]
 
         views: list[str] = []
-        props: list[tuple[float, float]] = []
+        props: list[tuple[float, float, float]] = []
         view_col = "fragment_view" if "fragment_view" in df.columns else "fragmol_view"
         for smi, view in zip(df["smiles"].astype(str), df[view_col].astype(str)):
-            row = molecule_qed_molwt(smi)
+            row = molecule_probe_props(smi)
             if row is None:
                 continue
             views.append(view)
@@ -285,19 +308,38 @@ class SSLValProbes:
             normalize=False,
         ).numpy()
         z_norm = _l2_normalize_rows(z_raw)
-        # Primary probe space matches downstream deploy semantics per method.
         z = z_norm if normalize_probe else z_raw
+        z_sum = encode_views_sum_pooled_batched(
+            module.encoder,
+            self._views,
+            batch_size=self.encode_batch_size,
+            device=module.device,
+            desc="ssl val probe encode (sum pool)",
+        ).numpy()
 
         r2_map, n_tr, n_te = _ridge_r2(
             z,
-            self._props,
+            self._props[:, :2],
             seed=self.seed,
             test_size=self.probe_test_size,
             ridge_alpha=self.ridge_alpha,
         )
-        eff_raw, num_raw = embedding_covariance_rank(z_raw)
-        eff_norm, num_norm = embedding_covariance_rank(z_norm)
-        eff_primary, num_primary = (eff_norm, num_norm) if normalize_probe else (eff_raw, num_raw)
+        r2_logp, _, _ = _ridge_r2(
+            z,
+            self._props[:, [2]],
+            names=("logp",),
+            seed=self.seed,
+            test_size=self.probe_test_size,
+            ridge_alpha=self.ridge_alpha,
+        )
+        r2_mw_sum, _, _ = _ridge_r2(
+            z_sum,
+            self._props[:, [1]],
+            names=("molwt",),
+            seed=self.seed,
+            test_size=self.probe_test_size,
+            ridge_alpha=self.ridge_alpha,
+        )
         result = SslValProbeResult(
             r2_qed=r2_map["qed"],
             r2_molwt=r2_map["molwt"],
@@ -305,28 +347,39 @@ class SSLValProbes:
             n_probe=len(self._views),
             n_train=n_tr,
             n_test=n_te,
-            rank_effective=eff_primary,
-            rank_numerical=num_primary,
-            rank_effective_raw=eff_raw,
-            rank_numerical_raw=num_raw,
-            rank_effective_norm=eff_norm,
-            rank_numerical_norm=num_norm,
+            r2_logp=r2_logp["logp"],
+            r2_molwt_sum=r2_mw_sum["molwt"],
         )
 
         emb = _pca_tsne_2d(z, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50)
         qed = self._props[:, 0]
         molwt = self._props[:, 1]
+        logp = self._props[:, 2]
         fig_qed = _tsne_figure(
             emb, qed, title="Val $z_m$ PCA(50)→t-SNE (QED)", cbar_label="QED",
         )
         fig_mw = _tsne_figure(
             emb, molwt, title="Val $z_m$ PCA(50)→t-SNE (molWt)", cbar_label="molWt",
         )
+        fig_logp = _tsne_figure(
+            emb, logp, title="Val $z_m$ PCA(50)→t-SNE (logP)", cbar_label="logP",
+        )
+        emb_sum = _pca_tsne_2d(
+            z_sum, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50,
+        )
+        fig_mw_sum = _tsne_figure(
+            emb_sum,
+            molwt,
+            title="Val sum-pool $z_m$ PCA(50)→t-SNE (molWt)",
+            cbar_label="molWt",
+        )
         _log_wandb_figures(
             module,
             {
-                "val/tsne_qed": fig_qed,
-                "val/tsne_molwt": fig_mw,
+                "t-sne/qed": fig_qed,
+                "t-sne/molwt": fig_mw,
+                "t-sne/logp": fig_logp,
+                "t-sne/molwt_sum": fig_mw_sum,
             },
         )
         return result
@@ -344,7 +397,7 @@ class SSLValProbes:
 
 @torch.no_grad()
 def _encode_jepa_zs(
-    student: Any,
+    module: Any,
     views: list[str],
     *,
     batch_size: int,
@@ -357,9 +410,9 @@ def _encode_jepa_zs(
     """
     from lattice_lab.backbone.discrete_flow import pad_batch
 
-    student.encoder.eval()
+    module.encoder.eval()
     out: list[torch.Tensor] = []
-    b = student.bundle
+    b = module.bundle
     for start in range(0, len(views), batch_size):
         batch = views[start : start + batch_size]
         seqs = [
@@ -367,19 +420,15 @@ def _encode_jepa_zs(
             for v in batch
         ]
         ids, mask = pad_batch(seqs, pad_id=b.pad_id)
-        z = student.encoder(ids.to(device), mask.to(device))
+        z = encode_pooled_latent(
+            module, ids.to(device), mask.to(device), training=False
+        )
         out.append(z.detach().cpu())
     return torch.cat(out, dim=0)
 
 
 class JepaValProbes(SSLValProbes):
-    """Val probes for the conditional denoising-JEPA module.
-
-    Reuses the cached val-split subset, Ridge R² probes, rank diagnostics and
-    PCA→t-SNE plots of :class:`SSLValProbes`, but the molecule embedding is the
-    encoder's pooled latent ``z_s = student.encoder(ids, mask)`` (already
-    LayerNorm'd by the attention pool, so the *raw* space is primary).
-    """
+    """Val probes using ``encoder(ids, mask)`` pooled latents."""
 
     @torch.no_grad()
     def run(self, module: Any) -> SslValProbeResult | None:
@@ -388,23 +437,28 @@ class JepaValProbes(SSLValProbes):
         assert self._views is not None and self._props is not None
 
         z_raw = _encode_jepa_zs(
-            module.student,
+            module,
             self._views,
             batch_size=self.encode_batch_size,
             device=module.device,
         ).numpy()
-        z_norm = _l2_normalize_rows(z_raw)
-        z = z_raw  # pooled z_s is LayerNorm'd; the raw space is the deploy space.
+        z = z_raw
 
         r2_map, n_tr, n_te = _ridge_r2(
             z,
-            self._props,
+            self._props[:, :2],
             seed=self.seed,
             test_size=self.probe_test_size,
             ridge_alpha=self.ridge_alpha,
         )
-        eff_raw, num_raw = embedding_covariance_rank(z_raw)
-        eff_norm, num_norm = embedding_covariance_rank(z_norm)
+        r2_logp, _, _ = _ridge_r2(
+            z,
+            self._props[:, [2]],
+            names=("logp",),
+            seed=self.seed,
+            test_size=self.probe_test_size,
+            ridge_alpha=self.ridge_alpha,
+        )
         result = SslValProbeResult(
             r2_qed=r2_map["qed"],
             r2_molwt=r2_map["molwt"],
@@ -412,12 +466,8 @@ class JepaValProbes(SSLValProbes):
             n_probe=len(self._views),
             n_train=n_tr,
             n_test=n_te,
-            rank_effective=eff_raw,
-            rank_numerical=num_raw,
-            rank_effective_raw=eff_raw,
-            rank_numerical_raw=num_raw,
-            rank_effective_norm=eff_norm,
-            rank_numerical_norm=num_norm,
+            r2_logp=r2_logp["logp"],
+            r2_molwt_sum=float("nan"),  # sum-pool probe is discrete-flow adapter only
         )
 
         emb = _pca_tsne_2d(z, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50)
@@ -427,7 +477,17 @@ class JepaValProbes(SSLValProbes):
         fig_mw = _tsne_figure(
             emb, self._props[:, 1], title="Val $z_s$ PCA(50)→t-SNE (molWt)", cbar_label="molWt",
         )
-        _log_wandb_figures(module, {"val/tsne_qed": fig_qed, "val/tsne_molwt": fig_mw})
+        fig_logp = _tsne_figure(
+            emb, self._props[:, 2], title="Val $z_s$ PCA(50)→t-SNE (logP)", cbar_label="logP",
+        )
+        _log_wandb_figures(
+            module,
+            {
+                "t-sne/qed": fig_qed,
+                "t-sne/molwt": fig_mw,
+                "t-sne/logp": fig_logp,
+            },
+        )
         return result
 
 

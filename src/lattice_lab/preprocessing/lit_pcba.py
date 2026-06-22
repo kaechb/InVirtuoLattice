@@ -7,7 +7,7 @@ evaluate retrieval (EF@1%) per target.
 
 This module loads a LIT-PCBA dump prepared by ``scripts/copy_lit_pcba.sh``:
 
-    artifacts/raw/lit_pcba/<TARGET>/
+    artifacts/preprocessing/raw/lit_pcba/<TARGET>/
         actives.smi               (SMILES <tab/space> PubChem CID)
         inactives.smi             (same format)
         <pdb>_protein.mol2        one representative protein structure / target

@@ -8,7 +8,7 @@ output directory is idempotent: existing shards are skipped.
 Usage::
 
     python -m lattice_lab.preprocessing.run_preprocessing \\
-        --input data/raw.smi --output artifacts/processed/moses/ \\
+        --input data/raw.smi --output artifacts/preprocessing/processed/moses/ \\
         --n-views 3 --n-jobs 16
 """
 
@@ -30,6 +30,7 @@ from lattice_lab.preprocessing.molecules import (
     PropertyFilter,
     dedup_records,
     flatten_views_to_rows,
+    load_smiles_tokenizer,
     process_smiles_record,
 )
 
@@ -69,12 +70,16 @@ def run(
     chunk_size: int = 50_000,
     seed: int = 0,
     filter_overrides: dict[str, float] | None = None,
+    tokenizer_path: Path | None = None,
 ) -> dict[str, int]:
     """Run the preprocessing pipeline. Returns a summary dict with row counts.
 
     Idempotency: if ``output_dir`` already contains ``shard_NNNN.parquet`` files,
     they are kept and the next available index is used for new shards. Pipeline
     output is fully determined by inputs + ``seed`` per molecule.
+
+    When ``tokenizer_path`` is set, each row also gets a ``body_ids`` column so
+    Stage-2 SSL can skip runtime tokenization (shuffle/mask still happen online).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     n_jobs = n_jobs or max(1, (os.cpu_count() or 2) - 1)
@@ -82,6 +87,11 @@ def run(
     pf = PropertyFilter()
     if filter_overrides:
         pf = PropertyFilter(**{**pf.__dict__, **filter_overrides})
+
+    tokenizer = None
+    if tokenizer_path is not None:
+        tokenizer = load_smiles_tokenizer(tokenizer_path)
+        logger.info("pretokenize fragment views with %s", tokenizer_path)
 
     smiles_list = _read_smiles(input_path)
     logger.info("read %d SMILES from %s", len(smiles_list), input_path)
@@ -100,7 +110,7 @@ def run(
                 accumulated_records.append(r)
 
     records = dedup_records(accumulated_records)
-    rows = flatten_views_to_rows(records)
+    rows = flatten_views_to_rows(records, tokenizer=tokenizer)
     logger.info("kept %d molecules → %d view rows", len(records), len(rows))
 
     # Detect next shard index for idempotent re-runs.
@@ -130,6 +140,12 @@ def main() -> None:
     parser.add_argument("--n-jobs", type=int, default=None)
     parser.add_argument("--chunk-size", type=int, default=50_000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--tokenizer-path",
+        type=Path,
+        default=None,
+        help="optional SMILES tokenizer json; adds body_ids column to shards",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -146,6 +162,7 @@ def main() -> None:
         n_jobs=args.n_jobs,
         chunk_size=args.chunk_size,
         seed=args.seed,
+        tokenizer_path=args.tokenizer_path,
     )
     logger.info("summary: %s", summary)
 

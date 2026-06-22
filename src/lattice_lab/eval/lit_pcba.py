@@ -8,8 +8,7 @@ Pipeline:
 3. Score with ``-E_θ(z_m, z_p)`` (higher = predicted binder).
 4. Compute AUROC, BEDROC(α=80.5), EF@{0.5, 1, 5} % per target. Aggregate
    mean + median across targets.
-5. Log all values to W&B (``lit_pcba/<target>/{metric}`` and
-   ``lit_pcba/avg/{metric}``) and write a per-target CSV.
+5. Write a per-target CSV.
 
 Targets whose pid is missing from the protein store are listed in the
 output but skipped from metrics (Stage-3 likely rejected non-canonical
@@ -41,7 +40,6 @@ from lattice_lab.models.builders import (
 )
 from lattice_lab.preprocessing.molecules import smiles_to_fragment_views
 from lattice_lab.protein.store import EmbeddingStore
-from lattice_lab.training.run_logger import RunLogger
 
 RDLogger.DisableLog("rdApp.*")
 logger = logging.getLogger(__name__)
@@ -341,6 +339,10 @@ def evaluate(args: argparse.Namespace) -> pd.DataFrame:
             len(missing_targets), len(targets), missing_targets,
         )
 
+    if args.limit_targets is not None:
+        present_targets = present_targets[: args.limit_targets]
+        logger.info("limit-targets=%d → scoring %d targets", args.limit_targets, len(present_targets))
+
     # Diagnostic: map each target to a DIFFERENT target's z_p (cyclic derangement)
     # so every ligand set is scored against the wrong protein. If the metrics
     # barely move vs the normal run, the head is ignoring z_p (target-independent
@@ -436,72 +438,62 @@ def evaluate(args: argparse.Namespace) -> pd.DataFrame:
     )
 
     rows: list[dict[str, float | str]] = []
-    with RunLogger(
-        project=args.wandb_project,
-        run_name=args.wandb_run_name,
-        config=vars(args),
-        tags=["stage6", "lit_pcba"],
-    ) as run_logger:
-        for t in tqdm(present_targets, desc="targets", dynamic_ncols=True):
-            sub = work[work["target_name"] == t]
-            z_p = protein_store.get_mean(zp_target[t])
-            # Pull z_m for the InChIKeys this target sees, in the row order.
-            idx = np.fromiter((zm_store.pid_to_row[k] for k in sub["inchikey"]),
-                              dtype=np.int64, count=len(sub))
-            z_m_rows = np.asarray(zm_store.mean_array[idx], dtype=np.float32)
-            y_true = sub["is_active"].to_numpy(dtype=int)
-            y_score = _score_target(
-                head, z_m_rows, z_p,
-                batch_size=args.batch_size, device=args.device,
-            )
-            m = _per_target_metrics(y_true, y_score, args)
-            m["target"] = t
-            rows.append(m)
-            if args.violin_dir is not None:
-                _plot_target_energy_violin(t, y_true, y_score, args.violin_dir)
-            run_logger.log({f"lit_pcba/{t}/{k}": v
-                            for k, v in m.items() if k != "target"})
-            logger.info("%-8s n=%d n_a=%d auc=%.3f bedroc=%.3f ef0.5=%.2f ef1=%.2f ef5=%.2f",
-                        t, int(m["n"]), int(m["n_active"]), m["auroc"], m["bedroc"],
-                        m["ef@0.5%"], m["ef@1.0%"], m["ef@5.0%"])
-
-        # Rows for skipped targets so the CSV captures coverage.
-        for t in missing_targets:
-            rows.append({"target": t, "n": float("nan"), "n_active": float("nan"),
-                         "auroc": float("nan"), "bedroc": float("nan"),
-                         **{f"ef@{p}%": float("nan") for p in args.ef_percents}})
-
-        results = pd.DataFrame(rows)
-        results = results[
-            ["target", "n", "n_active", "auroc", "bedroc"]
-            + [f"ef@{p}%" for p in args.ef_percents]
-        ]
-        # Averages over scored targets only.
-        scored = results[results["target"].isin(present_targets)]
-        avg_row: dict[str, float | str] = {"target": "_mean"}
-        median_row: dict[str, float | str] = {"target": "_median"}
-        for col in ["auroc", "bedroc", *[f"ef@{p}%" for p in args.ef_percents]]:
-            avg_row[col] = float(scored[col].mean(skipna=True))
-            median_row[col] = float(scored[col].median(skipna=True))
-        avg_row["n"] = int(scored["n"].sum())
-        avg_row["n_active"] = int(scored["n_active"].sum())
-        median_row["n"] = avg_row["n"]
-        median_row["n_active"] = avg_row["n_active"]
-        results = pd.concat(
-            [results, pd.DataFrame([avg_row, median_row])], ignore_index=True
+    for t in tqdm(present_targets, desc="targets", dynamic_ncols=True):
+        sub = work[work["target_name"] == t]
+        z_p = protein_store.get_mean(zp_target[t])
+        # Pull z_m for the InChIKeys this target sees, in the row order.
+        idx = np.fromiter((zm_store.pid_to_row[k] for k in sub["inchikey"]),
+                          dtype=np.int64, count=len(sub))
+        z_m_rows = np.asarray(zm_store.mean_array[idx], dtype=np.float32)
+        y_true = sub["is_active"].to_numpy(dtype=int)
+        y_score = _score_target(
+            head, z_m_rows, z_p,
+            batch_size=args.batch_size, device=args.device,
         )
-        results.to_csv(args.output_csv, index=False)
-        logger.info("wrote per-target results to %s", args.output_csv)
+        m = _per_target_metrics(y_true, y_score, args)
+        m["target"] = t
+        rows.append(m)
+        if args.violin_dir is not None:
+            _plot_target_energy_violin(t, y_true, y_score, args.violin_dir)
+        logger.info("%-8s n=%d n_a=%d auc=%.3f bedroc=%.3f ef0.5=%.2f ef1=%.2f ef5=%.2f",
+                    t, int(m["n"]), int(m["n_active"]), m["auroc"], m["bedroc"],
+                    m["ef@0.5%"], m["ef@1.0%"], m["ef@5.0%"])
 
-        # W&B summary metrics — one number per (avg, metric) on the same panel.
-        summary: dict[str, float] = {}
-        for col in ["auroc", "bedroc", *[f"ef@{p}%" for p in args.ef_percents]]:
-            summary[f"lit_pcba/avg/{col}"] = float(avg_row[col])
-            summary[f"lit_pcba/median/{col}"] = float(median_row[col])
-        summary["lit_pcba/n_targets_scored"] = float(len(present_targets))
-        summary["lit_pcba/n_targets_skipped"] = float(len(missing_targets))
-        run_logger.log(summary)
-        logger.info("summary: %s", json.dumps(summary, indent=2))
+    # Rows for skipped targets so the CSV captures coverage.
+    for t in missing_targets:
+        rows.append({"target": t, "n": float("nan"), "n_active": float("nan"),
+                     "auroc": float("nan"), "bedroc": float("nan"),
+                     **{f"ef@{p}%": float("nan") for p in args.ef_percents}})
+
+    results = pd.DataFrame(rows)
+    results = results[
+        ["target", "n", "n_active", "auroc", "bedroc"]
+        + [f"ef@{p}%" for p in args.ef_percents]
+    ]
+    # Averages over scored targets only.
+    scored = results[results["target"].isin(present_targets)]
+    avg_row: dict[str, float | str] = {"target": "_mean"}
+    median_row: dict[str, float | str] = {"target": "_median"}
+    for col in ["auroc", "bedroc", *[f"ef@{p}%" for p in args.ef_percents]]:
+        avg_row[col] = float(scored[col].mean(skipna=True))
+        median_row[col] = float(scored[col].median(skipna=True))
+    avg_row["n"] = int(scored["n"].sum())
+    avg_row["n_active"] = int(scored["n_active"].sum())
+    median_row["n"] = avg_row["n"]
+    median_row["n_active"] = avg_row["n_active"]
+    results = pd.concat(
+        [results, pd.DataFrame([avg_row, median_row])], ignore_index=True
+    )
+    results.to_csv(args.output_csv, index=False)
+    logger.info("wrote per-target results to %s", args.output_csv)
+
+    summary: dict[str, float] = {}
+    for col in ["auroc", "bedroc", *[f"ef@{p}%" for p in args.ef_percents]]:
+        summary[f"avg/{col}"] = float(avg_row[col])
+        summary[f"median/{col}"] = float(median_row[col])
+    summary["n_targets_scored"] = float(len(present_targets))
+    summary["n_targets_skipped"] = float(len(missing_targets))
+    logger.info("summary: %s", json.dumps(summary, indent=2))
 
     return results
 
@@ -514,15 +506,17 @@ def evaluate(args: argparse.Namespace) -> pd.DataFrame:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--test-parquet", type=Path,
-                        default=Path("artifacts/processed/bindingdb/test_lit_pcba.parquet"))
+                        default=Path("artifacts/preprocessing/processed/bindingdb/test_lit_pcba.parquet"))
     parser.add_argument("--head-ckpt", type=Path,
                         default=Path("artifacts/energy/checkpoints/ebm_last.pt"))
     parser.add_argument("--adapter-ckpt", type=Path,
                         default=Path("artifacts/adapter/checkpoints/adapter_v1.pt"))
     parser.add_argument("--protein-store", type=Path,
                         default=Path("artifacts/protein_store/embeddings/esm2_650M/"))
-    parser.add_argument("--zm-cache", type=Path,
-                        default=Path("artifacts/evaluation/lit_pcba_zm/"))
+    parser.add_argument("--zm-cache", type=Path, default=None,
+                        help="default: artifacts/evaluation/<adapter_run_id>/lit_pcba_zm_sv")
+    parser.add_argument("--adapter-run-id", default=None,
+                        help="Stage-2 W&B run id for the default zm-cache path")
     parser.add_argument("--output-csv", type=Path,
                         default=Path("artifacts/evaluation/lit_pcba_results.csv"))
     parser.add_argument("--violin-dir", type=Path, default=None,
@@ -540,16 +534,29 @@ def main() -> None:
                         help="DIAGNOSTIC: score each target's ligands against a "
                              "different target's z_p. If metrics barely drop, the "
                              "head is ignoring the protein.")
+    parser.add_argument("--limit-targets", type=int, default=-1,
+                        help="score only the first N protein-store targets (smoke runs)")
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--wandb-project", default="lattice")
-    parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args()
     logging.basicConfig(
         level=args.log_level,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    if args.zm_cache is None:
+        from lattice_lab.models.builders import adapter_run_id, eval_zm_cache_path
+
+        rid = args.adapter_run_id
+        if rid is None:
+            try:
+                rid = adapter_run_id(args.adapter_ckpt)
+            except ValueError as e:
+                raise SystemExit(
+                    f"{e} — pass --adapter-run-id (Stage-2 W&B run id) or --zm-cache"
+                ) from e
+        args.zm_cache = eval_zm_cache_path(rid, "lit_pcba_zm_sv")
     args.ef_percents = tuple(float(x) for x in args.ef_percents.split(","))
     args.d_protein = 1280
+    args.limit_targets = None if args.limit_targets < 0 else args.limit_targets
     evaluate(args)
 
 

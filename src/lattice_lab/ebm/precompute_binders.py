@@ -7,8 +7,8 @@ re-tokenised + pushed through the DDiT backbone every epoch. This removes the
 warm-up cost entirely and amortises it across the 3-seed Stage-5 array.
 
 The store is keyed by the raw SMILES string (the same key the data module looks
-up), uses the shared :class:`EmbeddingStore` layout, and is only valid for a
-*frozen* adapter (skip it / set ``finetune_adapter=true`` to encode live).
+up), uses the shared :class:`EmbeddingStore` layout, and must match the frozen
+Stage-2 adapter used at EBM train time.
 """
 
 from __future__ import annotations
@@ -21,23 +21,33 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from lattice_lab.models.builders import build_eval_encoder
+from lattice_lab.models.builders import adapter_run_id, build_eval_encoder, zm_store_path
 from lattice_lab.models.encode import encode_binders
 from lattice_lab.protein.store import EmbeddingStore
-from lattice_lab.training.run_logger import RunLogger
 
 logger = logging.getLogger(__name__)
 
 
-def _unique_smiles(parquets: list[Path]) -> list[str]:
-    """Collect unique ``smiles`` across the train/val parquets (order-stable)."""
+def _unique_smiles_and_views(parquets: list[Path]) -> tuple[list[str], dict[str, str]]:
+    """Collect unique ``smiles`` and optional precomputed ``fragment_view``."""
+    import pyarrow.parquet as pq
+
     seen: dict[str, None] = {}
+    views: dict[str, str] = {}
     for p in parquets:
-        df = pd.read_parquet(p, columns=["smiles"])
-        for s in df["smiles"]:
-            if s is not None and s not in seen:
-                seen[str(s)] = None
-    return list(seen)
+        names = set(pq.read_schema(p).names)
+        cols = ["smiles"]
+        if "fragment_view" in names:
+            cols.append("fragment_view")
+        df = pd.read_parquet(p, columns=cols)
+        for _, row in df.iterrows():
+            s = str(row["smiles"])
+            if s in seen:
+                continue
+            seen[s] = None
+            if "fragment_view" in df.columns and pd.notna(row.get("fragment_view")):
+                views[s] = str(row["fragment_view"])
+    return list(seen), views
 
 
 def _clear_store(store_path: Path) -> None:
@@ -59,6 +69,11 @@ def _clear_store(store_path: Path) -> None:
 
 
 def run(args: argparse.Namespace) -> dict[str, int]:
+    with EmbeddingStore.exclusive_lock(args.store_path):
+        return _run_locked(args)
+
+
+def _run_locked(args: argparse.Namespace) -> dict[str, int]:
     args.store_path.mkdir(parents=True, exist_ok=True)
     if args.force:
         _clear_store(args.store_path)
@@ -84,6 +99,7 @@ def run(args: argparse.Namespace) -> dict[str, int]:
             "source_train_parquet": str(args.train_parquet),
             "source_val_parquet": str(args.val_parquet),
             "adapter_ckpt": str(args.adapter_ckpt),
+            "adapter_run_id": adapter_run_id(args.adapter_ckpt),
             "backbone_layer_start": str(encoder.backbone_layer_start),
             "backbone_layer_end": str(encoder.backbone_layer_end),
         },
@@ -91,7 +107,12 @@ def run(args: argparse.Namespace) -> dict[str, int]:
     already = set(store.pid_to_row)
     logger.info("binder store at %s has %d existing rows", args.store_path, len(already))
 
-    smiles = _unique_smiles(parquets)
+    smiles, precomputed_views = _unique_smiles_and_views(parquets)
+    if precomputed_views:
+        logger.info(
+            "using precomputed fragment_view for %d / %d unique binders",
+            len(precomputed_views), len(smiles),
+        )
     if args.limit:
         smiles = smiles[: args.limit]
     todo = [s for s in smiles if s not in already]
@@ -102,24 +123,21 @@ def run(args: argparse.Namespace) -> dict[str, int]:
     )
 
     n_written = 0
-    with RunLogger(
-        project=args.wandb_project,
-        run_name=args.wandb_run_name,
-        config=vars(args),
-        tags=["stage4", "precompute", "binders"],
-    ) as run_logger:
-        pbar = tqdm(total=len(todo), desc="encode binders", unit="mol", dynamic_ncols=True)
-        for start in range(0, len(todo), args.batch_size):
-            batch = todo[start : start + args.batch_size]
-            with torch.no_grad():
-                z_m = encode_binders(encoder, batch, args.device, grad=False)
-            arr = z_m.detach().cpu().to(torch.float16).numpy()
-            n_written += store.append_mean(batch, arr)
-            run_logger.log({"binders/n_written": n_written}, step=n_written, pbar=pbar)
-            pbar.update(len(batch))
-        pbar.close()
+    pbar = tqdm(total=len(todo), desc="encode binders", unit="mol", dynamic_ncols=True)
+    for start in range(0, len(todo), args.batch_size):
+        batch = todo[start : start + args.batch_size]
+        batch_views = [precomputed_views.get(s) for s in batch] if precomputed_views else None
+        with torch.no_grad():
+            z_m = encode_binders(encoder, batch, args.device, grad=False, views=batch_views)
+        arr = z_m.detach().cpu().to(torch.float16).numpy()
+        n_written += store.append_mean(batch, arr)
+        pbar.update(len(batch))
+    pbar.close()
 
-    logger.info("done: wrote %d new, skipped %d already-present", n_written, n_skipped)
+    logger.info(
+        "done: wrote %d new, skipped %d already-present, total=%d",
+        n_written, n_skipped, store.manifest.count,
+    )
     return {"written": n_written, "skipped": n_skipped, "total": store.manifest.count}
 
 
@@ -127,16 +145,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--train-parquet", type=Path,
-        default=Path("artifacts/processed/bindingdb/threshold_90/train.parquet"),
+        default=Path("artifacts/preprocessing/processed/bindingdb/threshold_90/train.parquet"),
     )
     parser.add_argument(
         "--val-parquet", type=Path,
-        default=Path("artifacts/processed/bindingdb/threshold_90/val.parquet"),
+        default=Path("artifacts/preprocessing/processed/bindingdb/threshold_90/val.parquet"),
     )
     parser.add_argument("--adapter-ckpt", type=Path, required=True,
                         help="Stage-2 Lightning .ckpt or run directory")
-    parser.add_argument("--store", dest="store_path", type=Path,
-                        default=Path("artifacts/binders/binder_zm/"))
+    parser.add_argument("--store", dest="store_path", type=Path, default=None,
+                        help="default: artifacts/binders/<adapter_run_id>/binder_zm")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--limit", type=int, default=-1, help="-1 = all")
     parser.add_argument(
@@ -146,11 +164,11 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--wandb-project", default="lattice")
-    parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     args.limit = None if args.limit < 0 else args.limit
+    if args.store_path is None:
+        args.store_path = zm_store_path(args.adapter_ckpt, "binder_zm")
     run(args)
 
 

@@ -11,6 +11,7 @@ import pytest
 from lattice_lab.data.fragment_views import load_fragment_split_df
 from lattice_lab.preprocessing.molecules import molecule_qed_molwt
 from lattice_lab.training.ssl_val_probes import _pca_tsne_2d, _ridge_r2, _tsne_2d
+from lattice_lab.training.ssl_val_probes import embedding_batch_collapse_diag
 
 
 def test_molecule_qed_molwt_ethanol() -> None:
@@ -19,6 +20,17 @@ def test_molecule_qed_molwt_ethanol() -> None:
     qed, mw = row
     assert 0.0 < qed <= 1.0
     assert 40.0 < mw < 50.0
+
+
+def test_molecule_probe_props_ethanol() -> None:
+    from lattice_lab.preprocessing.molecules import molecule_probe_props
+
+    row = molecule_probe_props("CCO")
+    assert row is not None
+    qed, mw, logp = row
+    assert 0.0 < qed <= 1.0
+    assert 40.0 < mw < 50.0
+    assert -1.0 < logp < 1.0
 
 
 def test_ridge_r2_perfect_linear_relation() -> None:
@@ -35,6 +47,16 @@ def test_tsne_2d_shape() -> None:
     x = np.random.default_rng(1).normal(size=(40, 8))
     emb = _tsne_2d(x, seed=0, perplexity=10.0)
     assert emb.shape == (40, 2)
+
+
+def test_embedding_batch_collapse_diag_spiky_when_collapsed() -> None:
+    rng = np.random.default_rng(0)
+    full = rng.standard_normal((128, 32))
+    collapsed = rng.standard_normal((128, 1)) @ rng.standard_normal((1, 32))
+    std_full, eig_full = embedding_batch_collapse_diag(full, top_k=5)
+    std_col, eig_col = embedding_batch_collapse_diag(collapsed, top_k=5)
+    assert std_full > std_col
+    assert eig_col[0] / max(eig_col[4], 1e-12) > eig_full[0] / max(eig_full[4], 1e-12)
 
 
 def test_pca_tsne_2d_shape() -> None:

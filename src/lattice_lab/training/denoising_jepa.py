@@ -1,39 +1,9 @@
-"""Conditional denoising-JEPA for the SMILES (DDiT) encoder.
-
-An LLM-JEPA-style scheme where a learned, *pooled* molecule latent conditions a
-denoiser that reconstructs a corrupted copy of the string. The objective is a
-**pure generative (token) loss** — cross-entropy to the ground-truth tokens at
-the corrupted positions — so there is no representation matching, and therefore
-**no EMA teacher / no stop-gradient is needed** (the targets are real tokens,
-not a learned representation, so there is nothing to collapse onto):
-
-    z_s = encoder(clean,    t=1)               # pooled molecule latent (grad)
-    x_t = corrupt(clean,    t=corrupt_t)        # uniform-source substitution
-    logits = denoiser(x_t,  t=corrupt_t | z_s)  # z_s is the conditioning input
-    loss = CE(logits, clean)  over the NOISED positions only
-
-The encoder is trained *through* the reconstruction: ``z_s`` must carry enough
-about the molecule for the denoiser to fill the noised positions back in. The
-remaining failure mode is therefore not representation collapse but an **inert
-anchor** (the denoiser reconstructs from the visible context and ignores
-``z_s``). :func:`condition_bypass_gap` / :func:`assert_condition_active` guard
-against that, and :func:`effective_rank` (``z_s``) is logged as a secondary
-tripwire.
-
-Two components are new relative to the reused discrete-flow stack:
-:class:`AttentionPool` (clean tokens → ``z_s``) and a separate conditional
-:class:`~lattice_lab.backbone.ddit.model_ddit.DDiT` denoiser (``n_conds = D``).
-Everything else is reused: the backbone, the tokenizer
-(:func:`~lattice_lab.backbone.discrete_flow.load_discrete_flow`), and the
-corruption math (:func:`~lattice_lab.backbone.discrete_flow._sample_path` /
-``_sample_timesteps``). The encoder backbone (``n_conds = 0``) and the denoiser
-(``n_conds = D``) are necessarily distinct DDiTs.
-"""
+"""Conditional denoising-JEPA training kernels (encoder, denoiser, loss)."""
 
 from __future__ import annotations
 
 import numbers
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -50,11 +20,13 @@ __all__ = [
     "AttentionPool",
     "VAEHead",
     "JEPAEncoder",
-    "JEPAStudent",
+    "DenoisingJEPAModel",
     "masked_mean",
     "effective_rank",
     "corrupt_tokens",
     "reconstruction_loss",
+    "denoise_logits",
+    "encode_pooled_latent",
     "denoising_loss",
     "condition_bypass_gap",
     "assert_condition_active",
@@ -68,17 +40,7 @@ __all__ = [
 # New component 1: attention pooling head (clean tokens → z_s)
 # --------------------------------------------------------------------------- #
 class AttentionPool(nn.Module):
-    """Learned-query attention pool: ``(B, L, D) -> (B, D)``.
-
-    A single learned query attends over the token axis with
-    :class:`torch.nn.MultiheadAttention`, honoring a key-padding mask, and the
-    pooled vector is LayerNorm'd. The pool itself carries **no positional
-    component**, so it is permutation-invariant in the token axis — order is
-    already baked into the backbone's contextual hidden states it consumes.
-
-    This is the encoder head that produces the molecule latent ``z_s`` used as
-    the denoiser's conditioning input (it is trained through reconstruction).
-    """
+    """Learned-query attention pool: ``(B, L, D) -> (B, D)``."""
 
     def __init__(self, dim: int, *, num_heads: int = 8, dropout: float = 0.0) -> None:
         super().__init__()
@@ -119,30 +81,27 @@ class AttentionPool(nn.Module):
 # New component 2: VAE reparameterization head (optional latent regularizer)
 # --------------------------------------------------------------------------- #
 class VAEHead(nn.Module):
-    """Beta-VAE reparameterization head: ``z_s [B, D] → (mu, log_var) [B, D]``.
+    """``z_s [B, D] → mu, log_var``; sample when ``training=True``, else ``mu``."""
 
-    During training samples ``z ~ N(mu, sigma)`` (reparameterization trick) so
-    the KL penalty can flow gradients back through the encoder. During eval
-    returns ``mu`` deterministically. Attach to :class:`JEPAStudent` as
-    ``student.vae_head``; :func:`denoising_loss` applies it automatically when
-    the attribute is set.
-    """
-
-    def __init__(self, dim: int) -> None:
+    def __init__(self, dim: int, *, free_bits: float = 0.0) -> None:
         super().__init__()
         self.mu = nn.Linear(dim, dim)
         self.log_var = nn.Linear(dim, dim)
+        self.free_bits = float(free_bits)
 
-    def reparameterize(self, z: Tensor, *, training: bool) -> tuple[Tensor, Tensor]:
-        """Return ``(z_out, kl)`` where ``kl = -0.5 * mean(1 + lv - mu² - exp(lv))``."""
+    def reparameterize(self, z: Tensor, *, training: bool) -> tuple[Tensor, Tensor, Tensor]:
+        """Return ``(z_out, kl, log_var)``; ``log_var`` is ``[B, D]``."""
         mu = self.mu(z)
         log_var = self.log_var(z).clamp(-10.0, 10.0)
         if training:
             z_out = mu + torch.randn_like(mu) * (0.5 * log_var).exp()
         else:
             z_out = mu
-        kl = -0.5 * (1.0 + log_var - mu.pow(2) - log_var.exp()).mean()
-        return z_out, kl
+        kl_dim = -0.5 * (1.0 + log_var - mu.pow(2) - log_var.exp())  # [B, D]
+        kl_dim = kl_dim.mean(dim=0)  # [D] expected KL per latent dimension
+        if self.free_bits > 0.0:
+            kl_dim = kl_dim.clamp_min(self.free_bits)
+        return z_out, kl_dim.mean(), log_var
 
 
 # --------------------------------------------------------------------------- #
@@ -174,13 +133,7 @@ def masked_mean(x: Tensor, mask: Tensor) -> Tensor:
 # Encoder wrapper (reused backbone → pooled molecule latent z_s)
 # --------------------------------------------------------------------------- #
 class JEPAEncoder(nn.Module):
-    """``backbone (DDiT) → contextual hiddens [B, L, D] → AttentionPool → z_s``.
-
-    :meth:`forward` returns the pooled molecule latent ``z_s`` ``[B, D]`` used as
-    the denoiser's conditioning input. The encoder always runs on the **clean**
-    string at the clean endpoint ``encode_time`` (``t = 1``); :meth:`latents`
-    exposes the per-position hiddens if needed for diagnostics.
-    """
+    """``backbone → [B, L, D] hiddens → AttentionPool → z_s [B, D]``."""
 
     def __init__(
         self,
@@ -217,15 +170,90 @@ class JEPAEncoder(nn.Module):
         return self.pool(h, key_padding_mask=~mask.to(torch.bool))
 
 
-# --------------------------------------------------------------------------- #
-# Student container (encoder + conditional denoiser)
-# --------------------------------------------------------------------------- #
-class JEPAStudent(nn.Module):
-    """Holds the trainable encoder, the conditional denoiser, and token metadata.
+class _DenoisingCore(Protocol):
+    encoder: JEPAEncoder
+    denoiser: nn.Module
+    pad_id: int
+    vocab_size: int
+    token_id_min: int
+    vae_head: VAEHead | None
+    training: bool
 
-    ``JEPAStudent.parameters()`` is exactly what the optimizer is built over.
-    There is no teacher: the loss is generative (CE to real tokens).
-    """
+
+def encode_pooled_latent(
+    model: _DenoisingCore,
+    ids: Tensor,
+    mask: Tensor,
+    *,
+    training: bool | None = None,
+) -> Tensor:
+    """Encoder pool output, then VAE μ (+ noise when ``training``)."""
+    z = model.encoder(ids, mask)
+    if model.vae_head is not None:
+        if training is None:
+            training = model.training
+        z, _, _ = model.vae_head.reparameterize(z, training=training)
+    return z
+
+
+def _encode_z_with_vae(
+    model: _DenoisingCore,
+    ids: Tensor,
+    mask: Tensor,
+    *,
+    training: bool | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor | None]:
+    """Pooled latent plus optional ``(kl, log_var)`` when a VAE head is attached."""
+    z = model.encoder(ids, mask)
+    kl: Tensor | None = None
+    log_var: Tensor | None = None
+    if model.vae_head is not None:
+        if training is None:
+            training = model.training
+        z, kl, log_var = model.vae_head.reparameterize(z, training=training)
+    return z, kl, log_var
+
+
+def _logvar_metrics(log_var: Tensor) -> dict[str, float]:
+    with torch.no_grad():
+        return {
+            "logvar_mean": float(log_var.mean()),
+            "logvar_std": float(log_var.std(unbiased=False)),
+            "logvar_exp_mean": float(log_var.exp().mean()),
+        }
+
+
+def denoise_forward(
+    model: _DenoisingCore,
+    x_t: Tensor,
+    mask: Tensor,
+    t: Tensor,
+    conds: Tensor,
+    *,
+    return_hidden: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
+    x_t = x_t.long()
+    attn = _additive_key_mask(mask.to(torch.bool))
+    out = model.denoiser(
+        x_t, t.float(), attn_mask=attn, conds=conds, return_hidden=return_hidden
+    )
+    if return_hidden:
+        return out[0], out[1]
+    return out[0] if isinstance(out, tuple) else out
+
+
+def denoise_logits(
+    model: _DenoisingCore, x_t: Tensor, mask: Tensor, t: Tensor, conds: Tensor
+) -> Tensor:
+    """Conditional denoiser logits ``[B, L, vocab]`` for corrupted ``x_t``."""
+    return denoise_forward(model, x_t, mask, t, conds, return_hidden=False)  # type: ignore[return-value]
+
+
+# --------------------------------------------------------------------------- #
+# Tiny fresh-build model (unit tests only)
+# --------------------------------------------------------------------------- #
+class DenoisingJEPAModel(nn.Module):
+    """Encoder + conditional denoiser + token metadata (tests / smoke builds)."""
 
     def __init__(
         self,
@@ -245,30 +273,19 @@ class JEPAStudent(nn.Module):
         self.token_id_min = int(token_id_min)
         self.bundle = bundle
         self.build_config: dict | None = None
-        self.vae_head: VAEHead | None = None  # set by DenoisingJEPAModule when kl_beta > 0
+        self.vae_head: VAEHead | None = None
 
     def denoise_logits(
         self, x_t: Tensor, mask: Tensor, t: Tensor, conds: Tensor
     ) -> Tensor:
-        """Conditional denoiser logits ``[B, L, vocab]`` for corrupted ``x_t``."""
-        x_t = x_t.long()
-        attn = _additive_key_mask(mask.to(torch.bool))
-        out = self.denoiser(x_t, t.float(), attn_mask=attn, conds=conds)
-        return out[0] if isinstance(out, tuple) else out
+        return denoise_logits(self, x_t, mask, t, conds)
 
 
 # --------------------------------------------------------------------------- #
-# Collapse / informativeness tripwire
+# effective_rank
 # --------------------------------------------------------------------------- #
 def effective_rank(z: Tensor, *, eps: float = 1e-12) -> float:
-    """Entropy-based effective rank ``exp(-Σ p_i log p_i)`` of ``z``'s covariance.
-
-    ``z`` is ``[B, D]``. Mirrors
-    :func:`lattice_lab.training.ssl_val_probes.embedding_covariance_rank` (the
-    effective component) but stays in torch so it can be logged every step. A
-    value collapsing toward ``1`` means ``z_s`` carries almost no per-molecule
-    information (an inert / degenerate anchor).
-    """
+    """Entropy-based effective rank of ``z`` ``[B, D]`` covariance."""
     z = z.detach().to(torch.float64)
     if z.ndim != 2 or z.shape[0] < 2:
         return float("nan")
@@ -328,7 +345,7 @@ def corrupt_tokens(
     ids = ids.long()
     x0 = torch.randint(int(token_id_min), int(vocab_size), ids.shape, device=device)
     # Bernoulli(sigma_t) draw of which positions take the source token.
-    sigma_t = 1.0 - t.pow(float(path_power))
+    sigma_t = 1.0 - t#.pow(float(path_power))
     src = torch.rand(ids.shape, device=device) < sigma_t.unsqueeze(-1)
     src = src & valid
     x_t = torch.where(src, x0, ids).masked_fill(~valid, int(pad_id))
@@ -343,14 +360,7 @@ def reconstruction_loss(
     clean_ids: Tensor,
     noised_mask: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Token CE to the clean ids, averaged over the noised positions only.
-
-    Returns ``(loss, per_position_ce)``. Clean (un-noised) positions are visible
-    in the denoiser input, so scoring them is trivial and would dilute the
-    signal that forces ``z_s`` to be used — the loss is restricted to the
-    positions that were actually corrupted. ``loss`` is ``0`` when nothing was
-    noised.
-    """
+    """Token CE at noised positions only; ``0`` when nothing was noised."""
     targets = clean_ids.long()
     ce = F.cross_entropy(logits.transpose(1, 2), targets, reduction="none")  # [B, L]
     w = noised_mask.to(ce.dtype)
@@ -360,85 +370,51 @@ def reconstruction_loss(
 
 
 # --------------------------------------------------------------------------- #
-# Conditional denoising objective (no teacher / no EMA / no stop-grad)
+# denoising_loss
 # --------------------------------------------------------------------------- #
 def denoising_loss(
-    student: JEPAStudent,
+    model: _DenoisingCore,
     batch: tuple[Tensor, Tensor],
     *,
     batch_b: tuple[Tensor, Tensor] | None = None,
     align_lambda: float = 0.0,
-    align_corrupt_t: Optional[Tensor | float | tuple[float, float]] = None,
     corrupt_t: Optional[Tensor | float | tuple[float, float]] = (0.1, 0.6),
     t_cap: float = 1e-3,
     path_power: float = 1.0,
     compute_rank: bool = True,
     return_outputs: bool = False,
     cond_noise_scale: float = 0.0,
+    latent_consistency_lambda: float = 0.0,
 ):
-    """Forward the conditional-denoising objective; return ``(loss, metrics)``.
-
-    Stages: (1) encoder pools the **clean** string at ``t = 1`` → ``z_s``;
-    (2) corrupt the clean ids (uniform source) → ``x_t`` at ``corrupt_t``;
-    (3) denoiser reconstructs, conditioned on ``z_s`` → ``logits``;
-    (4) CE to the clean tokens at the noised positions. No stop-gradient is
-    needed (targets are ground-truth tokens), so gradient flows into both the
-    encoder (via ``z_s``) and the denoiser.
-
-    View-invariance regularizer (optional): when ``batch_b`` (a second
-    augmentation — e.g. a different fragment shuffle — of the *same* molecules)
-    is given and ``align_lambda > 0``, add ``align_lambda * mean(1 - cos(z_s,
-    z_s_b))``. The generative term keeps ``z_s`` informative (so the alignment
-    cannot collapse to a constant), while the alignment pulls the two views'
-    codes together so ``z_s`` encodes order-invariant molecule identity rather
-    than reconstruction-specific token detail (keeps the embedding semantic).
-
-    ``align_corrupt_t`` makes the positive pair *hard*: the second view is
-    corrupted (uniform source) at that flow time and encoded at it before being
-    aligned to the clean anchor ``z_s``. Fragment-shuffle alone is nearly free
-    for a permutation-invariant pool (``align_cos`` saturates at 1 fast and stops
-    regularizing); requiring invariance to genuine token corruption forces the
-    encoder to capture molecule-level structure. ``None`` keeps the clean
-    (``t = 1``) second view.
-
-    ``compute_rank`` toggles the per-call ``effective_rank(z_s)`` SVD.
-    ``return_outputs`` also returns ``(z_s, logits, noised_mask, clean_ids)`` for
-    accuracy / retrieval diagnostics.
-    """
+    """Return ``(loss, metrics)``; optional ``(z_s, logits, noised, ids, kl), terms``."""
     ids, mask = batch
     ids = ids.long()
 
-    # Stage 1 — encoder pools the clean string at the clean endpoint (t = 1).
-    z_s = student.encoder(ids, mask)
+    z_s, kl, log_var = _encode_z_with_vae(model, ids, mask)
 
-    # Optional VAE reparameterization (beta-VAE regularizer on z_s).
-    kl: Optional[Tensor] = None
-    if student.vae_head is not None:
-        z_s, kl = student.vae_head.reparameterize(z_s, training=student.training)
-
-    # Stage 2 — uniform-source corruption (+ which positions were noised).
     x_corrupt, t, noised = corrupt_tokens(
         ids,
         mask,
-        vocab_size=student.vocab_size,
-        token_id_min=student.token_id_min,
-        pad_id=student.pad_id,
+        vocab_size=model.vocab_size,
+        token_id_min=model.token_id_min,
+        pad_id=model.pad_id,
         t=corrupt_t,
         t_cap=t_cap,
         path_power=path_power,
     )
 
-    # Stage 3 — conditional denoiser reconstructs, conditioned on z_s.
-    # t-scaled noise on the conditioning signal: at t≈0 (heavy corruption) z_s
-    # is clean and load-bearing; at t≈1 (easy task) z_s is noisy so the denoiser
-    # cannot lean on it, preventing easy-task gradients from eroding the pool.
-    # FP distillation / SIGReg always see the clean z_s above.
     z_s_cond = z_s
-    if cond_noise_scale > 0.0 and student.training:
-        z_s_cond = z_s + t.unsqueeze(-1) * cond_noise_scale * torch.randn_like(z_s)
-    logits = student.denoise_logits(x_corrupt, mask, t, conds=z_s_cond)
+    if cond_noise_scale > 0.0 and model.training:
+        t_c = t.unsqueeze(-1)
+        z_s_cond = (1.0 - t_c) * z_s + t_c * torch.randn_like(z_s)
+    need_latent = float(latent_consistency_lambda) > 0.0
+    if need_latent:
+        logits, hidden = denoise_forward(
+            model, x_corrupt, mask, t, z_s_cond, return_hidden=True
+        )
+    else:
+        logits = denoise_forward(model, x_corrupt, mask, t, z_s_cond)
 
-    # Stage 4 — pure generative CE at the noised positions.
     recon, _ = reconstruction_loss(logits, ids, noised)
     loss = recon
 
@@ -446,24 +422,17 @@ def denoising_loss(
     if batch_b is not None and align_lambda > 0.0:
         ids_b, mask_b = batch_b
         ids_b = ids_b.long()
-        if align_corrupt_t is not None:
-            # Hard positive: corrupt the second view and encode it at its noise
-            # time, so invariance demands molecule-level (not surface) features.
-            x_b, t_b, _ = corrupt_tokens(
-                ids_b,
-                mask_b,
-                vocab_size=student.vocab_size,
-                token_id_min=student.token_id_min,
-                pad_id=student.pad_id,
-                t=align_corrupt_t,
-                t_cap=t_cap,
-                path_power=path_power,
-            )
-            z_b = student.encoder(x_b, mask_b, t=t_b)
-        else:
-            z_b = student.encoder(ids_b, mask_b)
+        z_b, _, _ = _encode_z_with_vae(model, ids_b, mask_b)
         align = (1.0 - F.cosine_similarity(z_s, z_b, dim=-1)).mean()
         loss = recon + float(align_lambda) * align
+
+    latent: Optional[Tensor] = None
+    if need_latent and noised.any():
+        valid = mask.to(torch.bool)
+        pool_kpm = ~(noised & valid)
+        z_hat = model.encoder.pool(hidden, key_padding_mask=pool_kpm)
+        latent = (1.0 - F.cosine_similarity(z_hat, z_s.detach(), dim=-1)).mean()
+        loss = loss + float(latent_consistency_lambda) * latent
 
     with torch.no_grad():
         pred = logits.argmax(dim=-1)
@@ -478,49 +447,52 @@ def denoising_loss(
         "rank_s": effective_rank(z_s) if compute_rank else float("nan"),
     }
     if align is not None:
-        metrics["align"] = float(align.detach())          # 1 - cos (lower better)
-        metrics["align_cos"] = float(1.0 - align.detach())  # cos(z_s_a, z_s_b)
+        metrics["align"] = float(align.detach())
+        metrics["align_cos"] = float(1.0 - align.detach())
+    if latent is not None:
+        metrics["latent"] = float(latent.detach())
+        metrics["latent_cos"] = float(1.0 - latent.detach())
+    if log_var is not None:
+        metrics.update(_logvar_metrics(log_var))
     if return_outputs:
-        return loss, metrics, (z_s, logits, noised, ids, kl)
+        terms: dict[str, Tensor] = {"recon": recon}
+        if align is not None:
+            terms["align"] = float(align_lambda) * align
+        if latent is not None:
+            terms["latent"] = float(latent_consistency_lambda) * latent
+        return loss, metrics, (z_s, logits, noised, ids, kl), terms
     return loss, metrics
 
 
 # --------------------------------------------------------------------------- #
-# Condition-bypass diagnostic (is z_s actually used, or inert?)
+# condition_bypass_gap
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def condition_bypass_gap(
-    student: JEPAStudent,
+    model: _DenoisingCore,
     batch: tuple[Tensor, Tensor],
     *,
     corrupt_t: Optional[Tensor | float | tuple[float, float]] = 0.1,
     t_cap: float = 1e-3,
     path_power: float = 1.0,
 ) -> dict[str, float]:
-    """Reconstruct once with the real ``z_s`` and once with ``z_s`` zeroed.
-
-    Returns ``{recon_real, recon_zeroed, gap}`` where ``gap = recon_zeroed -
-    recon_real``. A positive gap means the denoiser genuinely uses the anchor; a
-    gap near zero means ``z_s`` is **inert** (the corruption is too weak, or the
-    context alone is enough) and the encoder is learning nothing. Run at a fixed,
-    strong corruption (``corrupt_t`` small) so the noised positions are hard.
-    """
-    student.eval()
+    """Return ``{recon_real, recon_zeroed, gap}`` with ``gap = recon_zeroed - recon_real``."""
+    model.eval()
     ids, mask = batch
     ids = ids.long()
-    z_s = student.encoder(ids, mask)
+    z_s = encode_pooled_latent(model, ids, mask, training=False)
     x_corrupt, t, noised = corrupt_tokens(
         ids,
         mask,
-        vocab_size=student.vocab_size,
-        token_id_min=student.token_id_min,
-        pad_id=student.pad_id,
+        vocab_size=model.vocab_size,
+        token_id_min=model.token_id_min,
+        pad_id=model.pad_id,
         t=corrupt_t,
         t_cap=t_cap,
         path_power=path_power,
     )
-    logits_real = student.denoise_logits(x_corrupt, mask, t, conds=z_s)
-    logits_zero = student.denoise_logits(x_corrupt, mask, t, conds=torch.zeros_like(z_s))
+    logits_real = denoise_logits(model, x_corrupt, mask, t, conds=z_s)
+    logits_zero = denoise_logits(model, x_corrupt, mask, t, conds=torch.zeros_like(z_s))
     recon_real, _ = reconstruction_loss(logits_real, ids, noised)
     recon_zero, _ = reconstruction_loss(logits_zero, ids, noised)
     return {
@@ -531,53 +503,44 @@ def condition_bypass_gap(
 
 
 def assert_condition_active(
-    student: JEPAStudent,
+    model: _DenoisingCore,
     batch: tuple[Tensor, Tensor],
     *,
     margin: float = 0.1,
     corrupt_t: Optional[Tensor | float | tuple[float, float]] = 0.1,
     hard_fail: bool = True,
 ) -> dict[str, float]:
-    """Assert the conditioning gap exceeds ``margin`` (loud if not).
-
-    Raises :class:`RuntimeError` when ``hard_fail`` and the gap is below
-    ``margin`` (the anchor is inert — do not let a run proceed silently). When
-    ``hard_fail`` is ``False`` it returns the gap dict so a caller can warn.
-    """
-    stats = condition_bypass_gap(student, batch, corrupt_t=corrupt_t)
+    stats = condition_bypass_gap(model, batch, corrupt_t=corrupt_t)
     if stats["gap"] < float(margin) and hard_fail:
         raise RuntimeError(
             f"condition-bypass: gap={stats['gap']:.4f} < margin={margin} "
             f"(recon_real={stats['recon_real']:.4f}, "
-            f"recon_zeroed={stats['recon_zeroed']:.4f}). z_s is inert — increase "
-            f"corruption (lower corrupt_t) so reconstruction must rely on z_s."
+            f"recon_zeroed={stats['recon_zeroed']:.4f})"
         )
     return stats
 
 
 # --------------------------------------------------------------------------- #
-# One optimization step (no teacher update)
+# train_step
 # --------------------------------------------------------------------------- #
 def train_step(
-    student: JEPAStudent,
+    model: _DenoisingCore,
     opt: torch.optim.Optimizer,
     batch: tuple[Tensor, Tensor],
     *,
     batch_b: tuple[Tensor, Tensor] | None = None,
     align_lambda: float = 0.0,
-    align_corrupt_t: Optional[Tensor | float | tuple[float, float]] = None,
     corrupt_t: Optional[Tensor | float | tuple[float, float]] = (0.1, 0.6),
     t_cap: float = 1e-3,
     path_power: float = 1.0,
 ) -> dict[str, float]:
     """One optimization step of the conditional-denoising objective."""
-    student.train()
+    model.train()
     loss, metrics = denoising_loss(
-        student,
+        model,
         batch,
         batch_b=batch_b,
         align_lambda=align_lambda,
-        align_corrupt_t=align_corrupt_t,
         corrupt_t=corrupt_t,
         t_cap=t_cap,
         path_power=path_power,
@@ -586,6 +549,27 @@ def train_step(
     loss.backward()
     opt.step()
     return metrics
+
+
+def _wire_denoising_jepa(
+    parent: nn.Module,
+    *,
+    encoder: JEPAEncoder,
+    denoiser: nn.Module,
+    bundle: DiscreteFlowBundle,
+    token_id_min: int,
+    build_config: dict[str, Any],
+) -> None:
+    """Register encoder/denoiser/token metadata on ``parent`` (module or model)."""
+    parent.encoder = encoder
+    parent.denoiser = denoiser
+    parent.pad_id = int(bundle.pad_id)
+    parent.vocab_size = int(bundle.vocab_size)
+    parent.token_id_min = int(token_id_min)
+    parent.bundle = bundle
+    parent.build_config = dict(build_config)
+    if not hasattr(parent, "vae_head"):
+        parent.vae_head = None
 
 
 # --------------------------------------------------------------------------- #
@@ -605,14 +589,8 @@ def build_jepa(
     token_id_min: int = 4,
     ckpt_path: Optional[str] = None,
     device: str | torch.device = "cpu",
-) -> JEPAStudent:
-    """Wire a conditional-denoising :class:`JEPAStudent` from fresh (or
-    warm-started) DDiTs.
-
-    Two DDiTs: the encoder backbone (``n_conds = 0``) and the conditional
-    denoiser (``n_conds = hidden_size`` so it accepts ``z_s``). ``encode_time =
-    1`` is the clean endpoint the encoder runs at.
-    """
+) -> DenoisingJEPAModel:
+    """Wire a conditional-denoising model from fresh (or warm-started) DDiTs."""
     backbone, _ = load_ddit(
         ckpt_path=ckpt_path,
         vocab_size=vocab_size,
@@ -633,15 +611,15 @@ def build_jepa(
     )
     pool = AttentionPool(hidden_size, num_heads=pool_heads, dropout=pool_dropout)
     encoder = JEPAEncoder(backbone, pool, encode_time=encode_time)
-    student = JEPAStudent(
+    model = DenoisingJEPAModel(
         encoder,
         denoiser,
         pad_id=pad_id,
         vocab_size=vocab_size,
         token_id_min=token_id_min,
     )
-    student.to(device)
-    return student
+    model.to(device)
+    return model
 
 
 def build_denoising_jepa(
@@ -650,11 +628,7 @@ def build_denoising_jepa(
     tokenizer_path: str,
     pool_heads: int = 8,
     pool_dropout: float = 0.0,
-    # The encoder runs on the *clean* string, so its flow time is the clean
-    # endpoint t = 1 (sigma = 1 - t**power = 0).
     encode_time: float = 1.0,
-    # The encoder backbone may be frozen (adapter-style: only the pool + denoiser
-    # train); the denoiser is always trainable.
     freeze_backbone: bool = True,
     token_id_min: int = 4,
     n_layer: int = 12,
@@ -662,16 +636,9 @@ def build_denoising_jepa(
     n_embd: int = 768,
     dropout: float = 0.1,
     device: str | torch.device = "cpu",
-) -> JEPAStudent:
-    """Hydra entrypoint: build a conditional-denoising :class:`JEPAStudent` from
-    the reused discrete-flow parts (tokenizer + two ``DDiT`` backbones).
-
-    The encoder backbone is loaded via :func:`load_discrete_flow` (so the student
-    carries a tokenizer :class:`DiscreteFlowBundle`) and may be frozen. The
-    conditional denoiser is a second ``DDiT`` warm-started from the same
-    checkpoint with ``n_conds = hidden`` (its fresh conditioning projection is
-    the only un-restored part); it is always trainable.
-    """
+    parent: nn.Module | None = None,
+) -> DenoisingJEPAModel | None:
+    """Build encoder + denoiser; register on ``parent`` or return a test model."""
     bundle = load_discrete_flow(
         ckpt_path=ckpt_path,
         tokenizer_path=tokenizer_path,
@@ -684,8 +651,6 @@ def build_denoising_jepa(
         device=device,
     )
     hidden = int(bundle.n_embd)
-    # Force n_conds=hidden even when warm-starting from an unconditional (n_conds
-    # = 0) pretrained DDiT: the conditioning projection stays freshly init'd.
     denoiser, _ = load_ddit(
         ckpt_path=ckpt_path,
         vocab_size=bundle.vocab_size,
@@ -699,16 +664,7 @@ def build_denoising_jepa(
     denoiser.to(device)
     pool = AttentionPool(hidden, num_heads=pool_heads, dropout=pool_dropout)
     encoder = JEPAEncoder(bundle.model, pool, encode_time=encode_time)
-    student = JEPAStudent(
-        encoder,
-        denoiser,
-        pad_id=bundle.pad_id,
-        vocab_size=bundle.vocab_size,
-        token_id_min=token_id_min,
-        bundle=bundle,
-    )
-    student.to(device)
-    student.build_config = {
+    build_config = {
         "tokenizer_path": tokenizer_path,
         "pool_heads": int(pool_heads),
         "encode_time": float(encode_time),
@@ -719,4 +675,25 @@ def build_denoising_jepa(
         "dropout": float(dropout),
         "freeze_backbone": bool(freeze_backbone),
     }
-    return student
+    if parent is not None:
+        _wire_denoising_jepa(
+            parent,
+            encoder=encoder,
+            denoiser=denoiser,
+            bundle=bundle,
+            token_id_min=token_id_min,
+            build_config=build_config,
+        )
+        parent.to(device)
+        return None
+    model = DenoisingJEPAModel(
+        encoder,
+        denoiser,
+        pad_id=bundle.pad_id,
+        vocab_size=bundle.vocab_size,
+        token_id_min=token_id_min,
+        bundle=bundle,
+    )
+    model.build_config = build_config
+    model.to(device)
+    return model

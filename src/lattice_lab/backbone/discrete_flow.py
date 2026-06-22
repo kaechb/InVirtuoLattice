@@ -4,7 +4,9 @@ Wraps the pretrained ``DDiT`` discrete-flow model from InVirtuoFM/InVirtuoGEN an
 exposes a molecule encoder for the rest of the pipeline (adapter SSL, decoy
 precompute, EBM head):
 
-    DDiT (frozen) → block hidden states [start..end] → Adapter → z_m  [B, d_adapter]
+    DDiT → block hidden states [start..end] → Adapter → z_m  [B, d_adapter]
+
+(the DDiT backbone is frozen or trainable per ``freeze_backbone``)
 
 It additionally supports the model's *own* discrete-flow pretraining objective
 (:meth:`DiscreteFlowEncoder.discrete_flow_loss`), so the backbone can either be
@@ -375,7 +377,8 @@ class _BlockHiddenCollector:
 # Encoder
 # --------------------------------------------------------------------------- #
 class DiscreteFlowEncoder(nn.Module):
-    """``DDiT (frozen) → block hiddens [start..end] → Adapter → z_m``.
+    """``DDiT → block hiddens [start..end] → Adapter → z_m`` (backbone frozen or
+    trainable per ``freeze_backbone`` at build time).
 
     ``encode_token_ids`` / ``encode_views`` / ``encode_molecule`` return the
     L2-normalized molecule latent ``z_m`` (optionally with the SimCLR
@@ -446,12 +449,18 @@ class DiscreteFlowEncoder(nn.Module):
         return float(self.encode_time)
 
     # -- low-level ---------------------------------------------------------- #
-    def _attn_mask(self, x: Tensor) -> Tensor:
-        """Additive ``[B, 1, L, L]`` mask: -inf where the *key* is PAD."""
+    def _attn_mask(self, x: Tensor, *, hole_mask: Tensor | None = None) -> Tensor:
+        """Additive ``[B, 1, L, L]`` mask: -inf where the *key* is PAD or a hole."""
         b, length = x.shape
         valid = (x != self.bundle.pad_id) & (x != self.bundle.bos_id) & (x != self.bundle.eos_id)
 
         block = (~valid).unsqueeze(1).expand(b, length, length)
+        if hole_mask is not None:
+            if hole_mask.shape != (b, length):
+                raise ValueError(
+                    f"hole_mask must be [B,T]=({b},{length}), got {tuple(hole_mask.shape)}"
+                )
+            block = block | hole_mask.unsqueeze(1).expand(b, length, length)
         return block.float().masked_fill(block, float("-inf")).unsqueeze(1)
 
     def _build_time(self, batch: int, device: torch.device) -> Tensor:
@@ -462,9 +471,9 @@ class DiscreteFlowEncoder(nn.Module):
             (batch,), float(self.encode_time), device=device, dtype=torch.float32
         )
 
-    def _backbone_hidden(self, x: Tensor) -> Tensor:
+    def _backbone_hidden(self, x: Tensor, *, hole_mask: Tensor | None = None) -> Tensor:
         """Run DDiT once on clean tokens; return concat hiddens ``[B,T,L*d]``."""
-        attn = self._attn_mask(x)
+        attn = self._attn_mask(x, hole_mask=hole_mask)
         t = self._build_time(x.size(0), x.device)
         kwargs: dict[str, Any] = {"attn_mask": attn, "conds": None}
         if self._supports_post_hidden:
@@ -483,17 +492,38 @@ class DiscreteFlowEncoder(nn.Module):
         *,
         return_projection: bool = False,
         normalize: bool = True,
+        return_tokens: bool = False,
+        hole_mask: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
+        """Encode token ids to ``z_m`` (see :meth:`Adapter.forward`).
+
+        ``return_tokens`` returns ``(z_m, x)`` with per-token reps ``x`` aligned
+        to the *post*-:func:`prepare_backbone_tokens` frame — i.e. the leading
+        BOS is dropped, so column ``i`` of ``x`` corresponds to input column
+        ``i + 1``. Callers pooling specific token spans must account for that.
+
+        ``hole_mask`` ``[B,T]`` bool (post-BOS frame): when set, hole positions
+        are blocked as attention *keys* in DDiT and the adapter so visible context
+        reps cannot attend to ``<UNK>`` slots (I-JEPA context-only encoding).
+        """
         x, m = prepare_backbone_tokens(
             ids, mask, bos_id=self.bundle.bos_id, eos_id=self.bundle.eos_id, pad_id=self.bundle.pad_id
         )
+        if hole_mask is not None:
+            hole_mask = hole_mask.to(device=x.device, dtype=torch.bool)
+            if hole_mask.shape != x.shape:
+                raise ValueError(
+                    f"hole_mask must match post-BOS ids shape {tuple(x.shape)}, "
+                    f"got {tuple(hole_mask.shape)}"
+                )
         # Track the backbone graph when its params need grad OR when the encode
         # time is learnable (gradient must reach time_logit through the backbone).
         grad = self._learnable_time or any(p.requires_grad for p in self.backbone.parameters())
         with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
-            hs = self._backbone_hidden(x)
+            hs = self._backbone_hidden(x, hole_mask=hole_mask)
         return self.adapter(
-            hs, m.to(hs.dtype), return_projection=return_projection, normalize=normalize
+            hs, m.to(hs.dtype), return_projection=return_projection,
+            normalize=normalize, return_tokens=return_tokens, hole_mask=hole_mask,
         )
 
     def encode_views(

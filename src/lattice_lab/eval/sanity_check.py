@@ -189,7 +189,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adapter", type=Path, required=True,
                         help="Path to adapter_v1.pt produced by Stage 2 training")
-    parser.add_argument("--val-shards", type=Path, default=Path("artifacts/processed/moses"),
+    parser.add_argument("--val-shards", type=Path, default=Path("artifacts/preprocessing/processed/moses"),
                         help="Shard dir containing Stage-1 parquet (val split derived from here)")
     parser.add_argument("--val-ratio", type=float, default=0.005)
     parser.add_argument("--test-ratio", type=float, default=0.005)
@@ -198,7 +198,7 @@ def main() -> None:
                         help="Cap val pairs for retrieval (default -1 = use full split). "
                              "Note: memory is O(N²); set a cap for very large val sets.")
     parser.add_argument("--bioisostere-csv", type=Path, default=DEFAULT_BIOISOSTERE_CSV)
-    parser.add_argument("--qm9-csv", type=Path, default=Path("artifacts/raw/qm9.csv"))
+    parser.add_argument("--qm9-csv", type=Path, default=Path("artifacts/preprocessing/raw/qm9.csv"))
     parser.add_argument("--qm9-n-subset", type=int, default=-1,
                         help="QM9 random subsample (default -1 = use full 134K)")
     parser.add_argument("--no-baselines", action="store_true",

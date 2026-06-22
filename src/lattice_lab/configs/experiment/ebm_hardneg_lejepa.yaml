@@ -11,13 +11,13 @@ tags: ["ebm", "hardneg", "lejepa"]
 ssl_run_id: 4tau7a38
 
 data:
-  decoy_store: artifacts/decoys/lejepa/decoy_zm/
-  bdb_store: artifacts/decoys/lejepa/bdb_zm
-  binder_store: artifacts/binders/lejepa/binder_zm
+  decoy_store: artifacts/decoys/${ssl_run_id}/decoy_zm/
+  bdb_store: artifacts/decoys/${ssl_run_id}/bdb_zm
+  binder_store: artifacts/binders/${ssl_run_id}/binder_zm
 
 model:
   encoder:
-    adapter_ckpt: artifacts/adapter/lejepa/checkpoints/${ssl_run_id}/last.ckpt
+    adapter_ckpt: artifacts/adapter/checkpoints/${ssl_run_id}/last.ckpt
 
 logger:
   wandb:

@@ -8,7 +8,7 @@ per-target early-recognition (EF@1%, BEDROC).
 
 This module loads a DUD-E dump prepared by ``scripts/download_dude.sh``:
 
-    artifacts/raw/dude/<TARGET>/
+    artifacts/preprocessing/raw/dude/<TARGET>/
         actives_final.ism        SMILES <space> internal_id [<space> ChEMBL_id]
         decoys_final.ism         SMILES <space> ZINC-style decoy_id
         receptor.pdb             one representative receptor structure / target

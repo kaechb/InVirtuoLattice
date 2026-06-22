@@ -210,7 +210,7 @@ cat <<EOF
   Run the ESM C precompute from the repo root:
     cd ${REPO_ROOT}
     python -m lattice_lab.protein.precompute --backend esmc \\
-      --fasta artifacts/processed/bindingdb/bindingdb_targets.fasta \\
+      --fasta artifacts/preprocessing/processed/bindingdb/bindingdb_targets.fasta \\
       --store artifacts/protein_store/embeddings/esmc_600m \\
       --device cuda --batch-size 8
 

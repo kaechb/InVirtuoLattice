@@ -1,7 +1,7 @@
 _target_: lattice_lab.data.EBMDataModule
 
-train_parquet: artifacts/processed/bindingdb/threshold_90/train.parquet
-val_parquet: artifacts/processed/bindingdb/threshold_90/val.parquet
+train_parquet: artifacts/preprocessing/processed/bindingdb/threshold_90/train.parquet
+val_parquet: artifacts/preprocessing/processed/bindingdb/threshold_90/val.parquet
 protein_store: artifacts/protein_store/embeddings/esm2_650M/
 decoy_store: artifacts/decoys/decoy_zm_ssl2/
 bdb_store: artifacts/decoys/bdb_zm_ssl2

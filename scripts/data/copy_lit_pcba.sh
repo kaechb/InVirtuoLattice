@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage 0 — copy the LIT-PCBA test set into artifacts/raw/lit_pcba/.
+# Stage 0 — copy the LIT-PCBA test set into artifacts/preprocessing/raw/lit_pcba/.
 #
 # Source layout (per-target subfolder produced by the 23AIBox-CSCo-DTA repo):
 #     <SRC>/<TARGET>/actives.smi          SMILES + PubChem CID, whitespace-separated
@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DEST="${REPO}/artifacts/raw/lit_pcba"
+DEST="${REPO}/artifacts/preprocessing/raw/lit_pcba"
 SRC="${LIT_PCBA_SRC:-/home/euser/Gianvito/23AIBox-CSCo-DTA-main/data/source/lit_pcba}"
 
 if [[ ! -d "$SRC" ]]; then

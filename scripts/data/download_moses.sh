@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-RAW_DIR="${REPO}/artifacts/raw"
+RAW_DIR="${REPO}/artifacts/preprocessing/raw"
 DEST="${RAW_DIR}/moses.csv"
 URL="https://media.githubusercontent.com/media/molecularsets/moses/master/data/dataset_v1.csv"
 

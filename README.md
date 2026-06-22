@@ -51,13 +51,14 @@ All pipeline inputs/outputs live under one git-ignored `artifacts/` tree
 
 ```
 artifacts/
-├── raw/            # downloads: moses.csv, qm9.csv, bindingdb/, lit_pcba/, dude/
-├── processed/      # Stage 1: bindingdb/threshold_90/*.parquet, moses/shard_*.parquet, *.fasta
-├── adapter/        # Stage 2: <variant>/checkpoints/<run_id>/last.ckpt
+├── preprocessing/  # Stages 0–1
+│   ├── raw/        # downloads: moses.csv, qm9.csv, bindingdb/, lit_pcba/, dude/
+│   └── processed/  # bindingdb/threshold_90/*.parquet, moses/shard_*.parquet, *.fasta
+├── adapter/        # Stage 2: checkpoints/<run_id>/last.ckpt (flat — no variant subdirs)
 ├── protein_store/  # Stage 3: frozen ESM-2 embedding store
-├── decoys/         # Stage 4: <variant>/{decoy_zm,bdb_zm} pools (binders → binders/<variant>/)
-├── energy/         # Stage 5: <variant>/<run_id>/last.ckpt EBM heads
-├── evaluation/     # Stage 6: LIT-PCBA caches, results, violins
+├── decoys/         # Stage 4: <adapter_run_id>/{decoy_zm,bdb_zm} (binders → binders/<run_id>/)
+├── energy/         # Stage 5: checkpoints/<run_id>/last.ckpt EBM heads (flat)
+├── evaluation/     # Stage 6: <adapter_run_id>/lit_pcba_zm_* caches + results
 └── predictions/    # Stage 7: inference outputs
 ```
 
@@ -126,7 +127,7 @@ Run the CLIs from the repo root so the relative `artifacts/` paths in
 All pipeline inputs/outputs live under `artifacts/`.
 
 When W&B logging is enabled, every ``ModelCheckpoint`` writes under
-``{dirpath}/{wandb_run_id}/`` (e.g. ``artifacts/adapter/lejepa/checkpoints/73miv4j1/last.ckpt``).
+``{dirpath}/{wandb_run_id}/`` (e.g. ``artifacts/adapter/checkpoints/73miv4j1/last.ckpt``).
 The run id is printed in the W&B URL and in the training log line
 ``ModelCheckpoint dirpath → …``.
 
@@ -160,70 +161,143 @@ the released `ssl2` artifact set.
 
 `scripts/slurm/` has one sbatch wrapper per stage. They all `source common.sh`
 (module loads, `$REPO`, GPU check, and self-healing `logs/slurm/stage<N>/` log
-dirs), so just submit from the repo root. Most are driven by **environment
-variables — you don't edit the files**:
+dirs). Submit from the repo root. Stages 2–6 take **run ids as arguments or env
+vars** — you don't edit the script files.
 
-| Stage | Script | Knobs | Output |
+| Stage | Script | Args / env | Output |
 |---|---|---|---|
 | 1 | `stage1_preprocess.sh` | — | BindingDB curation + 90% MMseqs2 split |
-| 2 | `stage2_adapter_ssl_{lejepa,ntxent}.sh` | — | adapter SSL ckpt (one per variant) |
-| 3 | `stage3_protein_precompute.sh` (or `…_esmc.sh`) | — | frozen ESM-2 / ESM C store |
-| 4 | `stage4_precompute_decoys_{lejepa,ntxent}.sh` | edit `SSL_RUN_ID` | decoy + BDB + binder `z_m` pools |
-| 5 | `stage5_ebm_train_{lejepa,ntxent}.sh` | `--array=0-2` (3 seeds) | `artifacts/energy/<variant>/<run_id>/last.ckpt` |
-| 6a | `stage6_build_zm_cache.sh` | `VARIANT` | 4-view cache `lit_pcba_zm_mv4_<variant>` |
-| 6b | `stage6_ensemble_eval.sh` | `VARIANT` | 3-seed LIT-PCBA ensemble (needs 6a) |
-| 6 | `stage6_single_eval.sh` | `VARIANT`, `RUN_ID` (or `CKPT`) | single-checkpoint LIT-PCBA (self-contained cache) |
-| 7 | `stage7_predict_ensemble.sh` | `VARIANT` | virtual screening |
+| 2 | `stage2_ssl.sh` | `METHOD`, optional `RUN_NAME` | `artifacts/adapter/checkpoints/<run_id>/last.ckpt` |
+| 3 | `stage3_protein_precompute.sh` | `PROTEIN` (`esm2`\|`esmc`), `OVERWRITE` | frozen ESM-2 / ESM C store |
+| 4 | `stage4_precompute_decoys.sh` | `RUN_ID` (Stage-2 W&B id) | `artifacts/decoys/<run_id>/…`, `artifacts/binders/<run_id>/…` |
+| 5 | `stage5_ebm_train.sh` | `METHOD`, `RUN_ID` (Stage-2); optional `--three-seeds` | `artifacts/energy/checkpoints/<run_id>/last.ckpt` |
+| 6 | `stage6_eval.sh` | `RUN_ID` or three EBM ids; optional `--single-view` + `SSL_RUN_ID` | mv4 cache + CSV, ensemble JSON, or 1-view CSV |
+| 7 | `stage7_predict_ensemble.sh` | edit paths + seed ids in script | virtual screening CSV |
+| — | `run_pipeline.sh` | `METHOD`, `PROTEIN`, `N_SEEDS`, optional `RUN_NAME` | submits stages 2→6 (same stage scripts) with SLURM dependencies |
+
+**Run-id convention.** Stage 2 prints a W&B run id; that same id keys Stage-4
+decoy pools and is passed to Stage 5 as `RUN_ID`. Stage 5 prints one W&B run id
+per array task (one per seed); those EBM ids go to Stage 6.
 
 ```bash
-# variant-aware stages take VARIANT=lejepa|ntxent:
-VARIANT=ntxent sbatch scripts/slurm/stage6_build_zm_cache.sh
-VARIANT=ntxent sbatch scripts/slurm/stage6_ensemble_eval.sh         # after 6a finishes
-VARIANT=ntxent RUN_ID=gi2762bi sbatch scripts/slurm/stage6_single_eval.sh
+# --- Stage 2: adapter SSL (pick one METHOD) ---
+sbatch scripts/slurm/stage2_ssl.sh lejepa
+sbatch scripts/slurm/stage2_ssl.sh ntxent
+sbatch scripts/slurm/stage2_ssl.sh ijepa
+sbatch scripts/slurm/stage2_ssl.sh ijepa my_ablation_name   # optional W&B run name
+sbatch scripts/slurm/stage2_ssl.sh denoise
+# → note the W&B run id, e.g. nsw2w2z5
 
-# chain a job to start only once another succeeds:
-sbatch --dependency=afterok:<jobid> scripts/slurm/stage6_ensemble_eval.sh
+# --- Stage 4: z_m pools (any Stage-2 ckpt; encoder type auto-detected) ---
+sbatch scripts/slurm/stage4_precompute_decoys.sh nsw2w2z5
+# RUN_ID=nsw2w2z5 sbatch scripts/slurm/stage4_precompute_decoys.sh
+
+# --- Stage 5: EBM training (seed 0 by default) ---
+sbatch scripts/slurm/stage5_ebm_train.sh lejepa nsw2w2z5
+sbatch scripts/slurm/stage5_ebm_train.sh ntxent 1kfmwoar
+./scripts/slurm/stage5_ebm_train.sh --three-seeds lejepa nsw2w2z5   # seeds 0–2
+sbatch --array=0-2 scripts/slurm/stage5_ebm_train.sh lejepa nsw2w2z5
+# → note EBM run id(s), e.g. abc123 (one seed) or abc123, def456, ghi789 (three)
+
+# --- Stage 6: LIT-PCBA (rebuilds mv4 cache every time, then scores) ---
+sbatch scripts/slurm/stage6_eval.sh abc123                              # one seed
+sbatch scripts/slurm/stage6_eval.sh abc123 def456 ghi789                # 3-seed ensemble
+SSL_RUN_ID=nsw2w2z5 sbatch scripts/slurm/stage6_eval.sh --single-view abc123  # 1-view debug
+
+# chain jobs:
+sbatch --dependency=afterok:<stage4_jobid> scripts/slurm/stage5_ebm_train.sh lejepa nsw2w2z5
 ```
 
-The three per-seed run ids for the **ensemble** (6b) and **screening** (7) are
-wired in a `case "$VARIANT"` block near the top of those two scripts — update
-them after a fresh Stage-5 run. Stage-4 takes its Stage-2 adapter id via
-`SSL_RUN_ID` (also at the top). Everything else needs no per-run edits. The
-`adapter_fingerprint` guard refuses to score a `z_m` cache that was built with a
-different adapter than the checkpoint, so a stale cache fails loudly instead of
-silently returning wrong numbers.
+**Full pipeline (stages 2→6, dependency chain):** run from the login node — **not**
+`sbatch`. `run_pipeline.sh` submits the same stage scripts with `PIPELINE_ENV` set;
+stage 2 writes the adapter W&B id, stage 5 writes per-seed EBM ids to
+`<pipeline_id>.env.ebm.<seed>`, and stages 4/6 read those automatically.
 
-The manual `python -m …` commands behind each wrapper are documented per stage
-below.
+```bash
+./scripts/slurm/run_pipeline.sh lejepa
+PROTEIN=esmc RUN_NAME=ijepa_ablation ./scripts/slurm/run_pipeline.sh ijepa
+N_SEEDS=3 ./scripts/slurm/run_pipeline.sh lejepa          # three seeds → stage6_ensemble_eval path
+SMOKE=1 ./scripts/slurm/run_pipeline.sh lejepa           # fast wiring test (~1h total)
+```
+
+**Smoke test (`SMOKE=1`):** exercises the full dependency chain with tiny data —
+1 SSL epoch on 1% of train batches, 5k-row BDB/decoy pools, 50 EBM steps, 3
+LIT-PCBA targets with 1-view cache. Sampled parquets are created at **stage 4**
+(when python is available) under `logs/slurm/pipeline/<id>/smoke_data/`. Jobs get
+`--time=01:00:00`. Tunables: `SMOKE_PRECOMPUTE_LIMIT`, `SMOKE_PARQUET_ROWS`,
+`SMOKE_LITPCBA_TARGETS`.
+
+```bash
+SMOKE=1 ./scripts/slurm/run_pipeline.sh lejepa
+SMOKE=1 SMOKE_LITPCBA_TARGETS=2 ./scripts/slurm/run_pipeline.sh ijepa smoke_ijepa
+```
+
+Dependency graph (stage 3 and 4 run in parallel after stage 2; stage 6 waits for
+both stage 5 and stage 3):
+
+```
+stage2 ─┬─→ stage3 ─┐
+        └─→ stage4 ─→ stage5 ─┴─→ stage6
+```
+
+| Env | Default | Meaning |
+|---|---|---|
+| `METHOD` | `lejepa` | Stage-2 SSL objective (positional `$1`) |
+| `RUN_NAME` | — | Optional W&B run name for stage 2 (positional `$2`) |
+| `PROTEIN` | `esm2` | Stage 3: `esm2` or `esmc` (pipeline sets `OVERWRITE=0` for incremental embed) |
+| `N_SEEDS` | `1` | Stage-5 seeds; `3` runs ensemble eval, else single-checkpoint eval |
+| `SMOKE` | `0` | `1` = smoke mode (see above) |
+
+Stage 3 skips pids already in the protein store; stages 4–6 rebuild decoy pools
+and LIT-PCBA caches from scratch (`--force` / cache clear).
+
+Stage-2 `METHOD` values: `lejepa`, `ntxent`, `ijepa`, `denoise` (maps to Hydra
+`experiment=`). Stage-5 `METHOD` is `lejepa` or `ntxent` (W&B grouping only;
+pools always come from the Stage-2 `RUN_ID`).
+
+Stage 6 eval artifacts for EBM run id `<ebm_id>`:
+
+```
+artifacts/evaluation/<ebm_id>/lit_pcba_zm_mv4      # 4-view z_m cache
+artifacts/evaluation/<ebm_id>/lit_pcba_mv4.csv    # single-checkpoint metrics
+artifacts/evaluation/<ebm_id>/ensemble_mv4.json   # 3-seed ensemble (RUN_ID0 key)
+```
+
+The `adapter_fingerprint` guard refuses to score a `z_m` cache built with a
+different adapter than the checkpoint.
+
+Stage 7 still has per-target paths and seed run ids in the script header — update
+those after Stage 5. The manual `python -m …` commands behind each wrapper are
+documented per stage below.
 
 ### Stage 0 — Data acquisition
 
-Download scripts live in `scripts/` and write into `artifacts/raw/`. See
+Download scripts live in `scripts/` and write into `artifacts/preprocessing/raw/`. See
 `scripts/DATASETS.md` for dataset details, sizes, and licences.
 
 ```bash
-# MOSES — molecules for adapter self-supervision        → artifacts/raw/moses.csv
+# MOSES — molecules for adapter self-supervision        → artifacts/preprocessing/raw/moses.csv
 bash scripts/download_moses.sh
 
-# BindingDB-All — full monthly dump (~3.2M measurements) → artifacts/raw/bindingdb/
+# BindingDB-All — full monthly dump (~3.2M measurements) → artifacts/preprocessing/raw/bindingdb/
 # Pick the latest YYYYMM release from
 # https://www.bindingdb.org/rwd/bind/chemsearch/marvin/Download.jsp
 # download_bindingdb.sh is idempotent: if BindingDB_All.tsv already exists it
 # will NOT re-fetch. Delete stale files before refreshing:
-#   rm -f artifacts/raw/bindingdb/BindingDB_All.tsv artifacts/raw/bindingdb/BindingDB_All_*.tsv.zip
+#   rm -f artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv artifacts/preprocessing/raw/bindingdb/BindingDB_All_*.tsv.zip
 BINDINGDB_DATE=202606 bash scripts/download_bindingdb.sh
 
 # Sanity-check before Stage 1 (a truncated TSV silently poisons every later stage):
-wc -l artifacts/raw/bindingdb/BindingDB_All.tsv          # ~3.1–3.2M lines incl. header
-ls -lh artifacts/raw/bindingdb/BindingDB_All_*.tsv.zip   # zip ~550–570 MB; TSV ~3 GB
+wc -l artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv          # ~3.1–3.2M lines incl. header
+ls -lh artifacts/preprocessing/raw/bindingdb/BindingDB_All_*.tsv.zip   # zip ~550–570 MB; TSV ~3 GB
 
-# LIT-PCBA held-out benchmark                            → artifacts/raw/lit_pcba/
+# LIT-PCBA held-out benchmark                            → artifacts/preprocessing/raw/lit_pcba/
 # Downloads via huggingface_hub (CDN + retry/resume), unzips, and stages it.
 # Robust to HF rate-limiting (HTTP 429), common from shared cluster IPs — export
 # HF_TOKEN to raise the anonymous limit if it still throttles.
 bash scripts/download_lit_pcba.sh
 
-# DUD-E benchmark (optional secondary eval)              → artifacts/raw/dude/
+# DUD-E benchmark (optional secondary eval)              → artifacts/preprocessing/raw/dude/
 # 102 targets from dude.docking.org; override the mirror with DUDE_BASE_URL=<url>.
 bash scripts/download_dude.sh
 ```
@@ -277,55 +351,73 @@ If you are on LUMI - use this:
   mkdir -p $FLASH/tmp $FLASH/artifacts
   export TMPDIR=$FLASH/tmp
   python -m lattice_lab.preprocessing.run_bindingdb \
-    --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \
-    --lit-pcba-dir  artifacts/raw/lit_pcba \
+    --bindingdb-tsv artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv \
+    --lit-pcba-dir  artifacts/preprocessing/raw/lit_pcba \
     --output-dir     $FLASH/artifacts/processed/bindingdb \
     --identity 90 --n-jobs 16
 
 # Canonicalise MOSES (adapter SSL set) into fragment-view parquet shards.
 python -m lattice_lab.preprocessing.run_preprocessing \
-    --input  artifacts/raw/moses.csv \
+    --input  artifacts/preprocessing/raw/moses.csv \
     --output  $FLASH/artifacts/processed/moses \
     --n-views 3 --n-jobs 16
 
-cp -r $FLASH/artifacts/processed/* /scratch/$PROJ/benno/lattice_lab/artifacts/processed/
+cp -r $FLASH/artifacts/processed/* /scratch/$PROJ/benno/lattice_lab/artifacts/preprocessing/processed/
 ```
 
 ```bash
 # Curate BindingDB + build the 90% MMseqs2 identity split held out vs LIT-PCBA.
 # Needs MMseqs2 (hard dep). LATTICE_ALLOW_KMER_FALLBACK=1 only for smoke/tests.
 python -m lattice_lab.preprocessing.run_bindingdb \
-    --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \
-    --lit-pcba-dir  artifacts/raw/lit_pcba \
-    --output-dir    artifacts/processed/bindingdb \
+    --bindingdb-tsv artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv \
+    --lit-pcba-dir  artifacts/preprocessing/raw/lit_pcba \
+    --output-dir    artifacts/preprocessing/processed/bindingdb \
     --identity 90 --n-jobs 16
 
 # Canonicalise MOSES (adapter SSL set) into fragment-view parquet shards.
 python -m lattice_lab.preprocessing.run_preprocessing \
-    --input  artifacts/raw/moses.csv \
-    --output artifacts/processed/moses \
+    --input  artifacts/preprocessing/raw/moses.csv \
+    --output artifacts/preprocessing/processed/moses \
     --n-views 3 --n-jobs 16
 ```
 
 ### Stage 2 — Molecule encoder (DDiT + adapter SSL)
 
-Two interchangeable adapter objectives; pick one (or train both to compare).
-Each lands at `artifacts/adapter/<variant>/checkpoints/<wandb_run_id>/last.ckpt`,
+Pick an SSL objective via `METHOD` on SLURM (`lejepa`, `ntxent`, `ijepa`,
+`denoise`). Each lands at `artifacts/adapter/checkpoints/<wandb_run_id>/last.ckpt`,
 which Stage 4+ load **directly** — no export step.
 
 ```bash
-# NT-Xent / InfoNCE adapter:
-python -m lattice_lab.train experiment=adapter_discrete_flow_baseline \
-    data.shard_dir=artifacts/processed/moses \
-    trainer.max_epochs=10 data.batch_size=64 trainer.accelerator=gpu \
-    callbacks.model_checkpoint.dirpath=artifacts/adapter/ntxent/checkpoints
+sbatch scripts/slurm/stage2_ssl.sh lejepa
+sbatch scripts/slurm/stage2_ssl.sh ijepa my_ablation_name   # custom W&B run name
+```
 
-# LeJEPA (invariance + SIGReg) adapter:
-python -m lattice_lab.train experiment=adapter_discrete_flow_lejepa \
-    data.shard_dir=artifacts/processed/moses \
-    trainer.max_epochs=10 data.batch_size=64 trainer.accelerator=gpu \
-    callbacks.model_checkpoint.dirpath=artifacts/adapter/lejepa/checkpoints \
-    model.lejepa_lambda=0.5
+Manual equivalents:
+
+```bash
+# NT-Xent / InfoNCE (LATTICE baseline — fp distillation):
+python -m lattice_lab.train experiment=adapter_discrete_flow model.ssl_loss=ntxent model.fp_weight=2.0 \
+    data.shard_dir=artifacts/preprocessing/processed/moses \
+    trainer.max_epochs=10 trainer.accelerator=gpu \
+    callbacks.model_checkpoint.dirpath=artifacts/adapter/checkpoints
+
+# LeJEPA (invariance + SIGReg):
+python -m lattice_lab.train experiment=adapter_discrete_flow model.ssl_loss=lejepa model.fp_weight=0.0 \
+    data.shard_dir=artifacts/preprocessing/processed/moses data.batch_size=128 \
+    trainer.max_epochs=10 trainer.accelerator=gpu \
+    callbacks.model_checkpoint.dirpath=artifacts/adapter/checkpoints
+
+# I-JEPA (masked-fragment prediction + SIGReg):
+python -m lattice_lab.train experiment=adapter_discrete_flow model.ssl_loss=ijepa \
+    data.shard_dir=artifacts/preprocessing/processed/moses data.batch_size=256 \
+    trainer.max_epochs=10 trainer.accelerator=gpu \
+    callbacks.model_checkpoint.dirpath=artifacts/adapter/checkpoints
+
+# Denoising-JEPA:
+python -m lattice_lab.train experiment=denoising_jepa \
+    data.shard_dir=artifacts/preprocessing/processed/moses \
+    trainer.max_epochs=10 trainer.accelerator=gpu \
+    callbacks.model_checkpoint.dirpath=artifacts/adapter/checkpoints
 ```
 
 ### Stage 3 — Protein encoder (frozen ESM-2 650M)
@@ -354,11 +446,11 @@ python -c "import torch; print('gpu', torch.cuda.is_available(), torch.__version
 # expect: gpu True 2.7.1
 
 python -m lattice_lab.protein.precompute \
-    --fasta artifacts/processed/bindingdb/bindingdb_targets.fasta \
+    --fasta artifacts/preprocessing/processed/bindingdb/bindingdb_targets.fasta \
     --store artifacts/protein_store/embeddings/esm2_650M \
     --device cuda --batch-size 8
 python -m lattice_lab.protein.precompute \
-    --fasta artifacts/processed/bindingdb/lit_pcba_targets.fasta \
+    --fasta artifacts/preprocessing/processed/bindingdb/lit_pcba_targets.fasta \
     --store artifacts/protein_store/embeddings/esm2_650M \
     --device cuda --batch-size 8
 ```
@@ -376,7 +468,7 @@ the later stages about the new dimension:
 
 ```bash
 python -m lattice_lab.protein.precompute --backend esmc \
-    --fasta artifacts/processed/bindingdb/bindingdb_targets.fasta \
+    --fasta artifacts/preprocessing/processed/bindingdb/bindingdb_targets.fasta \
     --store artifacts/protein_store/embeddings/esmc_600m \
     --device cuda --batch-size 8
 ```
@@ -397,76 +489,115 @@ python -m lattice_lab.train experiment=ebm_hardneg_lejepa \
 ### Stage 4 — `z_m` pools (run all three before Stage 5)
 
 Encode the decoy, BindingDB-negative, and binder pools **with the same Stage-2
-adapter** (here `<variant>` = `lejepa` or `ntxent`; replace `<run_id>` with that
-variant's Stage-2 W&B run id). Positives and negatives **must** share one
-adapter — otherwise the head learns an adapter-signature shortcut (inflated
-`val/*`, random LIT-PCBA). The EBM data module hard-fails on a mismatch, and
-`--force` rebuilds a pool cleanly when the adapter changes.
+adapter** (replace `<run_id>` with that adapter's W&B run id). Positives and
+negatives **must** share one adapter — otherwise the head learns an
+adapter-signature shortcut (inflated `val/*`, random LIT-PCBA). The EBM data
+module hard-fails on a mismatch. Encoder type (LeJEPA, I-JEPA, denoising-JEPA,
+…) is auto-detected from the checkpoint.
 
 ```bash
-ADAPTER=artifacts/adapter/<variant>/checkpoints/<run_id>/last.ckpt
-
-python -m lattice_lab.ebm.precompute_decoys \
-    --shard-dir artifacts/processed/moses \
-    --adapter-ckpt "$ADAPTER" \
-    --store artifacts/decoys/<variant>/decoy_zm --batch-size 512 --force
-python -m lattice_lab.ebm.precompute_bdb_zm \
-    --bdb-parquet artifacts/processed/bindingdb/threshold_90/train.parquet \
-    --adapter-ckpt "$ADAPTER" \
-    --store artifacts/decoys/<variant>/bdb_zm --batch-size 512 --force
-python -m lattice_lab.ebm.precompute_binders \
-    --train-parquet artifacts/processed/bindingdb/threshold_90/train.parquet \
-    --val-parquet   artifacts/processed/bindingdb/threshold_90/val.parquet \
-    --adapter-ckpt "$ADAPTER" \
-    --store artifacts/binders/<variant>/binder_zm --batch-size 512 --force
+sbatch scripts/slurm/stage4_precompute_decoys.sh <run_id>
 ```
 
-### Stage 5 — Energy-head training (3 seeds)
+Manual equivalent:
+
+```bash
+ADAPTER=artifacts/adapter/checkpoints/<run_id>/last.ckpt
+
+python -m lattice_lab.ebm.precompute_decoys \
+    --shard-dir artifacts/preprocessing/processed/moses \
+    --adapter-ckpt "$ADAPTER" --batch-size 512 --force
+python -m lattice_lab.ebm.precompute_bdb_zm \
+    --bdb-parquet artifacts/preprocessing/processed/bindingdb/threshold_90/train.parquet \
+    --adapter-ckpt "$ADAPTER" --batch-size 512 --force
+python -m lattice_lab.ebm.precompute_binders \
+    --train-parquet artifacts/preprocessing/processed/bindingdb/threshold_90/train.parquet \
+    --val-parquet   artifacts/preprocessing/processed/bindingdb/threshold_90/val.parquet \
+    --adapter-ckpt "$ADAPTER" --batch-size 512 --force
+```
+
+Stores: `artifacts/decoys/<run_id>/{decoy_zm,bdb_zm}`,
+`artifacts/binders/<run_id>/binder_zm`.
+
+### Stage 5 — Energy-head training
+
+```bash
+# One seed (default --array=0-0 in the sbatch script):
+sbatch scripts/slurm/stage5_ebm_train.sh lejepa <stage2_run_id>
+sbatch scripts/slurm/stage5_ebm_train.sh ntxent <stage2_run_id>
+
+# Three seeds (reported protocol):
+./scripts/slurm/stage5_ebm_train.sh --three-seeds lejepa <stage2_run_id>
+sbatch --array=0-2 scripts/slurm/stage5_ebm_train.sh lejepa <stage2_run_id>
+```
+
+Manual equivalent (three seeds):
+
 ```bash
 for S in 0 1 2; do
   python -m lattice_lab.train experiment=ebm_hardneg_lejepa \
+    ssl_run_id=<stage2_run_id> \
     trainer.max_steps=12000 seed=$S \
-    callbacks.model_checkpoint.dirpath=artifacts/energy/lejepa
+    callbacks.model_checkpoint.dirpath=artifacts/energy/checkpoints
 done
-# Each run lands at artifacts/energy/<variant>/<wandb_run_id>/last.ckpt
-# (swap experiment=ebm_hardneg_ntxent + dirpath=artifacts/energy/ntxent for NT-Xent).
+# Each run lands at artifacts/energy/checkpoints/<wandb_run_id>/last.ckpt
 ```
 `ebm_hardneg` sets `data.hard_mining_mult=3` + the 0.4/0.15 hard-neg mix.
 `ModelCheckpoint(monitor="val/ef1", mode="max")` keeps the best head per seed.
 
 ### Stage 6 — Evaluation (LIT-PCBA)
+
 ```bash
-# 1. Build the 4-view LIT-PCBA z_m cache (adapter read straight from an EBM ckpt).
+# Single EBM checkpoint (4-view cache + CSV):
+sbatch scripts/slurm/stage6_eval.sh <ebm_run_id>
+
+# 3-seed ensemble (reported protocol):
+sbatch scripts/slurm/stage6_eval.sh <id0> <id1> <id2>
+
+# Single-view debug (1-view cache built inline; faster to iterate):
+SSL_RUN_ID=<stage2_run_id> sbatch scripts/slurm/stage6_eval.sh --single-view <ebm_run_id>
+```
+
+`stage6_ensemble_eval.sh` and `stage6_single_eval.sh` are thin wrappers around
+`stage6_eval.sh` for backward compatibility.
+
+Artifacts under `artifacts/evaluation/<ebm_run_id>/` (`lit_pcba_zm_mv4`,
+`lit_pcba_mv4.csv`, or `ensemble_mv4.json`). The cache is rebuilt from scratch
+on every run.
+
+Manual equivalent:
+
+```bash
+# 1. Build 4-view z_m cache + score one checkpoint (stage6_eval.sh does both):
 python -m lattice_lab.eval.build_multiview_cache \
-    --n-views 4 --zm-cache artifacts/evaluation/lit_pcba_zm_mv4_lejepa \
-    --adapter-ckpt artifacts/energy/lejepa/<run_id0>/last.ckpt --n-jobs 4
+    --n-views 4 --zm-cache artifacts/evaluation/<ebm_id>/lit_pcba_zm_mv4 \
+    --adapter-ckpt artifacts/energy/checkpoints/<ebm_id>/last.ckpt --n-jobs 40
+python -m lattice_lab.eval.lit_pcba \
+    --head-ckpt artifacts/energy/checkpoints/<ebm_id>/last.ckpt \
+    --adapter-ckpt artifacts/energy/checkpoints/<ebm_id>/last.ckpt \
+    --zm-cache artifacts/evaluation/<ebm_id>/lit_pcba_zm_mv4 \
+    --output-csv artifacts/evaluation/<ebm_id>/lit_pcba_mv4.csv
 
-# 2. Score the 3-seed ensemble (the reported result).
-# Replace each <run_id> with the W&B run id for that seed's training job.
+# 2. 3-seed ensemble:
 python -m lattice_lab.eval.ensemble_eval \
-    --ckpts artifacts/energy/lejepa/<run_id0>/last.ckpt \
-            artifacts/energy/lejepa/<run_id1>/last.ckpt \
-            artifacts/energy/lejepa/<run_id2>/last.ckpt \
-    --zm-cache artifacts/evaluation/lit_pcba_zm_mv4_lejepa \
+    --ckpts artifacts/energy/checkpoints/<id0>/last.ckpt \
+            artifacts/energy/checkpoints/<id1>/last.ckpt \
+            artifacts/energy/checkpoints/<id2>/last.ckpt \
+    --zm-cache artifacts/evaluation/<id0>/lit_pcba_zm_mv4 \
     --protein-store artifacts/protein_store/embeddings/esm2_650M \
-    --test-parquet artifacts/processed/bindingdb/test_lit_pcba.parquet \
-    --out artifacts/evaluation/ensemble_hardneg_mv4_lejepa.json --n-jobs 32
-
-# On SLURM, the above is wrapped by (VARIANT=lejepa|ntxent):
-#   VARIANT=lejepa sbatch scripts/slurm/stage6_build_zm_cache.sh
-#   VARIANT=lejepa sbatch scripts/slurm/stage6_ensemble_eval.sh
-#   VARIANT=lejepa RUN_ID=<run_id> sbatch scripts/slurm/stage6_single_eval.sh   # single ckpt
+    --test-parquet artifacts/preprocessing/processed/bindingdb/test_lit_pcba.parquet \
+    --out artifacts/evaluation/<id0>/ensemble_mv4.json --n-jobs 32
 
 # Held-out (in-distribution) ranking metrics for a single checkpoint:
-python -m lattice_lab.evaluate ckpt_path=artifacts/energy/lejepa/<run_id0>/last.ckpt
+python -m lattice_lab.evaluate ckpt_path=artifacts/energy/checkpoints/<ebm_id>/last.ckpt
 ```
 
 ### Stage 7 — Inference / virtual screening
 ```bash
 python -m lattice_lab.inference.predict_ensemble \
-    --head-ckpts artifacts/energy/lejepa/<run_id0>/last.ckpt \
-                 artifacts/energy/lejepa/<run_id1>/last.ckpt \
-                 artifacts/energy/lejepa/<run_id2>/last.ckpt \
+    --head-ckpts artifacts/energy/checkpoints/<run_id0>/last.ckpt \
+                 artifacts/energy/checkpoints/<run_id1>/last.ckpt \
+                 artifacts/energy/checkpoints/<run_id2>/last.ckpt \
     --target-fasta thrb.fasta --target-name THRB \
     --smiles-file my_library.csv --n-views 4 \
     --output-csv artifacts/predictions/thrb_predictions.csv

@@ -1,11 +1,4 @@
-"""Tests for the conditional denoising-JEPA objective.
-
-Covers AttentionPool (the z_s encoder head), the corruption + noised-position
-masking, the pure-generative reconstruction CE, gradient flow into both the
-encoder (via z_s) and the denoiser, the condition-bypass diagnostic, and the
-smoke / informativeness guard. Runs on tiny fresh DDiT backbones (no checkpoint
-needed). There is no EMA teacher: the loss is generative (CE to real tokens).
-"""
+"""Tests for the conditional denoising-JEPA objective."""
 
 from __future__ import annotations
 
@@ -17,12 +10,14 @@ import torch
 
 from lattice_lab.training.denoising_jepa import (
     AttentionPool,
-    JEPAStudent,
+    DenoisingJEPAModel,
+    VAEHead,
     build_jepa,
     condition_bypass_gap,
     corrupt_tokens,
     denoising_loss,
     effective_rank,
+    encode_pooled_latent,
     reconstruction_loss,
     train_step,
 )
@@ -40,7 +35,7 @@ TOKEN_ID_MIN = 4
 B, L, D = 8, 7, HIDDEN
 
 
-def _tiny_jepa() -> JEPAStudent:
+def _tiny_jepa() -> DenoisingJEPAModel:
     return build_jepa(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -52,6 +47,12 @@ def _tiny_jepa() -> JEPAStudent:
         pad_id=PAD_ID,
         token_id_min=TOKEN_ID_MIN,
     )
+
+
+def _tiny_jepa_with_vae() -> DenoisingJEPAModel:
+    model = _tiny_jepa()
+    model.vae_head = VAEHead(D, free_bits=0.0)
+    return model
 
 
 def _tiny_batch(*, seed: int = 0, with_pad: bool = True):
@@ -147,16 +148,16 @@ def test_reconstruction_loss_only_counts_noised_positions() -> None:
 # --------------------------------------------------------------------------- #
 # denoising_loss / gradient flow (no teacher, no stop-grad)
 # --------------------------------------------------------------------------- #
-def test_optimizer_over_student_params_only() -> None:
-    student = _tiny_jepa()
-    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
-    student_ids = {id(p) for p in student.parameters()}
+def test_optimizer_over_model_params_only() -> None:
+    model = _tiny_jepa()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model_ids = {id(p) for p in model.parameters()}
     opt_ids = {id(p) for group in opt.param_groups for p in group["params"]}
-    assert opt_ids == student_ids
+    assert opt_ids == model_ids
 
 
 def test_gradient_reaches_encoder_pool_and_denoiser() -> None:
-    student = _tiny_jepa()
+    model = _tiny_jepa()
 
     def _has_grad(module) -> bool:
         return any(
@@ -164,91 +165,145 @@ def test_gradient_reaches_encoder_pool_and_denoiser() -> None:
         )
 
     # The conditional denoiser receives gradient immediately.
-    loss, _ = denoising_loss(student, _tiny_batch(), corrupt_t=0.1)
+    loss, _ = denoising_loss(model, _tiny_batch(), corrupt_t=0.1)
     loss.backward()
-    assert _has_grad(student.denoiser)
+    assert _has_grad(model.denoiser)
 
     # DDiT's adaLN conditioning is zero-initialized, so the gradient w.r.t. the
     # conditioning vector (hence z_s and the encoder pool) is exactly 0 on a
     # fresh model — it only flows once adaLN moves off zero. A few steps warm it
     # up; then z_s is trained through reconstruction.
-    opt = torch.optim.AdamW(student.parameters(), lr=1e-2)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
     for _ in range(10):
-        train_step(student, opt, _tiny_batch(), corrupt_t=0.1)
-    student.zero_grad(set_to_none=True)
-    loss, _ = denoising_loss(student, _tiny_batch(), corrupt_t=0.1)
+        train_step(model, opt, _tiny_batch(), corrupt_t=0.1)
+    model.zero_grad(set_to_none=True)
+    loss, _ = denoising_loss(model, _tiny_batch(), corrupt_t=0.1)
     loss.backward()
-    assert _has_grad(student.encoder.pool)
+    assert _has_grad(model.encoder.pool)
 
 
 def test_alignment_zero_for_identical_views() -> None:
     """Two identical views → cos(z_s, z_s_b) = 1 → align term is 0."""
-    student = _tiny_jepa()
+    model = _tiny_jepa()
     b = _tiny_batch()
-    loss, m = denoising_loss(student, b, batch_b=b, align_lambda=0.5, corrupt_t=0.1)
+    loss, m = denoising_loss(model, b, batch_b=b, align_lambda=0.5, corrupt_t=0.1)
     assert "align" in m and "align_cos" in m
     assert m["align"] == pytest.approx(0.0, abs=1e-5)
     assert m["align_cos"] == pytest.approx(1.0, abs=1e-5)
 
 
-def test_alignment_corrupt_view_is_nontrivial() -> None:
-    """With align_corrupt_t set, identical input ids still give a non-trivial
-    alignment (cos < 1) because the second view is corrupted before encoding."""
-    student = _tiny_jepa()
+def test_alignment_vae_both_views_post_vae() -> None:
+    """With VAE, z_b must go through the same head as z_s (μ at eval)."""
+    model = _tiny_jepa_with_vae()
+    model.eval()
     b = _tiny_batch()
-    loss, m = denoising_loss(
-        student, b, batch_b=b, align_lambda=0.5, align_corrupt_t=0.2, corrupt_t=0.3
-    )
-    assert "align" in m
-    assert m["align"] > 0.0 and m["align_cos"] < 1.0
+    _, m = denoising_loss(model, b, batch_b=b, align_lambda=0.5, corrupt_t=0.1)
+    assert m["align"] == pytest.approx(0.0, abs=1e-5)
 
 
-def test_alignment_gives_pool_gradient_on_fresh_model() -> None:
-    """The alignment term feeds the pool directly (no adaLN zero-init gating), so
-    z_s gets gradient on a fresh model even when the recon term is empty."""
-    student = _tiny_jepa()
-    ids, mask = _tiny_batch(seed=1)
-    perm = torch.randperm(ids.size(1))
-    batch_b = (ids[:, perm], mask[:, perm])
-    # corrupt_t=1.0 → nothing noised → recon=0 → loss is purely the align term.
-    loss, m = denoising_loss(
-        student, (ids, mask), batch_b=batch_b, align_lambda=1.0, corrupt_t=1.0
+def test_encode_pooled_latent_applies_vae_mu_at_eval() -> None:
+    model = _tiny_jepa_with_vae()
+    model.eval()
+    ids, mask = _tiny_batch()
+    z_raw = model.encoder(ids, mask)
+    z = encode_pooled_latent(model, ids, mask, training=False)
+    assert not torch.allclose(z_raw, z)
+    assert torch.allclose(z, model.vae_head.mu(z_raw))
+
+
+def test_denoising_loss_reports_logvar_when_vae() -> None:
+    model = _tiny_jepa_with_vae()
+    _, m = denoising_loss(model, _tiny_batch(), corrupt_t=0.2)
+    assert "logvar_mean" in m and "logvar_std" in m and "logvar_exp_mean" in m
+
+
+def test_latent_consistency_when_enabled() -> None:
+    model = _tiny_jepa()
+    _, metrics, _, terms = denoising_loss(
+        model,
+        _tiny_batch(),
+        corrupt_t=0.2,
+        latent_consistency_lambda=0.5,
+        return_outputs=True,
     )
-    assert m["recon"] == 0.0 and m["align"] > 0.0
-    loss.backward()
-    assert any(
-        p.grad is not None and p.grad.abs().sum() > 0
-        for p in student.encoder.pool.parameters()
-    )
+    assert "latent" in metrics and "latent_cos" in metrics
+    assert metrics["latent"] >= 0.0
+    assert "latent" in terms
 
 
 def test_train_step_returns_finite_metrics() -> None:
-    student = _tiny_jepa()
-    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
-    metrics = train_step(student, opt, _tiny_batch(), corrupt_t=(0.1, 0.6))
+    model = _tiny_jepa()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    metrics = train_step(model, opt, _tiny_batch(), corrupt_t=(0.1, 0.6))
     assert set(metrics) >= {"loss", "recon", "recon_acc", "rank_s", "noised_frac"}
     assert all(math.isfinite(v) for v in metrics.values())
 
 
 def test_loss_is_zero_when_clean() -> None:
     """t=1 → nothing noised → the reconstruction loss has no terms (returns 0)."""
-    student = _tiny_jepa()
-    loss, metrics = denoising_loss(student, _tiny_batch(), corrupt_t=1.0)
+    model = _tiny_jepa()
+    loss, metrics = denoising_loss(model, _tiny_batch(), corrupt_t=1.0)
+    assert metrics["noised_frac"] == 0.0
+    assert float(loss) == 0.0
+
+
+def test_denoising_loss_returns_weighted_terms() -> None:
+    model = _tiny_jepa()
+    _, _, _, terms = denoising_loss(
+        model,
+        _tiny_batch(),
+        batch_b=_tiny_batch(seed=1),
+        align_lambda=0.5,
+        corrupt_t=0.3,
+        return_outputs=True,
+    )
+    assert set(terms) == {"recon", "align"}
+    assert all(t.requires_grad for t in terms.values())
+
+
+def test_log_grad_norms_logs_active_terms() -> None:
+    import lightning as L
+
+    from lattice_lab.models.denoising_jepa_ssl import DenoisingJEPAModule
+
+    model = _tiny_jepa()
+    harness = DenoisingJEPAModule.__new__(DenoisingJEPAModule)
+    L.LightningModule.__init__(harness)
+    harness.encoder = model.encoder
+    harness.denoiser = model.denoiser
+    harness.pad_id = model.pad_id
+    harness.vocab_size = model.vocab_size
+    harness.token_id_min = model.token_id_min
+    harness.vae_head = None
+    _, _, _, terms = denoising_loss(
+        model, _tiny_batch(), corrupt_t=0.3, return_outputs=True, align_lambda=0.0
+    )
+    logged: dict[str, float] = {}
+    harness.log_dict = lambda d, **kw: logged.update(d)  # type: ignore[method-assign]
+    DenoisingJEPAModule._log_grad_norms(harness, **terms)
+    assert set(logged) == {"train/grad_norm_recon"}
+    assert math.isfinite(logged["train/grad_norm_recon"]) and logged["train/grad_norm_recon"] > 0.0
+
+
+def test_loss_is_zero_when_clean() -> None:
+    """t=1 → nothing noised → the reconstruction loss has no terms (returns 0)."""
+    model = _tiny_jepa()
+    loss, metrics = denoising_loss(model, _tiny_batch(), corrupt_t=1.0)
     assert metrics["noised_frac"] == 0.0
     assert float(loss) == 0.0
 
 
 # --------------------------------------------------------------------------- #
-# Condition-bypass diagnostic (is z_s used, or inert?)
+# condition_bypass_gap
 # --------------------------------------------------------------------------- #
 def test_condition_bypass_gap_is_nonzero_after_training() -> None:
     """After fitting a tiny batch the denoiser should rely on z_s (positive gap)."""
-    student = _tiny_jepa()
-    opt = torch.optim.AdamW(student.parameters(), lr=5e-3)
+    model = _tiny_jepa()
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
     batch = _tiny_batch()
     for _ in range(60):
-        train_step(student, opt, batch, corrupt_t=0.1)
-    stats = condition_bypass_gap(student, batch, corrupt_t=0.1)
+        train_step(model, opt, batch, corrupt_t=0.1)
+    stats = condition_bypass_gap(model, batch, corrupt_t=0.1)
     assert set(stats) == {"recon_real", "recon_zeroed", "gap"}
     assert all(math.isfinite(v) for v in stats.values())
     # Zeroing z_s should not *help* reconstruction (gap >= ~0); after overfitting
@@ -273,20 +328,20 @@ def test_effective_rank_full_is_high() -> None:
 # Smoke + informativeness guard
 # --------------------------------------------------------------------------- #
 def test_smoke_single_train_step() -> None:
-    student = _tiny_jepa()
-    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
-    metrics = train_step(student, opt, _tiny_batch(), corrupt_t=(0.1, 0.6))
+    model = _tiny_jepa()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    metrics = train_step(model, opt, _tiny_batch(), corrupt_t=(0.1, 0.6))
     assert math.isfinite(metrics["loss"])
     assert math.isfinite(metrics["rank_s"])
 
 
 def test_rank_does_not_collapse_over_50_steps() -> None:
     torch.manual_seed(0)  # order-independent: don't inherit prior tests' RNG state
-    student = _tiny_jepa()
-    opt = torch.optim.AdamW(student.parameters(), lr=1e-3)
+    model = _tiny_jepa()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     ranks = []
     for step in range(50):
-        m = train_step(student, opt, _tiny_batch(seed=step), corrupt_t=(0.1, 0.6))
+        m = train_step(model, opt, _tiny_batch(seed=step), corrupt_t=(0.1, 0.6))
         ranks.append(m["rank_s"])
     assert all(math.isfinite(r) for r in ranks)
     assert ranks[-1] > 1.5  # crude guard: z_s stays informative
@@ -307,17 +362,22 @@ def test_lightning_module_fast_dev_run() -> None:
     from torch.utils.data import DataLoader
 
     from lattice_lab.models.denoising_jepa_ssl import DenoisingJEPAModule
-    from lattice_lab.training.denoising_jepa import build_denoising_jepa
 
-    student = build_denoising_jepa(
-        ckpt_path=None, tokenizer_path=str(TOKENIZER), freeze_backbone=False,
-        encode_time=1.0, n_layer=2, n_head=4, n_embd=32, dropout=0.0,
-    )
     module = DenoisingJEPAModule(
-        student, corrupt_t=(0.1, 0.6),
-        warmup_steps=1, total_steps=10, train_rank_every_n_steps=1,
+        ckpt_path=None,
+        tokenizer_path=str(TOKENIZER),
+        freeze_backbone=False,
+        encode_time=1.0,
+        n_layer=2,
+        n_head=4,
+        n_embd=32,
+        dropout=0.0,
+        corrupt_t=(0.1, 0.6),
+        warmup_steps=1,
+        total_steps=10,
+        train_rank_every_n_steps=1,
     )
-    p0 = next(p for p in student.denoiser.parameters() if p.requires_grad).detach().clone()
+    p0 = next(p for p in module.denoiser.parameters() if p.requires_grad).detach().clone()
 
     views = ["CCO", "c1ccccc1", "CC(=O)O", "CCN", "CCCC", "OCC", "C1CCCCC1", "CCl"]
     loader = DataLoader(views, batch_size=4, collate_fn=list)
@@ -327,7 +387,7 @@ def test_lightning_module_fast_dev_run() -> None:
     )
     trainer.fit(module, train_dataloaders=loader)
 
-    p1 = next(p for p in student.denoiser.parameters() if p.requires_grad).detach().clone()
+    p1 = next(p for p in module.denoiser.parameters() if p.requires_grad).detach().clone()
     assert not torch.equal(p0, p1)  # denoiser trained
 
 
@@ -349,20 +409,33 @@ def test_fp_distillation_is_finite_and_feeds_pool() -> None:
     import numpy as np
 
     from lattice_lab.models.denoising_jepa_ssl import DenoisingJEPAModule
-    from lattice_lab.training.denoising_jepa import build_denoising_jepa
 
-    student = build_denoising_jepa(
-        ckpt_path=None, tokenizer_path=str(TOKENIZER), freeze_backbone=False,
-        n_layer=2, n_head=4, n_embd=32, dropout=0.0,
+    module = DenoisingJEPAModule(
+        ckpt_path=None,
+        tokenizer_path=str(TOKENIZER),
+        freeze_backbone=False,
+        n_layer=2,
+        n_head=4,
+        n_embd=32,
+        dropout=0.0,
+        fp_weight=1.0,
+        fp_bits=64,
     )
-    module = DenoisingJEPAModule(student, fp_weight=1.0, fp_bits=64)
 
     smiles = ["CCO", "c1ccccc1", "CC(=O)O", "CCN"]
     ids, mask = module._tokenize(smiles)
 
-    # Disabled (fp_weight=0) → no term regardless of SMILES.
-    off = DenoisingJEPAModule(student, fp_weight=0.0)
-    assert off._fp_distillation(student.encoder(ids, mask), smiles) is None
+    off = DenoisingJEPAModule(
+        ckpt_path=None,
+        tokenizer_path=str(TOKENIZER),
+        freeze_backbone=False,
+        n_layer=2,
+        n_head=4,
+        n_embd=32,
+        dropout=0.0,
+        fp_weight=0.0,
+    )
+    assert off._fp_distillation(module.encoder(ids, mask), smiles) is None
 
     # Deterministic fake fingerprints (distinct per row) so Tanimoto is non-trivial.
     rng = np.random.default_rng(0)
@@ -373,27 +446,30 @@ def test_fp_distillation_is_finite_and_feeds_pool() -> None:
             return bits
 
     module._fp_cache = _FakeCache()
-    z_s = student.encoder(ids, mask)
+    z_s = module.encoder(ids, mask)
     fp = module._fp_distillation(z_s, smiles)
     assert fp is not None and math.isfinite(float(fp)) and float(fp) >= 0.0
 
     fp.backward()
     assert any(
         p.grad is not None and p.grad.abs().sum() > 0
-        for p in student.encoder.pool.parameters()
+        for p in module.encoder.pool.parameters()
     )
 
 
 @requires_tokenizer
 def test_lightning_checkpoint_embeds_config() -> None:
     from lattice_lab.models.denoising_jepa_ssl import DenoisingJEPAModule
-    from lattice_lab.training.denoising_jepa import build_denoising_jepa
 
-    student = build_denoising_jepa(
-        ckpt_path=None, tokenizer_path=str(TOKENIZER), freeze_backbone=False,
-        n_layer=2, n_head=4, n_embd=32, dropout=0.0,
+    module = DenoisingJEPAModule(
+        ckpt_path=None,
+        tokenizer_path=str(TOKENIZER),
+        freeze_backbone=False,
+        n_layer=2,
+        n_head=4,
+        n_embd=32,
+        dropout=0.0,
     )
-    module = DenoisingJEPAModule(student)
     ckpt: dict = {}
     module.on_save_checkpoint(ckpt)
     assert ckpt["encoder_config"]["n_embd"] == 32

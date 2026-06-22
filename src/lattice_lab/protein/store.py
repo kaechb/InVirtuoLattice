@@ -20,6 +20,8 @@ abstracts both directions.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -86,6 +88,7 @@ class EmbeddingStore:
     PIDS = "pids.tsv"
     MEAN = "mean.dat"
     PERRES_DIR = "per_residue"
+    LOCK = ".store.lock"
 
     def __init__(
         self,
@@ -102,6 +105,26 @@ class EmbeddingStore:
         self._mean_ram: np.ndarray | None = None
 
     # ----- construction --------------------------------------------------
+
+    @classmethod
+    @contextlib.contextmanager
+    def exclusive_lock(cls, path: Path | str):
+        """Exclusive lock for one writer per store dir (survives ``--force`` clears)."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        fh = open(path / cls.LOCK, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+
+    def _release_mean_memmap(self) -> None:
+        if self._mean_memmap is not None:
+            self._mean_memmap.flush()
+            del self._mean_memmap
+            self._mean_memmap = None
 
     @classmethod
     def create(
@@ -270,9 +293,12 @@ class EmbeddingStore:
         itemsize = np.dtype(self.manifest.dtype).itemsize
         nbytes = new_count * self.manifest.embedding_dim * itemsize
         # Resize the underlying file. Closing any open memmap first is required
-        # on most platforms before truncate.
-        self._mean_memmap = None
-        with open(self.path / self.MEAN, "r+b") as fh:
+        # on most platforms (and on Lustre) before truncate.
+        mean_path = self.path / self.MEAN
+        self._release_mean_memmap()
+        if not mean_path.exists():
+            mean_path.touch()
+        with open(mean_path, "r+b") as fh:
             fh.truncate(nbytes)
         new_memmap = np.memmap(
             self.path / self.MEAN,

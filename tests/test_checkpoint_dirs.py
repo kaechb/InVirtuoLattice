@@ -12,6 +12,7 @@ from lattice_lab.utils import (
     wandb_run_id,
     wire_checkpoint_dirs_to_wandb,
 )
+from lattice_lab.models.builders import _checkpoint_state_dict, _denoising_jepa_init_kwargs
 
 
 def test_checkpoint_dir_for_run_appends_run_id() -> None:
@@ -55,3 +56,31 @@ def test_wire_checkpoint_dirs_noop_without_wandb() -> None:
     ckpt = ModelCheckpoint(dirpath="logs/train/checkpoints")
     assert wire_checkpoint_dirs_to_wandb([], [ckpt]) is None
     assert Path(ckpt.dirpath) == Path("logs/train/checkpoints").resolve()
+
+
+def test_checkpoint_state_dict_strips_student_prefix() -> None:
+    import torch
+
+    raw = {
+        "state_dict": {
+            "student.encoder.pool.query": torch.zeros(1),
+            "student.denoiser.blocks.0.qw.weight": torch.zeros(1),
+        }
+    }
+    state = _checkpoint_state_dict(raw)
+    assert "encoder.pool.query" in state
+    assert "denoiser.blocks.0.qw.weight" in state
+    assert not any(k.startswith("student.") for k in state)
+
+
+def test_denoising_jepa_init_kwargs_fills_required_defaults() -> None:
+    kwargs = _denoising_jepa_init_kwargs(
+        {
+            "hyper_parameters": {"kl_beta": 0.5, "fp_weight": 10.0},
+            "encoder_config": {"tokenizer_path": "artifacts/tokenizer/smiles_new.json"},
+        }
+    )
+    assert kwargs["ckpt_path"] is None
+    assert kwargs["tokenizer_path"] == "artifacts/tokenizer/smiles_new.json"
+    assert kwargs["kl_beta"] == 0.5
+    assert kwargs["fp_weight"] == 10.0

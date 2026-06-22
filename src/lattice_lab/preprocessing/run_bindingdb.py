@@ -32,7 +32,7 @@ End-to-end pipeline:
             <out>/test_lit_pcba.parquet + lit_pcba_targets.fasta       # LIT-PCBA only
 
     The DUD-E **test** parquet + FASTA are produced separately by
-    ``lattice_lab.preprocessing.run_dude`` (→ ``artifacts/processed/moses_dude/``);
+    ``lattice_lab.preprocessing.run_dude`` (→ ``artifacts/preprocessing/processed/moses_dude/``);
     this script only needs the DUD-E target *sequences* to filter against.
 
 The script is **idempotent**: parquet files that already exist are skipped
@@ -42,16 +42,16 @@ Examples::
 
     # 90 % split held out against LIT-PCBA (the released default).
     python -m lattice_lab.preprocessing.run_bindingdb \\
-        --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \\
-        --lit-pcba-dir  artifacts/raw/lit_pcba \\
-        --output-dir    artifacts/processed/bindingdb \\
+        --bindingdb-tsv artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv \\
+        --lit-pcba-dir  artifacts/preprocessing/raw/lit_pcba \\
+        --output-dir    artifacts/preprocessing/processed/bindingdb \\
         --identity      all --n-jobs 16
 
     # 90 % split held out against DUD-E (reuses the cached curated parquet).
     python -m lattice_lab.preprocessing.run_bindingdb \\
-        --bindingdb-tsv artifacts/raw/bindingdb/BindingDB_All.tsv \\
-        --dude-dir      artifacts/raw/dude \\
-        --output-dir    artifacts/processed/bindingdb \\
+        --bindingdb-tsv artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv \\
+        --dude-dir      artifacts/preprocessing/raw/dude \\
+        --output-dir    artifacts/preprocessing/processed/bindingdb \\
         --identity      90 --n-jobs 16
 """
 
@@ -60,7 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +72,11 @@ from lattice_lab.preprocessing.homology import (
     excluded_at,
     max_identity_per_query,
     mmseqs_easy_search,
+)
+from lattice_lab.preprocessing.molecules import (
+    build_smiles_fragment_views,
+    load_smiles_tokenizer,
+    tokenize_fragment_view,
 )
 from lattice_lab.preprocessing.proteins import ProteinRecord, cluster_proteins
 from lattice_lab.preprocessing.splits import cluster_split
@@ -139,6 +144,94 @@ def _write_parquet(records: list[dict[str, object]], out_path: Path) -> None:
     pd.DataFrame.from_records(records).to_parquet(out_path, index=False)
 
 
+def _parquet_has_columns(path: Path, *cols: str) -> bool:
+    import pyarrow.parquet as pq
+
+    names = set(pq.read_schema(path).names)
+    return all(c in names for c in cols)
+
+
+def _needs_ligand_view_enrich(path: Path, *, want_body_ids: bool) -> bool:
+    if not path.is_file():
+        return True
+    need = ["fragment_view"]
+    if want_body_ids:
+        need.append("body_ids")
+    return not _parquet_has_columns(path, *need)
+
+
+def _views_from_parquet(df: pd.DataFrame) -> dict[str, str]:
+    if "fragment_view" not in df.columns:
+        return {}
+    sub = df.drop_duplicates("smiles")
+    return {
+        str(s): str(v)
+        for s, v in zip(sub["smiles"], sub["fragment_view"])
+        if pd.notna(v)
+    }
+
+
+def _body_ids_from_parquet(df: pd.DataFrame) -> dict[str, list[int]]:
+    if "body_ids" not in df.columns:
+        return {}
+    out: dict[str, list[int]] = {}
+    sub = df.drop_duplicates("smiles")
+    for s, b in zip(sub["smiles"], sub["body_ids"]):
+        if b is None or (isinstance(b, float) and np.isnan(b)):
+            continue
+        out[str(s)] = list(b) if not isinstance(b, list) else b
+    return out
+
+
+def _ligand_view_maps(
+    rows: list[bindingdb.BindingDbRow],
+    curated_parquet: Path,
+    *,
+    overwrite: bool,
+    n_jobs: int,
+    tokenizer_path: Path | None,
+) -> tuple[dict[str, str], dict[str, list[int]] | None]:
+    """Load or compute SMILES → fragment_view (+ optional body_ids)."""
+    want_body = tokenizer_path is not None
+    views: dict[str, str] = {}
+    body_ids: dict[str, list[int]] | None = None
+
+    if curated_parquet.is_file() and not overwrite:
+        df = pd.read_parquet(curated_parquet)
+        views = _views_from_parquet(df)
+        if want_body and _parquet_has_columns(curated_parquet, "body_ids"):
+            body_ids = _body_ids_from_parquet(df)
+
+    if not views:
+        unique = list(dict.fromkeys(r.smiles for r in rows))
+        logger.info("fragmentizing %d unique BindingDB ligands (n_jobs=%d)", len(unique), n_jobs)
+        views = build_smiles_fragment_views(unique, n_jobs=n_jobs)
+        logger.info("fragment views: %d / %d unique ligands", len(views), len(unique))
+
+    if want_body and body_ids is None:
+        tok = load_smiles_tokenizer(tokenizer_path)
+        logger.info("pretokenizing fragment views with %s", tokenizer_path)
+        body_ids = {s: tokenize_fragment_view(v, tok) for s, v in views.items()}
+
+    return views, body_ids if want_body else None
+
+
+def _enrich_split_parquet(
+    path: Path,
+    *,
+    views: dict[str, str],
+    body_ids: dict[str, list[int]] | None,
+) -> None:
+    if not _needs_ligand_view_enrich(path, want_body_ids=body_ids is not None):
+        return
+    df = pd.read_parquet(path)
+    df["fragment_view"] = df["smiles"].map(views)
+    if body_ids is not None:
+        df["body_ids"] = df["smiles"].map(body_ids)
+    df.to_parquet(path, index=False)
+    logger.info("enriched %s with ligand views", path)
+
+
 def _split_by_uniprot_cluster(
     rows: list[bindingdb.BindingDbRow],
     seq_by_uniprot: dict[str, str],
@@ -172,10 +265,10 @@ def main() -> None:
     p.add_argument("--bindingdb-tsv", type=Path, required=True,
                    help="Path to BindingDB_All.tsv (produced by scripts/download_bindingdb.sh).")
     p.add_argument("--lit-pcba-dir", type=Path, default=None,
-                   help="Directory with one subfolder per LIT-PCBA target (artifacts/raw/lit_pcba). "
+                   help="Directory with one subfolder per LIT-PCBA target (artifacts/preprocessing/raw/lit_pcba). "
                         "Held-out reference for the homology filter; mutually exclusive with --dude-dir.")
     p.add_argument("--dude-dir", type=Path, default=None,
-                   help="Directory with one subfolder per DUD-E target (artifacts/raw/dude). "
+                   help="Directory with one subfolder per DUD-E target (artifacts/preprocessing/raw/dude). "
                         "Build the split held out against DUD-E instead of LIT-PCBA; "
                         "mutually exclusive with --lit-pcba-dir.")
     p.add_argument("--output-dir", type=Path, required=True)
@@ -186,6 +279,10 @@ def main() -> None:
     p.add_argument("--train-frac", type=float, default=0.9)
     p.add_argument("--val-frac", type=float, default=0.1)
     p.add_argument("--n-jobs", type=int, default=1)
+    p.add_argument(
+        "--tokenizer-path", type=Path, default=None,
+        help="optional SMILES tokenizer json; adds body_ids per ligand fragment_view",
+    )
     p.add_argument("--row-limit", type=int, default=None,
                    help="Cap the number of raw TSV rows (debugging only).")
     p.add_argument("--seed", type=int, default=0)
@@ -218,7 +315,7 @@ def main() -> None:
         if not ref_targets:
             raise SystemExit(f"no DUD-E targets found in {args.dude_dir}")
         # DUD-E's test parquet + FASTA are written by lattice_lab.preprocessing.run_dude
-        # (-> artifacts/processed/moses_dude/); here we only need the sequences.
+        # (-> artifacts/preprocessing/processed/moses_dude/); here we only need the sequences.
     else:
         bench, suffix = "lit_pcba", ""
         ref_fasta = out_root / "lit_pcba_targets.fasta"
@@ -241,10 +338,14 @@ def main() -> None:
 
     # ---------- 2. BindingDB curation ---------------------------------------
     curated_parquet = out_root / "bindingdb_curated.parquet"
+    want_body = args.tokenizer_path is not None
+    rows: list[bindingdb.BindingDbRow]
+    rewrite_curated = args.overwrite or not curated_parquet.exists()
+
     if curated_parquet.exists() and not args.overwrite:
         logger.info("re-using cached %s", curated_parquet)
         cur_df = pd.read_parquet(curated_parquet)
-        rows = [bindingdb.BindingDbRow(**rec) for rec in cur_df.to_dict("records")]
+        rows = [bindingdb.row_from_record(rec) for rec in cur_df.to_dict("records")]
         # Salvage path: earlier curation runs stored multi-token UniProt strings
         # ("Q96CA5 P98170"). Normalise to the first accession + re-dedup; rewrite
         # the cache so subsequent runs see clean rows.
@@ -256,18 +357,36 @@ def main() -> None:
                 "patched %d cached rows with multi-token UniProt; deduped %d -> %d, rewriting cache",
                 n_fixed, n_before, len(rows),
             )
-            _write_parquet([asdict(r) for r in rows], curated_parquet)
+            rewrite_curated = True
+        elif _needs_ligand_view_enrich(curated_parquet, want_body_ids=want_body):
+            rewrite_curated = True
     else:
         logger.info("curating BindingDB TSV %s (n_jobs=%d)", args.bindingdb_tsv, args.n_jobs)
         rows = bindingdb.curate_tsv(
             args.bindingdb_tsv, n_jobs=args.n_jobs, limit=args.row_limit
         )
         rows = bindingdb.dedup_rows(rows)
-        _write_parquet([asdict(r) for r in rows], curated_parquet)
         logger.info("kept %d curated, deduplicated BindingDB rows", len(rows))
 
     if not rows:
         raise SystemExit("no rows survived BindingDB curation — check the input TSV.")
+
+    views, body_ids = _ligand_view_maps(
+        rows,
+        curated_parquet,
+        overwrite=args.overwrite,
+        n_jobs=args.n_jobs,
+        tokenizer_path=args.tokenizer_path,
+    )
+    if rewrite_curated:
+        _write_parquet(
+            bindingdb.ligand_view_records(rows, views=views, body_ids=body_ids),
+            curated_parquet,
+        )
+        logger.info(
+            "wrote %s (%d rows; %d unique ligands with fragment_view)",
+            curated_parquet, len(rows), len(views),
+        )
 
     # ---------- 3. Cross-FASTA homology search ------------------------------
     bdb_fasta = out_root / "bindingdb_targets.fasta"
@@ -302,6 +421,8 @@ def main() -> None:
         "train_frac": args.train_frac,
         "val_frac": args.val_frac,
         "seed": args.seed,
+        "tokenizer_path": str(args.tokenizer_path) if args.tokenizer_path else None,
+        "n_ligands_with_fragment_view": len(views),
         "per_threshold": {},
     }
 
@@ -321,6 +442,8 @@ def main() -> None:
         )
 
         if train_parquet.exists() and val_parquet.exists() and not args.overwrite:
+            _enrich_split_parquet(train_parquet, views=views, body_ids=body_ids)
+            _enrich_split_parquet(val_parquet, views=views, body_ids=body_ids)
             logger.info("re-using %s", sub_dir)
             train_df = pd.read_parquet(train_parquet)
             val_df = pd.read_parquet(val_parquet)
@@ -334,10 +457,16 @@ def main() -> None:
                 seed=args.seed,
                 workdir=sub_dir / "_mmseqs_cluster",
             )
-            _write_parquet([asdict(r) for r in train_rows], train_parquet)
-            _write_parquet([asdict(r) for r in val_rows], val_parquet)
-            train_df = pd.DataFrame([asdict(r) for r in train_rows])
-            val_df = pd.DataFrame([asdict(r) for r in val_rows])
+            _write_parquet(
+                bindingdb.ligand_view_records(train_rows, views=views, body_ids=body_ids),
+                train_parquet,
+            )
+            _write_parquet(
+                bindingdb.ligand_view_records(val_rows, views=views, body_ids=body_ids),
+                val_parquet,
+            )
+            train_df = pd.read_parquet(train_parquet)
+            val_df = pd.read_parquet(val_parquet)
 
         manifest["per_threshold"][f"{int(th * 100):02d}"] = {
             "n_excluded_targets": len(excluded_uniprots),

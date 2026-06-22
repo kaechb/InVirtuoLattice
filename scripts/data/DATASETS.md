@@ -1,8 +1,8 @@
 # Datasets
 
-Raw datasets and download scripts. Files in `artifacts/raw/` are never modified
+Raw datasets and download scripts. Files in `artifacts/preprocessing/raw/` are never modified
 — Stage 1 reads from there and writes processed shards into
-`artifacts/processed/`.
+`artifacts/preprocessing/processed/`.
 
 ## Currently available
 
@@ -30,16 +30,16 @@ bash scripts/download_qm9.sh
 #
 # Idempotent: skips download if BindingDB_All.tsv already exists. To refresh,
 # remove the old files first, then re-download:
-#   rm -f artifacts/raw/bindingdb/BindingDB_All.tsv artifacts/raw/bindingdb/BindingDB_All_*.tsv.zip
+#   rm -f artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv artifacts/preprocessing/raw/bindingdb/BindingDB_All_*.tsv.zip
 BINDINGDB_DATE=202606 bash scripts/download_bindingdb.sh
 
 # Sanity-check (must pass before Stage 1):
-wc -l artifacts/raw/bindingdb/BindingDB_All.tsv          # ~3.1–3.2M lines incl. header
-ls -lh artifacts/raw/bindingdb/BindingDB_All_*.tsv.zip # zip ~550–570 MB, not ~130 MB
+wc -l artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv          # ~3.1–3.2M lines incl. header
+ls -lh artifacts/preprocessing/raw/bindingdb/BindingDB_All_*.tsv.zip # zip ~550–570 MB, not ~130 MB
 
 # Stage 0c — LIT-PCBA (Stage 6 held-out benchmark).
 # Downloads via huggingface_hub (CDN + retry/resume; robust to HTTP 429),
-# unzips, and stages into artifacts/raw/lit_pcba/. Set HF_TOKEN if throttled.
+# unzips, and stages into artifacts/preprocessing/raw/lit_pcba/. Set HF_TOKEN if throttled.
 bash scripts/download_lit_pcba.sh
 # The _feat_cache subfolder is intentionally skipped — 3D-coord cache from another pipeline.
 ```

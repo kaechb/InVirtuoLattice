@@ -15,8 +15,8 @@ echo ">>> temp outputs: $TMP   (canonical 0X_ dirs are read-only)"
 PSTORE=artifacts/protein_store/embeddings/esm2_650M
 DZM=artifacts/decoys/decoy_zm_ssl2
 BDB=artifacts/decoys/bdb_zm_ssl2
-ADP="${ADP:-artifacts/adapter/ntxent/checkpoints/ed7yw5vq/last.ckpt}"
-SRC=artifacts/processed/bindingdb/threshold_90
+ADP="${ADP:-artifacts/adapter/checkpoints/ed7yw5vq/last.ckpt}"
+SRC=artifacts/preprocessing/processed/bindingdb/threshold_90
 
 # 1. Sample the real parquet (read-only) into the temp dir.
 python - "$TMP" "$SRC" <<'PY'

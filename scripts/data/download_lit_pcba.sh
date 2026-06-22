@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage 0 — download + stage the LIT-PCBA benchmark into artifacts/raw/lit_pcba/.
+# Stage 0 — download + stage the LIT-PCBA benchmark into artifacts/preprocessing/raw/lit_pcba/.
 #
 # Primary path uses the huggingface_hub client (CDN + automatic retry/resume),
 # which is far more robust than raw curl against HF rate-limiting (HTTP 429) —
@@ -36,5 +36,5 @@ fi
 echo "[unzip] $ZIP -> $DL"
 unzip -q -o "$ZIP" -d "$DL"
 
-# Stage into artifacts/raw/lit_pcba/ via the existing copy step.
+# Stage into artifacts/preprocessing/raw/lit_pcba/ via the existing copy step.
 LIT_PCBA_SRC="${DL}/lit_pcba" bash "${SCRIPT_DIR}/copy_lit_pcba.sh"

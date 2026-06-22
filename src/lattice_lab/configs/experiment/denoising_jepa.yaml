@@ -1,11 +1,4 @@
 # @package _global_
-# Stage-2 SSL on the discrete-flow (DDiT) backbone with a conditional
-# denoising-JEPA objective: an encoder attention-pools clean-SMILES embeddings
-# into a molecule latent z_s; z_s conditions a separate DDiT denoiser that
-# reconstructs a corrupted copy of the string with pure token CE at the noised
-# positions. The reconstruction is the anti-collapse anchor (replaces NT-Xent /
-# LeJEPA); it is a generative loss, so there is no EMA teacher.
-#
 #   python -m lattice_lab.train experiment=denoising_jepa
 defaults:
   - override /data: fragment_views
@@ -18,16 +11,12 @@ logger:
     group: ssl_denoising_jepa
     name: djepa_t${model.corrupt_t}_fp${model.fp_weight}_sigreg${model.sigreg_lambda}_kl${model.kl_beta}
 
-# Yield (view, smiles) pairs so the Tanimoto fingerprint distillation
-# (model.fp_weight > 0) has canonical SMILES to build Morgan FPs from.
 data:
   return_smiles: true
 
-# Pure token reconstruction (recon_acc) is anti-correlated with representation
-# quality here, so checkpoint on the linear-probe R² instead of val/acc@1.
 callbacks:
   model_checkpoint:
-    monitor: val/probe_r2_mean
+    monitor: r2/mean
     mode: max
 
 tags: ["ssl", "discrete_flow", "denoising_jepa"]

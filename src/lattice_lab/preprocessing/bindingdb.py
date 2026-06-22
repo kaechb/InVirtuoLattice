@@ -373,6 +373,31 @@ def dedup_rows(rows: list[BindingDbRow]) -> list[BindingDbRow]:
     return list(best.values())
 
 
+def row_from_record(rec: dict[str, object]) -> BindingDbRow:
+    """Build a row from a parquet dict, ignoring extra columns (``fragment_view``, etc.)."""
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(BindingDbRow)}
+    return BindingDbRow(**{k: v for k, v in rec.items() if k in fields})
+
+
 def rows_to_records(rows: list[BindingDbRow]) -> list[dict[str, object]]:
     """Flatten rows into plain dicts (parquet-friendly)."""
     return [asdict(r) for r in rows]
+
+
+def ligand_view_records(
+    rows: list[BindingDbRow],
+    *,
+    views: dict[str, str],
+    body_ids: dict[str, list[int]] | None = None,
+) -> list[dict[str, object]]:
+    """Attach ``fragment_view`` / optional ``body_ids`` per ligand SMILES."""
+    out: list[dict[str, object]] = []
+    for r in rows:
+        d = asdict(r)
+        d["fragment_view"] = views.get(r.smiles)
+        if body_ids is not None:
+            d["body_ids"] = body_ids.get(r.smiles)
+        out.append(d)
+    return out

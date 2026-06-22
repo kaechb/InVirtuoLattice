@@ -11,13 +11,13 @@ tags: ["ebm", "hardneg", "ntxent"]
 ssl_run_id: 1kfmwoar
 
 data:
-  decoy_store: artifacts/decoys/ntxent/decoy_zm/
-  bdb_store: artifacts/decoys/ntxent/bdb_zm
-  binder_store: artifacts/binders/ntxent/binder_zm
+  decoy_store: artifacts/decoys/${ssl_run_id}/decoy_zm/
+  bdb_store: artifacts/decoys/${ssl_run_id}/bdb_zm
+  binder_store: artifacts/binders/${ssl_run_id}/binder_zm
 
 model:
   encoder:
-    adapter_ckpt: artifacts/adapter/ntxent/checkpoints/${ssl_run_id}/last.ckpt
+    adapter_ckpt: artifacts/adapter/checkpoints/${ssl_run_id}/last.ckpt
 
 logger:
   wandb:

@@ -11,6 +11,8 @@ import pytest
 from lattice_lab.data.fragment_views import (
     FragmentViewDataset,
     mask_fragment_ids,
+    mask_local_ids,
+    mask_span_ids,
     shuffle_fragment_ids,
     split_fragment_ids,
 )
@@ -59,10 +61,48 @@ def test_mask_fragment_replaces_one_fragment() -> None:
     assert frags[2] == [30]
 
 
-def test_mask_fragment_single_fragment_sequence() -> None:
-    ids = [5, 6, 7]
-    masked = mask_fragment_ids(ids, SEP, mask_id=42, rng=random.Random(1))
-    assert masked == [42, 42, 42]
+def test_mask_fragment_fraction_masks_some_but_leaves_one() -> None:
+    ids = [10, SEP, 20, SEP, 30, SEP, 40]  # 4 fragments
+    masked = mask_fragment_ids(ids, SEP, mask_id=99, rng=random.Random(0), frac=0.5)
+    frags = split_fragment_ids(masked, SEP)
+    fully_masked = [f for f in frags if f and all(t == 99 for t in f)]
+    intact = [f for f in frags if f and all(t != 99 for t in f)]
+    assert len(fully_masked) == 2  # round(0.5 * 4)
+    assert len(intact) >= 1  # never masks every fragment
+
+
+def test_mask_fragment_single_fragment_not_fully_masked() -> None:
+    # ~19% of MOSES molecules are single-fragment; masking the whole body gives
+    # an information-free context. Mask a token fraction, leaving >= 1 token.
+    ids = [5, 6, 7, 8]
+    masked = mask_fragment_ids(ids, SEP, mask_id=42, rng=random.Random(1), frac=0.5)
+    assert len(masked) == len(ids)
+    assert 0 < masked.count(42) < len(ids)  # some masked, some real signal kept
+
+
+def test_mask_span_is_contiguous_and_leaves_context() -> None:
+    ids = [10, 11, 12, SEP, 20, 21, 22]
+    masked = mask_span_ids(ids, mask_id=99, rng=random.Random(0), frac=0.5)
+    assert len(masked) == len(ids)
+    assert 0 < masked.count(99) < len(ids)
+    runs = []
+    run = 0
+    for t in masked:
+        if t == 99:
+            run += 1
+        elif run:
+            runs.append(run)
+            run = 0
+    if run:
+        runs.append(run)
+    assert len(runs) == 1  # one contiguous span
+
+
+def test_mask_local_mixed_picks_fragment_or_span() -> None:
+    ids = [10, SEP, 20, SEP, 30, SEP, 40]
+    rng = random.Random(0)
+    seen = {tuple(mask_local_ids(ids, SEP, 99, rng, frac=0.5, mode="mixed")) for _ in range(40)}
+    assert len(seen) > 1
 
 
 def test_deterministic_given_rng() -> None:
@@ -84,3 +124,40 @@ def test_fragment_view_dataset_reads_view_column(tmp_path: Path, view_col: str) 
     assert fragment_view_column(pd.read_parquet(shard).head(0)) == view_col
     ds = FragmentViewDataset([shard], split="train", val_ratio=0.0, test_ratio=0.0)
     assert len(ds) == 2
+
+
+def test_flatten_views_to_rows_body_ids() -> None:
+    from lattice_lab.preprocessing.molecules import flatten_views_to_rows
+
+    class _Tok:
+        def encode(self, view: str, *, add_special_tokens: bool = False) -> list[int]:
+            assert not add_special_tokens
+            return [len(view), view.count(" ") + 10]
+
+    records = [{"smiles": "CCO", "inchikey": "IK1", "views": ["a b", "c d e"]}]
+    rows = flatten_views_to_rows(records, tokenizer=_Tok())
+    assert rows[0]["body_ids"] == [3, 11]
+    assert rows[1]["body_ids"] == [5, 12]
+
+
+def test_fragment_view_dataset_reads_body_ids_column(tmp_path: Path) -> None:
+    from lattice_lab.preprocessing.molecules import flatten_views_to_rows
+
+    class _Tok:
+        def encode(self, view: str, *, add_special_tokens: bool = False) -> list[int]:
+            return [ord(view[0])]
+
+    rows = flatten_views_to_rows(
+        [
+            {"smiles": "CCO", "inchikey": "IK1", "views": ["ab"]},
+            {"smiles": "CCC", "inchikey": "IK2", "views": ["cd"]},
+        ],
+        tokenizer=_Tok(),
+    )
+    shard = tmp_path / "shard_0000.parquet"
+    pd.DataFrame(rows).to_parquet(shard, index=False)
+    ds = FragmentViewDataset([shard], split="train", val_ratio=0.0, test_ratio=0.0)
+    assert ds._use_body_ids
+    assert len(ds) == 2
+    assert ds[0] == [ord("a")]
+    assert ds[1] == [ord("c")]

@@ -10,31 +10,7 @@
 #SBATCH --output=logs/slurm/stage3/%j.out
 #SBATCH --error=logs/slurm/stage3/%j.err
 #
-# Stage 3 — frozen ESM C 600M protein embeddings (BindingDB + LIT-PCBA targets).
-# Mirrors stage3_protein_precompute.sh but uses the ESM C (Cambrian) backend
-# (d=1152) and writes to a separate store so both embedding sets coexist.
-#
-#   sbatch scripts/slurm/stage3_protein_precompute_esmc.sh
+# Deprecated wrapper — use PROTEIN=esmc stage3_protein_precompute.sh instead.
 set -euo pipefail
-
-cd "${SLURM_SUBMIT_DIR:?submit from repo root: sbatch scripts/slurm/stage3_protein_precompute_esmc.sh}"
-# shellcheck source=scripts/slurm/common.sh
-source "scripts/slurm/common.sh"
-
-lattice_load_gpu_modules
-lattice_cd_repo
-lattice_require_gpu
-
-srun python -m lattice_lab.protein.precompute \
-  --backend esmc \
-  --fasta artifacts/processed/bindingdb/bindingdb_targets.fasta \
-  --store artifacts/protein_store/embeddings/esmc_600m \
-  --device cuda \
-  --batch-size 8
-
-srun python -m lattice_lab.protein.precompute \
-  --backend esmc \
-  --fasta artifacts/processed/bindingdb/lit_pcba_targets.fasta \
-  --store artifacts/protein_store/embeddings/esmc_600m \
-  --device cuda \
-  --batch-size 8
+export PROTEIN=esmc
+exec bash "$(dirname "$0")/stage3_protein_precompute.sh"

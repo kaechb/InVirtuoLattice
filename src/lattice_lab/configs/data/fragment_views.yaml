@@ -1,12 +1,14 @@
 _target_: lattice_lab.data.fragment_views.FragmentViewDataModule
 
-shard_dir: artifacts/processed/moses
-batch_size: 64
+shard_dir: artifacts/preprocessing/processed/moses
+batch_size: 256
 val_ratio: 0.005
 test_ratio: 0.005
 split_seed: 0
 run_validation: true
-num_workers: 0
+num_workers: 4
+# Fallback runtime tokenization when shards lack body_ids (Stage 1 --tokenizer-path).
+tokenizer_path: null
 # Yield (view, smiles) pairs so the module can build Morgan fingerprints for the
 # similarity-distillation loss. Enable together with model.fp_weight > 0.
 return_smiles: false

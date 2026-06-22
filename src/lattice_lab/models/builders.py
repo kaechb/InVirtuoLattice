@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import torch
+from torch import Tensor
 
 from lattice_lab.backbone.discrete_flow import (
     DiscreteFlowEncoder,
     build_discrete_flow_encoder,
+    pad_batch,
 )
 from lattice_lab.ebm.head import EnergyHead
 
@@ -23,6 +27,7 @@ DEFAULT_BACKBONE_LAYER_END = 11
 
 _ENCODER_PREFIX = "encoder."
 _ADAPTER_PREFIX = "encoder.adapter."
+_STUDENT_PREFIX = "student."
 
 # Skeleton kwargs used to rebuild an encoder from a *pre-``encoder_config``*
 # checkpoint. New checkpoints embed their own ``encoder_config`` (see the
@@ -68,12 +73,24 @@ def _checkpoint_state_dict(raw: object) -> dict[str, torch.Tensor]:
     ``state_dict`` mapping is also accepted. There are intentionally no legacy
     partial-bundle formats — every stage saves the entire module, so loading is
     a single, unambiguous prefix split.
+
+    Some denoising-JEPA runs were saved with a leading ``student.`` prefix on
+    every parameter; strip that when no bare ``encoder.*`` keys are present.
     """
     if not isinstance(raw, dict):
         raise ValueError(f"checkpoint must be a dict, got {type(raw)}")
     state = raw.get("state_dict", raw)
     if not isinstance(state, dict) or not state:
         raise ValueError("checkpoint has no 'state_dict'")
+    if not any(k.startswith(_ENCODER_PREFIX) for k in state):
+        student = {
+            k[len(_STUDENT_PREFIX):]: v
+            for k, v in state.items()
+            if k.startswith(_STUDENT_PREFIX)
+        }
+        if student:
+            logger.info("remapping checkpoint state_dict: student.* → *")
+            return student
     return state
 
 
@@ -163,6 +180,37 @@ def resolve_adapter_ckpt(adapter_ckpt: str | Path) -> Path:
         f"no last.ckpt under {adapter_ckpt}; pass a file or "
         f"{adapter_ckpt}/<wandb_run_id>/last.ckpt"
     )
+
+
+def adapter_run_id(adapter_ckpt: str | Path) -> str:
+    """W&B run id from ``.../checkpoints/<run_id>/last.ckpt``."""
+    path = resolve_adapter_ckpt(adapter_ckpt)
+    parent = path.parent
+    if path.name != "last.ckpt" or parent.name == "checkpoints":
+        raise ValueError(
+            f"cannot infer adapter run id from {adapter_ckpt}; "
+            "expected .../checkpoints/<wandb_run_id>/last.ckpt"
+        )
+    return parent.name
+
+
+def zm_store_path(adapter_ckpt: str | Path, pool: str) -> Path:
+    """Default Stage-4 z_m store for an adapter checkpoint.
+
+    Layout: ``artifacts/decoys/<run_id>/{decoy_zm,bdb_zm}`` or
+    ``artifacts/binders/<run_id>/binder_zm``.
+    """
+    rid = adapter_run_id(adapter_ckpt)
+    if pool == "binder_zm":
+        return Path(f"artifacts/binders/{rid}/binder_zm")
+    if pool in ("decoy_zm", "bdb_zm"):
+        return Path(f"artifacts/decoys/{rid}/{pool}")
+    raise ValueError(f"unknown z_m pool {pool!r}")
+
+
+def eval_zm_cache_path(adapter_run_id: str, cache_name: str) -> Path:
+    """Default Stage-6 LIT-PCBA z_m cache for a Stage-2 adapter run."""
+    return Path(f"artifacts/evaluation/{adapter_run_id}/{cache_name}")
 
 
 def adapter_state_fingerprint(adapter_state: Mapping[str, torch.Tensor]) -> str:
@@ -264,14 +312,140 @@ def load_encoder_from_ckpt(
     return encoder
 
 
+class DenoisingJepaViewEncoder:
+    """Frozen denoising-JEPA encoder for Stage-4 precompute / eval."""
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+        self.latent_dim = int(module.encoder.pool.dim)
+
+    @property
+    def adapter(self) -> object:
+        # ponytail: shim so Stage-4 scripts can read d_adapter without branching
+        dim = self.latent_dim
+
+        class _AdapterShim:
+            d_adapter = dim
+
+            def to(self, _device: object) -> _AdapterShim:
+                return self
+
+            def eval(self) -> _AdapterShim:
+                return self
+
+        return _AdapterShim()
+
+    @property
+    def backbone_layer_start(self) -> int:
+        return 0
+
+    @property
+    def backbone_layer_end(self) -> int:
+        return int(self._module.hparams.n_layer) - 1
+
+    def encode_views(
+        self,
+        views: Sequence[str],
+        device: torch.device | str = "cpu",
+        **kwargs: object,
+    ) -> Tensor:
+        from lattice_lab.training.denoising_jepa import encode_pooled_latent
+
+        bundle = self._module.bundle
+        seqs = [
+            [bundle.bos_id, *bundle.tokenizer.encode(v, add_special_tokens=False), bundle.eos_id]
+            for v in views
+        ]
+        ids, mask = pad_batch(seqs, pad_id=bundle.pad_id)
+        ids = ids.to(device)
+        mask = mask.to(device)
+        self._module.to(device)
+        with torch.no_grad():
+            return encode_pooled_latent(self._module, ids, mask, training=False)
+
+
+def _flatten_mapping(obj: Mapping[str, object] | object) -> dict[str, object]:
+    """Coerce Lightning / OmegaConf hyperparameter blobs to a plain dict."""
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(obj):
+            return OmegaConf.to_container(obj, resolve=True)  # type: ignore[return-value]
+    except ImportError:
+        pass
+    if isinstance(obj, Mapping):
+        return dict(obj)
+    return {}
+
+
+def _denoising_jepa_init_kwargs(raw: Mapping[str, object]) -> dict[str, object]:
+    from lattice_lab.models.denoising_jepa_ssl import DenoisingJEPAModule
+
+    flat = _flatten_mapping(raw.get("hyper_parameters") or {})
+    enc_cfg = _flatten_mapping(raw.get("encoder_config") or {})
+    for src in (enc_cfg, flat):
+        for k, v in src.items():
+            flat.setdefault(k, v)
+
+    params = inspect.signature(DenoisingJEPAModule.__init__).parameters
+    kwargs: dict[str, object] = {}
+    for name, param in params.items():
+        if name == "self":
+            continue
+        if name in flat:
+            kwargs[name] = flat[name]
+        elif param.default is not inspect.Parameter.empty:
+            kwargs[name] = param.default
+
+    # Backbone weights come from state_dict; warm-start ckpt is unused at eval time.
+    kwargs["ckpt_path"] = None
+    kwargs["tokenizer_path"] = str(kwargs.get("tokenizer_path") or DEFAULT_TOKENIZER)
+    return kwargs
+
+
+def load_denoising_jepa_for_eval(
+    ckpt: str | Path,
+    *,
+    device: str | torch.device = "cpu",
+) -> DenoisingJepaViewEncoder:
+    """Rebuild a frozen denoising-JEPA module for ``encode_views`` precompute."""
+    from lattice_lab.models.denoising_jepa_ssl import DenoisingJEPAModule
+
+    path = resolve_adapter_ckpt(ckpt)
+    raw = safe_torch_load(path, weights_only=False)
+    if not isinstance(raw, dict):
+        raise ValueError(f"denoising-JEPA checkpoint {path} is not a dict")
+    state = _checkpoint_state_dict(raw)
+    if not raw.get("hyper_parameters") and not raw.get("encoder_config"):
+        raise ValueError(f"denoising-JEPA checkpoint {path} has no hyper_parameters")
+
+    module = DenoisingJEPAModule(**_denoising_jepa_init_kwargs(raw))
+    module.load_state_dict(state, strict=True)
+    module.to(device).eval()
+    for p in module.parameters():
+        p.requires_grad_(False)
+    logger.info("loaded denoising-JEPA encoder from %s (latent_dim=%d)", path, module.encoder.pool.dim)
+    return DenoisingJepaViewEncoder(module)
+
+
 def build_eval_encoder(
     ckpt: str | Path,
     *,
     device: str | torch.device = "cpu",
     **overrides: object,
-) -> DiscreteFlowEncoder:
-    """Frozen encoder for eval / precompute CLIs — just loads the full ckpt."""
-    return load_encoder_from_ckpt(ckpt, device=device, **overrides)
+) -> DiscreteFlowEncoder | DenoisingJepaViewEncoder:
+    """Frozen encoder for eval / precompute CLIs."""
+    path = resolve_adapter_ckpt(ckpt)
+    raw = safe_torch_load(path, weights_only=False)
+    state = _checkpoint_state_dict(raw)
+    if any(k.startswith(_ADAPTER_PREFIX) for k in state):
+        return load_encoder_from_ckpt(ckpt, device=device, **overrides)
+    if any(k.startswith("encoder.pool.") for k in state):
+        return load_denoising_jepa_for_eval(ckpt, device=device)
+    raise ValueError(
+        f"unrecognized checkpoint layout at {path}; "
+        "expected discrete-flow adapter (encoder.adapter.*) or denoising-JEPA (encoder.pool.*)"
+    )
 
 
 def build_energy_head(*, d_adapter: int, d_protein: int) -> EnergyHead:

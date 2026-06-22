@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=lattice-s3-esm2
+#SBATCH --job-name=lattice-s3-protein
 #SBATCH --account=project_465003063
 #SBATCH --partition=small-g
 #SBATCH --nodes=1
@@ -10,30 +10,51 @@
 #SBATCH --output=logs/slurm/stage3/%j.out
 #SBATCH --error=logs/slurm/stage3/%j.err
 #
-# Stage 3 — frozen ESM-2 650M protein embeddings (BindingDB + LIT-PCBA targets).
+# Stage 3 — frozen protein embeddings (BindingDB + LIT-PCBA targets).
 #
 #   sbatch scripts/slurm/stage3_protein_precompute.sh
+#   PROTEIN=esmc sbatch scripts/slurm/stage3_protein_precompute.sh
+#   OVERWRITE=0 sbatch scripts/slurm/stage3_protein_precompute.sh   # incremental (pipeline default)
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:?submit from repo root: sbatch scripts/slurm/stage3_protein_precompute.sh}"
 # shellcheck source=scripts/slurm/common.sh
 source "scripts/slurm/common.sh"
 
+PROTEIN="${PROTEIN:-esm2}"
+lattice_pipeline_source_env
+# ponytail: pipeline sets OVERWRITE=0; standalone default rebuilds the store.
+OVERWRITE="${OVERWRITE:-1}"
+
+case "${PROTEIN}" in
+  esm2|esm)
+    PROTEIN_STORE=artifacts/protein_store/embeddings/esm2_650M
+    PROTEIN_EXTRA=(--no-canonical-filter)
+    ;;
+  esmc)
+    PROTEIN_STORE=artifacts/protein_store/embeddings/esmc_600m
+    PROTEIN_EXTRA=(--backend esmc)
+    ;;
+  *)
+    echo "unknown PROTEIN=${PROTEIN} (want esm2 or esmc)" >&2
+    exit 1
+    ;;
+esac
+
+OVERWRITE_ARGS=()
+[[ "${OVERWRITE}" == 1 ]] && OVERWRITE_ARGS=(--overwrite)
+
 lattice_load_gpu_modules
 lattice_cd_repo
+[[ -n "${PIPELINE_LOG_DIR:-}" ]] && trap 'lattice_pipeline_collect_logs_on_exit 3' EXIT
 lattice_require_gpu
 
-srun python -m lattice_lab.protein.precompute \
-  --fasta artifacts/processed/bindingdb/bindingdb_targets.fasta \
-  --store artifacts/protein_store/embeddings/esm2_650M \
-  --device cuda \
-  --batch-size 8 \
-  --no-canonical-filter --overwrite
-
-srun python -m lattice_lab.protein.precompute \
-  --fasta artifacts/processed/bindingdb/lit_pcba_targets.fasta \
-  --store artifacts/protein_store/embeddings/esm2_650M \
-  --device cuda \
-  --batch-size 8 \
-  --no-canonical-filter --overwrite
-
+for _fasta in bindingdb_targets.fasta lit_pcba_targets.fasta; do
+  srun python -m lattice_lab.protein.precompute \
+    "${PROTEIN_EXTRA[@]}" \
+    --fasta "artifacts/preprocessing/processed/bindingdb/${_fasta}" \
+    --store "${PROTEIN_STORE}" \
+    --device cuda \
+    --batch-size 8 \
+    "${OVERWRITE_ARGS[@]}"
+done

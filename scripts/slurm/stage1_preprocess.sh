@@ -3,7 +3,7 @@
 #SBATCH --account=project_465003063
 #SBATCH --partition=small
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=120G
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/slurm/stage1/%j.out
@@ -21,18 +21,20 @@ source "scripts/slurm/common.sh"
 lattice_load_cpu_modules
 lattice_cd_repo
 
-OUT_BINDINGDB="${REPO}/artifacts/processed/bindingdb"
-OUT_MOSES="${REPO}/artifacts/processed/moses"
+OUT_BINDINGDB="${REPO}/artifacts/preprocessing/processed/bindingdb"
+OUT_MOSES="${REPO}/artifacts/preprocessing/processed/moses_id"
 
 srun python -m lattice_lab.preprocessing.run_bindingdb \
-  --bindingdb-tsv "${REPO}/artifacts/raw/bindingdb/BindingDB_All.tsv" \
-  --lit-pcba-dir "${REPO}/artifacts/raw/lit_pcba" \
+  --bindingdb-tsv "${REPO}/artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv" \
+  --lit-pcba-dir "${REPO}/artifacts/preprocessing/raw/lit_pcba" \
   --output-dir "${OUT_BINDINGDB}" \
   --identity 90 \
-  --n-jobs 40
+  --n-jobs 128 \
+  --tokenizer-path "${REPO}/artifacts/tokenizer/smiles_new.json"
 
 srun python -m lattice_lab.preprocessing.run_preprocessing \
-  --input "${REPO}/artifacts/raw/moses.csv" \
+  --input "${REPO}/artifacts/preprocessing/raw/moses.csv" \
   --output "${OUT_MOSES}" \
   --n-views 3 \
-  --n-jobs 40
+  --n-jobs 128 \
+  --tokenizer-path "${REPO}/artifacts/tokenizer/smiles_new.json"

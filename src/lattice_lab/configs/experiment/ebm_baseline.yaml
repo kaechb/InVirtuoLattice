@@ -13,3 +13,6 @@ data:
   hard_mining_mult: 1
   frac_other_binder: 0.4
   frac_non_binder: 0.15
+# precision: 32-true or no grads!!!
+trainer:
+  precision: 32-true

@@ -29,7 +29,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-RAW_DIR="${REPO}/artifacts/raw/bindingdb"
+RAW_DIR="${REPO}/artifacts/preprocessing/raw/bindingdb"
 DEFAULT_DATE="202606"
 DATE="${BINDINGDB_DATE:-$DEFAULT_DATE}"
 DEFAULT_URL="https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All_${DATE}_tsv.zip"

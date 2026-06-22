@@ -22,13 +22,13 @@ Run as::
 
     # ESM-2 (default)
     python -m lattice_lab.protein.precompute \\
-        --fasta artifacts/raw/targets.fasta \\
+        --fasta artifacts/preprocessing/raw/targets.fasta \\
         --store artifacts/protein_store/embeddings/esm2_650M/ \\
         --batch-size 8 --device cuda
 
     # ESM C 600M
     python -m lattice_lab.protein.precompute --backend esmc \\
-        --fasta artifacts/raw/targets.fasta \\
+        --fasta artifacts/preprocessing/raw/targets.fasta \\
         --store artifacts/protein_store/embeddings/esmc_600m/ \\
         --batch-size 8 --device cuda
 """

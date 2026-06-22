@@ -11,12 +11,12 @@ GPUs are busy training. Optionally writes a per-target actives-vs-inactives
 energy violin (``--violin-dir``) for the separation check.
 
     python -m lattice_lab.eval.ensemble_eval \
-        --ckpts artifacts/energy/lejepa/<run_id0>/last.ckpt \
-                artifacts/energy/lejepa/<run_id1>/last.ckpt \
-                artifacts/energy/lejepa/<run_id2>/last.ckpt \
+        --ckpts artifacts/energy/checkpoints/<run_id0>/last.ckpt \
+                artifacts/energy/checkpoints/<run_id1>/last.ckpt \
+                artifacts/energy/checkpoints/<run_id2>/last.ckpt \
         --zm-cache      artifacts/evaluation/lit_pcba_zm_mv4_lejepa \
         --protein-store artifacts/protein_store/embeddings/esm2_650M \
-        --test-parquet  artifacts/processed/bindingdb/test_lit_pcba.parquet \
+        --test-parquet  artifacts/preprocessing/processed/bindingdb/test_lit_pcba.parquet \
         --out           artifacts/evaluation/ensemble_hardneg_mv4_lejepa.json
 """
 from __future__ import annotations
@@ -67,7 +67,7 @@ def main() -> None:
     ap.add_argument("--zm-cache", type=Path, required=True)
     ap.add_argument("--protein-store", type=Path, required=True)
     ap.add_argument("--test-parquet", type=Path,
-                    default=Path("artifacts/processed/bindingdb/test_lit_pcba.parquet"))
+                    default=Path("artifacts/preprocessing/processed/bindingdb/test_lit_pcba.parquet"))
     ap.add_argument("--out", type=Path, default=Path("artifacts/evaluation/ensemble_eval.json"))
     ap.add_argument("--violin-dir", type=Path, default=None)
     ap.add_argument("--bedroc-alpha", type=float, default=80.5)

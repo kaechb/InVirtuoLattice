@@ -4,23 +4,31 @@ Each batch is a list of fragmented-SMILES strings. Per molecule we tokenize once
 and produce two views by shuffling the fragment order at the token level (split
 on the separator id, shuffle, rejoin). Both views go through the *same* encoder,
 so the (optionally learnable) encode-time is shared across them by construction.
-Only the adapter and — when enabled — the encode-time parameter train; the DDiT
-backbone stays frozen.
+The adapter, the encode-time parameter (when learnable), and the DDiT backbone
+(when ``encoder.freeze_backbone`` is false) all train — whatever has
+``requires_grad`` is optimized.
 
 Losses (``ssl_loss``):
   * ``ntxent`` (default) — symmetric NT-Xent / InfoNCE on projection head outputs.
-  * ``lejepa`` — LeJEPA with global (fragment-shuffle) + local (one masked
-    fragment per view) on unnormalized pooled latents.
+  * ``lejepa`` — invariance loss + SIGReg on unnormalized pooled latents: every
+    view (intact shuffles + masked) is pulled directly toward the molecule's
+    intact center (no predictor), while SIGReg keeps the target batch isotropic.
+    Needs >= 1 global (intact) view; masked local views supply the augmentation.
   * ``hybrid`` — NT-Xent on the first two global views' projections, linearly
     annealed (1.0 -> 0.0 over ``hybrid_anneal_steps``) in favor of the LeJEPA
-    loss on all views. Motivation: LeJEPA alone reaches near-full numerical
-    rank but very low effective rank, because nothing in its objective pushes
-    different molecules apart between-sample — NT-Xent's explicit pairwise
-    repulsion supplies that directly while it's annealed in.
+    loss. Motivation: LeJEPA alone reaches near-full numerical rank but very
+    low effective rank, because nothing in its objective pushes different
+    molecules apart between-sample — NT-Xent's explicit pairwise repulsion
+    supplies that directly while it's annealed in.
+  * ``ijepa`` — I-JEPA: one masked encoder pass (``<UNK>`` holes), visible adapter
+    reps + learnable mask-token predictor vs EMA intact targets at hole indices.
+    One intact view per molecule plus ``lejepa_n_local_views`` masked locals.
+    Masking is fragment-, span-, or mixed-mode (``ijepa_mask_mode``).
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import random
 
@@ -30,9 +38,14 @@ import torch
 
 from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder, pad_batch
 from lattice_lab.backbone.discrete_flow import resolve_mask_token_id
-from lattice_lab.data.fragment_views import mask_fragment_ids, shuffle_fragment_ids
+from lattice_lab.data.fragment_views import (
+    mask_fragment_ids,
+    mask_local_ids,
+    shuffle_fragment_ids,
+)
 from lattice_lab.models.schedules import cosine_with_warmup
 from lattice_lab.training.ssl_loss import (
+    IJEPALoss,
     LeJEPALoss,
     NTXentLoss,
     _FingerprintCache,
@@ -43,7 +56,7 @@ from lattice_lab.training.ssl_loss import (
 )
 from lattice_lab.training.ssl_val_probes import (
     SSLValProbes,
-    _l2_normalize_rows,
+    embedding_batch_collapse_diag,
     embedding_covariance_rank,
 )
 
@@ -68,7 +81,20 @@ class DiscreteFlowSSLModule(L.LightningModule):
         lejepa_lambda: float = 0.05,
         lejepa_n_global_views: int = 2,
         lejepa_n_local_views: int = 2,
+        lejepa_mask_frac: float = 0.5,
+        lejepa_mask_frac_max: float | None = None,
         lejepa_mask_token_id: int | None = None,
+        ijepa_mask_mode: str = "fragment",
+        ijepa_ema_decay: float = 0.996,
+        # When true, visible context reps cannot attend to <UNK> hole keys in DDiT
+        # + adapter (paper-faithful context-only encoding on one masked pass).
+        ijepa_block_hole_attn: bool = False,
+        ijepa_predictor_layers: int = 1,
+        ijepa_predictor_heads: int = 2,
+        ijepa_predictor_ff_mult: int = 2,
+        ijepa_context_sigreg_lambda: float = 0.0,
+        ijepa_collapse_diag_every_n_steps: int = 50,
+        rank_subsample: int = 256,
         sigreg_num_projections: int = 256,
         sigreg_knots: int = 17,
         sigreg_t_max: float = 3.0,
@@ -77,11 +103,8 @@ class DiscreteFlowSSLModule(L.LightningModule):
         # max(0, 1 - global_step/hybrid_anneal_steps) -- 1.0 (pure ntxent) at
         # step 0 down to 0.0 (pure lejepa) by this step, then held at 0.
         hybrid_anneal_steps: int = 2000,
-        # Cheap covariance-rank diagnostic logged every N training steps from
-        # the current batch's raw pooled latents (both methods, same metric) —
-        # far finer-grained than the val probe's val_check_interval, so the
-        # early-training rank trajectory (e.g. LeJEPA's invariance-vs-SIGReg
-        # tension in the first ~1-2k steps) is actually visible. 0 disables.
+        # Covariance-rank of the teacher (I-JEPA EMA) or online global pooled z_m,
+        # logged every N train steps and on every val batch. 0 disables.
         train_rank_every_n_steps: int = 50,
         # Diagnostic: per-loss-term gradient L2 norm w.r.t. trainable params,
         # via a separate torch.autograd.grad call per term (retain_graph=True,
@@ -91,6 +114,8 @@ class DiscreteFlowSSLModule(L.LightningModule):
         # backward-equivalent pass per term every training step -- off by
         # default, only meant for short diagnostic runs.
         log_grad_norms: bool = False,
+        # ijepa only: warn when the predictor ignores context (see on_validation_epoch_end).
+        condition_margin: float = 0.01,
         val_probe_n_molecules: int = 2000,
         val_probe_every_n_epochs: int = 1,
         val_probe_encode_batch_size: int = 128,
@@ -103,15 +128,19 @@ class DiscreteFlowSSLModule(L.LightningModule):
         self.save_hyperparameters(ignore=["encoder"])
         self.encoder = encoder
         ssl_loss = ssl_loss.lower()
-        if ssl_loss not in {"ntxent", "lejepa", "hybrid"}:
+        if ssl_loss not in {"ntxent", "lejepa", "hybrid", "ijepa"}:
             raise ValueError(
-                f"ssl_loss must be 'ntxent', 'lejepa', or 'hybrid', got {ssl_loss!r}"
+                f"ssl_loss must be 'ntxent', 'lejepa', 'hybrid', or 'ijepa', "
+                f"got {ssl_loss!r}"
             )
         self.ssl_loss = ssl_loss
         # "hybrid" reuses lejepa's global+local view construction (it needs the
         # masked local views for SIGReg too), just also takes a projection for
         # the annealed ntxent term.
         uses_lejepa_views = ssl_loss in ("lejepa", "hybrid")
+        # ijepa doesn't use the global/local pooled-view stack, but it does use
+        # fragment masking (mask token + mask fraction) to build its hole.
+        uses_masking = uses_lejepa_views or ssl_loss == "ijepa"
         # Morgan-fingerprint similarity distillation: aligns the cosine geometry
         # of z_m with Tanimoto similarity, injecting the chemical-similarity
         # structure plain instance-discrimination / invariance never learns.
@@ -143,6 +172,32 @@ class DiscreteFlowSSLModule(L.LightningModule):
             if uses_lejepa_views
             else None
         )
+        self.ijepa_loss_fn = (
+            IJEPALoss(
+                dim=encoder.adapter.d_adapter,
+                lejepa_lambda=lejepa_lambda,
+                context_sigreg_lambda=ijepa_context_sigreg_lambda,
+                sigreg_num_projections=sigreg_num_projections,
+                sigreg_knots=sigreg_knots,
+                sigreg_t_max=sigreg_t_max,
+                sigreg_eps=sigreg_eps,
+                ijepa_predictor_layers=ijepa_predictor_layers,
+                ijepa_predictor_heads=ijepa_predictor_heads,
+                ijepa_predictor_ff_mult=ijepa_predictor_ff_mult,
+            )
+            if ssl_loss == "ijepa"
+            else None
+        )
+        self.encoder_ema: DiscreteFlowEncoder | None = None
+        if ssl_loss == "ijepa":
+            if not (0.0 <= float(ijepa_ema_decay) < 1.0):
+                raise ValueError(
+                    f"ijepa_ema_decay must be in [0, 1), got {ijepa_ema_decay}"
+                )
+            self.encoder_ema = copy.deepcopy(encoder)
+            self.encoder_ema.eval()
+            for p in self.encoder_ema.parameters():
+                p.requires_grad = False
         self._rng = random.Random(seed)
         self._val_probes = SSLValProbes(
             n_molecules=val_probe_n_molecules,
@@ -154,33 +209,65 @@ class DiscreteFlowSSLModule(L.LightningModule):
             tsne_perplexity=val_probe_tsne_perplexity,
         )
         self._val: dict[str, list[float]] = {
-            "loss": [], "acc": [], "inv": [], "sigreg": [], "view_diversity": [], "fp": [],
-            "ntxent": [],
+            "loss": [], "acc": [], "inv": [], "inv_rel": [], "sigreg": [],
+            "predict": [], "sigreg_context": [], "view_diversity": [], "fp": [], "ntxent": [],
+            "cond_true": [], "cond_shuf": [], "cond_zero": [],
+            "cond_gap_zero": [], "cond_gap_shuf": [],
+            "rank_effective": [], "rank_numerical": [],
         }
         self._mask_token_id = (
             resolve_mask_token_id(
                 encoder.bundle.tokenizer, override=lejepa_mask_token_id,
             )
-            if uses_lejepa_views
+            if uses_masking
             else None
         )
         if uses_lejepa_views and int(lejepa_n_global_views) < 1:
             raise ValueError(
                 f"lejepa_n_global_views must be >= 1, got {lejepa_n_global_views}"
             )
+        if uses_masking:
+            frac_lo = float(lejepa_mask_frac)
+            frac_hi = float(lejepa_mask_frac_max) if lejepa_mask_frac_max is not None else frac_lo
+            if not (0.0 < frac_lo <= 1.0):
+                raise ValueError(
+                    f"lejepa_mask_frac must be in (0, 1], got {lejepa_mask_frac}"
+                )
+            if not (0.0 < frac_hi <= 1.0):
+                raise ValueError(
+                    f"lejepa_mask_frac_max must be in (0, 1], got {lejepa_mask_frac_max}"
+                )
+            if frac_lo > frac_hi:
+                raise ValueError(
+                    f"lejepa_mask_frac ({frac_lo}) must be <= lejepa_mask_frac_max ({frac_hi})"
+                )
         if ssl_loss == "hybrid" and int(lejepa_n_global_views) < 2:
             raise ValueError(
                 "hybrid loss pairs the first two global views for ntxent; "
                 f"need lejepa_n_global_views >= 2, got {lejepa_n_global_views}"
             )
+        if ssl_loss == "ijepa":
+            if int(lejepa_n_local_views) < 1:
+                raise ValueError(
+                    f"lejepa_n_local_views must be >= 1 for ijepa, "
+                    f"got {lejepa_n_local_views}"
+                )
+            mode = ijepa_mask_mode.lower()
+            if mode not in {"fragment", "span", "mixed"}:
+                raise ValueError(
+                    f"ijepa_mask_mode must be fragment, span, or mixed, got {ijepa_mask_mode!r}"
+                )
         logger.info(
             "discrete-flow SSL: ssl_loss=%s lejepa_global=%d lejepa_local=%d "
-            "mask_id=%s hybrid_anneal_steps=%s learnable_time=%s init_time=%.3f "
-            "frag_sep_id=%d",
+            "ijepa_mask=%s block_hole_attn=%s pred_layers=%s mask_id=%s "
+            "hybrid_anneal_steps=%s learnable_time=%s init_time=%.3f frag_sep_id=%d",
             ssl_loss,
             lejepa_n_global_views if uses_lejepa_views else 0,
-            lejepa_n_local_views if uses_lejepa_views else 0,
-            self._mask_token_id if uses_lejepa_views else "n/a",
+            lejepa_n_local_views if uses_lejepa_views or ssl_loss == "ijepa" else 0,
+            ijepa_mask_mode if ssl_loss == "ijepa" else "n/a",
+            ijepa_block_hole_attn if ssl_loss == "ijepa" else "n/a",
+            ijepa_predictor_layers if ssl_loss == "ijepa" else "n/a",
+            self._mask_token_id if uses_masking else "n/a",
             hybrid_anneal_steps if ssl_loss == "hybrid" else "n/a",
             encoder.learnable_time,
             self.encoder.encode_time_value,
@@ -188,7 +275,30 @@ class DiscreteFlowSSLModule(L.LightningModule):
         )
 
     # -- fragment-shuffle augmentation -------------------------------------- #
-    def _two_views(self, view_strings: list[str]):
+    def _sample_mask_frac(self) -> float:
+        """Mask fraction for one view. Fixed when ``lejepa_mask_frac_max`` is unset;
+        otherwise uniform in ``[lejepa_mask_frac, lejepa_mask_frac_max]``."""
+        lo = float(self.hparams.lejepa_mask_frac)
+        hi = self.hparams.lejepa_mask_frac_max
+        if hi is None:
+            return lo
+        hi = float(hi)
+        return lo if hi <= lo else self._rng.uniform(lo, hi)
+
+    @staticmethod
+    def _body_ids(item: str | list[int], tokenizer) -> list[int]:
+        if isinstance(item, list):
+            return item
+        return tokenizer.encode(item, add_special_tokens=False)
+
+    @staticmethod
+    def _subsample_rows(z: torch.Tensor, k: int) -> torch.Tensor:
+        if k <= 0 or z.size(0) <= k:
+            return z
+        idx = torch.randperm(z.size(0), device=z.device)[:k]
+        return z[idx]
+
+    def _two_views(self, view_strings: list[str] | list[list[int]]):
         """Tokenize each view, build two fragment-shuffled token sequences,
         return two padded ``(ids, mask)`` batches on the module device."""
         b = self.encoder.bundle
@@ -196,7 +306,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
         seqs_a: list[list[int]] = []
         seqs_b: list[list[int]] = []
         for s in view_strings:
-            body = b.tokenizer.encode(s, add_special_tokens=False)
+            body = self._body_ids(s, b.tokenizer)
             sa = shuffle_fragment_ids(body, sep, self._rng)
             sb = shuffle_fragment_ids(body, sep, self._rng)
             seqs_a.append([b.bos_id, *sa, b.eos_id])
@@ -207,33 +317,24 @@ class DiscreteFlowSSLModule(L.LightningModule):
         return (ids_a.to(dev), mask_a.to(dev)), (ids_b.to(dev), mask_b.to(dev))
 
     @staticmethod
-    def _split_batch(batch) -> tuple[list[str], list[str] | None]:
-        """Accept either ``list[str]`` views or ``(views, smiles)`` tuples."""
+    def _split_batch(batch) -> tuple[list[str] | list[list[int]], list[str] | None]:
+        """Accept view strings, pretokenized body ids, or ``(views, smiles)``."""
         if isinstance(batch, tuple) and len(batch) == 2:
             views, smiles = batch
             return list(views), list(smiles)
         return list(batch), None
 
-    def _encode_ntxent_views(self, views, *, with_raw_pooled: bool = False):
-        """Return ``(z_a_proj, z_b_proj, z_a_pooled, raw_pooled)``.
+    def _encode_ntxent_views(self, views):
+        """Return ``(z_a_proj, z_b_proj, z_a_pooled)``.
 
         ``z_*_proj`` are the SimCLR projection outputs (NT-Xent loss);
         ``z_a_pooled`` is the L2-normalized z_m of view a, used by the optional
-        Tanimoto similarity-distillation loss. When ``with_raw_pooled`` is set,
-        also runs two extra no-grad encodes (same shuffled tokens, ``normalize=
-        False``) to get both views' *raw* pooled latents stacked ``[B, 2, D]``
-        for the train-rank diagnostic — ``None`` otherwise.
+        Tanimoto similarity-distillation loss.
         """
         (ids_a, mask_a), (ids_b, mask_b) = self._two_views(views)
         z_a_pooled, z_a = self.encoder.encode_token_ids(ids_a, mask_a, return_projection=True)
         _, z_b = self.encoder.encode_token_ids(ids_b, mask_b, return_projection=True)
-        raw_pooled = None
-        if with_raw_pooled:
-            with torch.no_grad():
-                raw_a = self.encoder.encode_token_ids(ids_a, mask_a, normalize=False)
-                raw_b = self.encoder.encode_token_ids(ids_b, mask_b, normalize=False)
-            raw_pooled = torch.stack([raw_a, raw_b], dim=1)
-        return z_a, z_b, z_a_pooled, raw_pooled
+        return z_a, z_b, z_a_pooled
 
     def _fp_distillation(self, z_pooled, smiles):
         """MSE(cos(z_pooled), Tanimoto(smiles)); ``None`` if disabled.
@@ -271,7 +372,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
         seqs: list[list[int]] = []
         n_changed = 0
         for s in batch:
-            body = b.tokenizer.encode(s, add_special_tokens=False)
+            body = self._body_ids(s, b.tokenizer)
             first_global: list[int] | None = None
             for _ in range(n_global):
                 shuffled = shuffle_fragment_ids(body, sep, self._rng)
@@ -282,7 +383,9 @@ class DiscreteFlowSSLModule(L.LightningModule):
                     n_changed += 1
                 seqs.append(seq)
             for _ in range(n_local):
-                masked = mask_fragment_ids(body, sep, mask_id, self._rng)
+                masked = mask_fragment_ids(
+                    body, sep, mask_id, self._rng, frac=self._sample_mask_frac(),
+                )
                 seqs.append([b.bos_id, *masked, b.eos_id])
         ids, mask = pad_batch(seqs, pad_id=b.pad_id)
         dev = self.device
@@ -299,6 +402,100 @@ class DiscreteFlowSSLModule(L.LightningModule):
             proj.view(len(batch), n_all, -1)[:, :n_global], dim=-1
         )
         return z_global, z_all, diversity, proj_global
+
+    @staticmethod
+    def _gather_hole_tokens(tok: torch.Tensor, hole: torch.Tensor) -> torch.Tensor:
+        """Stack adapter reps at hole positions: ``[B,T,D]`` + ``[B,T]`` → ``[N,D]``."""
+        if tok.shape[:2] != hole.shape:
+            raise ValueError(f"tok/hole shape mismatch: {tuple(tok.shape)} vs {tuple(hole.shape)}")
+        return tok[hole.bool()]
+
+    @staticmethod
+    def _gather_visible_tokens(
+        tok: torch.Tensor, hole: torch.Tensor, valid: torch.Tensor
+    ) -> torch.Tensor:
+        """Stack visible (non-hole) adapter reps: ``[B,T,D]`` → ``[N_vis,D]``."""
+        return tok[(valid & ~hole).bool()]
+
+    def _encode_ijepa(self, batch):
+        """I-JEPA views: one masked encode + intact targets at hole indices.
+
+        Returns ``(tok_masked, hole, valid, target_ema, target_online, z_pooled,
+        z_teacher_global)``.
+
+        * ``tok_masked``: online encoder on masked locals, per-token adapter reps ``[B,T,D]``.
+          Predictor reads **visible** rows only; ``<UNK>`` rows supply sequence length /
+          optional attention context unless ``ijepa_block_hole_attn`` blocks hole keys.
+        * ``hole`` / ``valid``: boolean masks aligned with ``tok_masked`` (post-BOS frame).
+        * ``target_ema``: EMA encoder, intact view at hole columns — stop-grad endpoint.
+        * ``target_online``: online encoder, intact view at hole columns — SIGReg.
+        * ``z_pooled``: ``[B_mol, D]`` mean-pooled intact online ``z_m``.
+        * ``z_teacher_global``: ``[B_mol, D]`` intact-view pooled latents from the EMA teacher.
+
+        ponytail: assumes ``<UNK>`` (mask_id) does not occur naturally in the body.
+        """
+        b = self.encoder.bundle
+        sep = int(self.hparams.frag_sep_id)
+        mask_id = int(self._mask_token_id)
+        n_local = int(self.hparams.lejepa_n_local_views)
+        mask_mode = str(self.hparams.ijepa_mask_mode).lower()
+        intact_seqs: list[list[int]] = []
+        masked_seqs: list[list[int]] = []
+        for s in batch:
+            body = self._body_ids(s, b.tokenizer)
+            ordered = shuffle_fragment_ids(body, sep, self._rng)
+            intact_seqs.append([b.bos_id, *ordered, b.eos_id])
+            for _ in range(n_local):
+                masked = mask_local_ids(
+                    ordered,
+                    sep,
+                    mask_id,
+                    self._rng,
+                    frac=self._sample_mask_frac(),
+                    mode=mask_mode,
+                )
+                masked_seqs.append([b.bos_id, *masked, b.eos_id])
+        intact_ids, intact_mask = pad_batch(intact_seqs, pad_id=b.pad_id)
+        masked_ids, masked_mask = pad_batch(masked_seqs, pad_id=b.pad_id)
+        dev = self.device
+        intact_ids, intact_mask = intact_ids.to(dev), intact_mask.to(dev)
+        masked_ids, masked_mask = masked_ids.to(dev), masked_mask.to(dev)
+        hole = (masked_ids == mask_id)[:, 1:]
+        valid = masked_mask[:, 1:].bool()
+        hole_attn = hole if bool(self.hparams.ijepa_block_hole_attn) else None
+        _, tok_masked = self.encoder.encode_token_ids(
+            masked_ids,
+            masked_mask,
+            normalize=False,
+            return_tokens=True,
+            hole_mask=hole_attn,
+        )
+        with torch.no_grad():
+            z_teacher_global, tok_ema = self.encoder_ema.encode_token_ids(
+                intact_ids, intact_mask, normalize=False, return_tokens=True
+            )
+        z_pooled, tok_online = self.encoder.encode_token_ids(
+            intact_ids, intact_mask, normalize=False, return_tokens=True
+        )
+        tok_ema = tok_ema.repeat_interleave(n_local, dim=0)
+        tok_online = tok_online.repeat_interleave(n_local, dim=0)
+        target_ema = self._gather_hole_tokens(tok_ema, hole)
+        target_online = self._gather_hole_tokens(tok_online, hole)
+        if target_ema.numel() == 0:
+            raise RuntimeError("ijepa batch has no hole tokens — check masking")
+        return tok_masked, hole, valid, target_ema, target_online, z_pooled, z_teacher_global
+
+    @staticmethod
+    def _update_ema(online: torch.nn.Module, ema: torch.nn.Module, decay: float) -> None:
+        with torch.no_grad():
+            for p_online, p_ema in zip(online.parameters(), ema.parameters()):
+                p_ema.data.mul_(decay).add_(p_online.data, alpha=1.0 - decay)
+
+    def _update_ijepa_ema(self) -> None:
+        assert self.encoder_ema is not None
+        self._update_ema(
+            self.encoder, self.encoder_ema, float(self.hparams.ijepa_ema_decay)
+        )
 
     def _hybrid_alpha(self) -> float:
         """Linear anneal: 1.0 (pure ntxent) at step 0 -> 0.0 (pure lejepa) by
@@ -320,15 +517,18 @@ class DiscreteFlowSSLModule(L.LightningModule):
         if self.ssl_loss == "ntxent":
             assert z_a is not None and z_b is not None
             loss = self.ntxent_loss_fn(z_a, z_b)
-            return loss, {"inv": None, "sigreg": None, "ntxent": None, "alpha": None}
+            return loss, {
+                "inv": None, "inv_rel": None, "sigreg": None,
+                "ntxent": None, "alpha": None,
+            }
         assert z_global is not None and z_all is not None
         terms = self.lejepa_loss_fn(z_global, z_all)
         if self.ssl_loss != "hybrid":
             if self.hparams.log_grad_norms and torch.is_grad_enabled():
                 self._log_grad_norms(inv=terms.inv, sigreg=terms.sigreg)
             return terms.total, {
-                "inv": terms.inv.detach(), "sigreg": terms.sigreg.detach(),
-                "ntxent": None, "alpha": None,
+                "inv": terms.inv.detach(), "inv_rel": terms.inv_rel,
+                "sigreg": terms.sigreg.detach(), "ntxent": None, "alpha": None,
             }
         assert proj_global is not None
         ntxent_loss = self.ntxent_loss_fn(proj_global[:, 0], proj_global[:, 1])
@@ -338,6 +538,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
             self._log_grad_norms(ntxent=ntxent_loss, inv=terms.inv, sigreg=terms.sigreg)
         return total, {
             "inv": terms.inv.detach(),
+            "inv_rel": terms.inv_rel,
             "sigreg": terms.sigreg.detach(),
             "ntxent": ntxent_loss.detach(),
             "alpha": alpha,
@@ -382,6 +583,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 logs[f"{prefix}/acc@1"] = acc
         if extras["inv"] is not None:
             logs[f"{prefix}/inv"] = extras["inv"]
+            logs[f"{prefix}/inv_rel"] = extras["inv_rel"]
             logs[f"{prefix}/sigreg"] = extras["sigreg"]
         if extras["ntxent"] is not None:
             logs[f"{prefix}/ntxent"] = extras["ntxent"]
@@ -392,41 +594,92 @@ class DiscreteFlowSSLModule(L.LightningModule):
         self.log(f"{prefix}/loss", loss.detach(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, batch_size=batch_size)
         self.log_dict(logs, on_step=on_step, on_epoch=on_epoch, batch_size=batch_size)
 
-    def _train_rank_due(self) -> bool:
+    def _rank_due(self) -> bool:
         every = int(self.hparams.train_rank_every_n_steps)
         return every > 0 and self.global_step % every == 0
 
-    def _log_train_rank(self, z_multiview: torch.Tensor) -> None:
-        """Covariance-rank diagnostic from the current batch's raw pooled
-        latents, both as-is and L2-normalized (mirrors ``embedding_covariance_
-        rank`` usage in the val probe) — same metric for ntxent and lejepa so
-        the early-training trajectory is directly comparable.
-        """
-        flat_raw = (
-            z_multiview.detach().float().reshape(-1, z_multiview.shape[-1]).cpu().numpy()
-        )
-        eff_raw, num_raw = embedding_covariance_rank(flat_raw)
-        eff_norm, num_norm = embedding_covariance_rank(_l2_normalize_rows(flat_raw))
+    def _global_rank_metrics(self, z: torch.Tensor) -> tuple[float, float]:
+        """Covariance rank of ``[B, D]`` global pooled latents."""
+        flat = self._subsample_rows(
+            z.detach().float(), int(self.hparams.rank_subsample),
+        ).cpu().numpy()
+        return embedding_covariance_rank(flat)
+
+    def _log_global_rank(
+        self, z: torch.Tensor, *, prefix: str, batch_size: int, on_step: bool,
+    ) -> None:
+        eff, num = self._global_rank_metrics(z)
         self.log_dict(
-            {
-                "train/rank_effective_raw": eff_raw,
-                "train/rank_numerical_raw": num_raw,
-                "train/rank_effective_norm": eff_norm,
-                "train/rank_numerical_norm": num_norm,
-            },
-            on_step=True,
-            batch_size=z_multiview.shape[0],
+            {f"{prefix}/rank_effective": eff, f"{prefix}/rank_numerical": num},
+            on_step=on_step,
+            on_epoch=not on_step,
+            batch_size=batch_size,
         )
+
+    def _append_val_rank(self, z: torch.Tensor) -> None:
+        eff, num = self._global_rank_metrics(z)
+        self._val["rank_effective"].append(eff)
+        self._val["rank_numerical"].append(num)
+
+    def _online_global_z(self, z_global: torch.Tensor) -> torch.Tensor:
+        """First intact global view per molecule: ``[B, Vg, D]`` → ``[B, D]``."""
+        return z_global[:, 0]
+
+    def _collapse_diag_due(self) -> bool:
+        every = int(self.hparams.ijepa_collapse_diag_every_n_steps)
+        return every > 0 and self.global_step % every == 0
+
+    def _ntxent_global_z(self, views) -> torch.Tensor:
+        """Unnormalized pooled z_m of view-a (online; no teacher in NT-Xent)."""
+        (ids_a, mask_a), _ = self._two_views(views)
+        with torch.no_grad():
+            return self.encoder.encode_token_ids(ids_a, mask_a, normalize=False)
+
+    def _log_ijepa_collapse_diag(
+        self,
+        tok_masked: torch.Tensor,
+        hole: torch.Tensor,
+        valid: torch.Tensor,
+        target_ema: torch.Tensor,
+        target_online: torch.Tensor,
+        *,
+        spectrum: bool,
+        batch_size: int,
+    ) -> None:
+        """EMA-target collapse checks + visible-context / pred alignment."""
+        assert self.ijepa_loss_fn is not None
+        visible = self._gather_visible_tokens(tok_masked, hole, valid).detach().float()
+        ema = target_ema.detach().float()
+        online = target_online.detach().float()
+        ema_norm = torch.nn.functional.normalize(ema, dim=-1)
+        online_norm = torch.nn.functional.normalize(online, dim=-1)
+        pred = self.ijepa_loss_fn._predict(tok_masked, hole, valid=valid).detach().float()
+        pred_norm = torch.nn.functional.normalize(pred, dim=-1)
+        logs: dict[str, float] = {
+            "diagnostics/target_std": float(ema.std(dim=0).mean()),
+            "diagnostics/target_online_std": float(online.std(dim=0).mean()),
+            "diagnostics/context_std": float(visible.std(dim=0).mean()),
+            "diagnostics/n_hole_tokens": float(ema.shape[0]),
+            "diagnostics/cos_online_ema": float((online_norm * ema_norm).sum(-1).mean()),
+            "diagnostics/cos_pred_ema": float((pred_norm * ema_norm).sum(-1).mean()),
+        }
+        if spectrum:
+            k = int(self.hparams.rank_subsample)
+            ema_s = self._subsample_rows(ema, k).cpu().numpy()
+            _, top = embedding_batch_collapse_diag(ema_s, top_k=5)
+            for i, v in enumerate(top, start=1):
+                logs[f"diagnostics/target_eig_{i}"] = v
+        self.log_dict(logs, on_step=True, batch_size=batch_size)
 
     # -- lifecycle ---------------------------------------------------------- #
     def training_step(self, batch, batch_idx):
         views, smiles = self._split_batch(batch)
         bs = len(views)
-        log_rank = self._train_rank_due()
+        log_rank = self._rank_due()
+        log_collapse = self._collapse_diag_due()
+        z_rank = None
         if self.ssl_loss == "ntxent":
-            z_a, z_b, z_a_pooled, raw_pooled = self._encode_ntxent_views(
-                views, with_raw_pooled=log_rank,
-            )
+            z_a, z_b, z_a_pooled = self._encode_ntxent_views(views)
             loss, extras = self._compute_loss(z_a=z_a, z_b=z_b)
             fp_loss = self._fp_distillation(z_a_pooled, smiles)
             if fp_loss is not None:
@@ -437,7 +690,39 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 batch_size=bs, prog_bar=True,
             )
             if log_rank:
-                self._log_train_rank(raw_pooled)
+                z_rank = self._ntxent_global_z(views)
+        elif self.ssl_loss == "ijepa":
+            (
+                tok_masked, hole, valid, target_ema, target_online, z_pooled,
+                z_teacher_global,
+            ) = self._encode_ijepa(views)
+            terms = self.ijepa_loss_fn(
+                tok_masked, hole, target_ema, valid=valid, target_sigreg=target_online,
+            )
+            loss = terms.total
+            fp_loss = self._fp_distillation(z_pooled, smiles)
+            if fp_loss is not None:
+                self.log("train/fp", fp_loss.detach(), on_step=True, batch_size=bs)
+                loss = loss + self.fp_weight * fp_loss
+            if self.hparams.log_grad_norms and torch.is_grad_enabled():
+                self._log_grad_norms(predict=terms.predict, sigreg=terms.sigreg)
+            self.log("train/loss", loss.detach(), on_step=True, prog_bar=True, batch_size=bs)
+            self.log_dict(
+                {
+                    "train/predict": terms.predict.detach(),
+                    "train/sigreg": terms.sigreg.detach(),
+                    "train/sigreg_context": terms.sigreg_context.detach(),
+                    "train/encode_time": self.encoder.encode_time_value,
+                },
+                on_step=True, batch_size=bs,
+            )
+            if log_collapse:
+                self._log_ijepa_collapse_diag(
+                    tok_masked, hole, valid, target_ema, target_online,
+                    spectrum=True, batch_size=bs,
+                )
+            if log_rank:
+                z_rank = z_teacher_global
         else:
             with_proj = self.ssl_loss == "hybrid"
             out = self._encode_lejepa_views(views, with_projection=with_proj)
@@ -455,19 +740,52 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 batch_size=bs, prog_bar=True, view_diversity=diversity, z_all=z_all,
             )
             if log_rank:
-                self._log_train_rank(z_all)
+                z_rank = self._online_global_z(z_global)
+        if log_rank and z_rank is not None:
+            self._log_global_rank(z_rank, prefix="train", batch_size=bs, on_step=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         views, smiles = self._split_batch(batch)
+        z_rank = None
+        rank_on = int(self.hparams.train_rank_every_n_steps) > 0
         if self.ssl_loss == "ntxent":
-            z_a, z_b, z_a_pooled, _ = self._encode_ntxent_views(views)
+            z_a, z_b, z_a_pooled = self._encode_ntxent_views(views)
             loss, extras = self._compute_loss(z_a=z_a, z_b=z_b)
             self._val["acc"].append(top1_paired_accuracy(z_a, z_b))
             fp_loss = self._fp_distillation(z_a_pooled, smiles)
             if fp_loss is not None:
                 self._val["fp"].append(float(fp_loss))
                 loss = loss + self.fp_weight * fp_loss
+            if rank_on:
+                z_rank = self._ntxent_global_z(views)
+        elif self.ssl_loss == "ijepa":
+            (
+                tok_masked, hole, valid, target_ema, target_online, z_pooled,
+                z_teacher_global,
+            ) = self._encode_ijepa(views)
+            terms = self.ijepa_loss_fn(
+                tok_masked, hole, target_ema, valid=valid, target_sigreg=target_online,
+            )
+            loss = terms.total
+            fp_loss = self._fp_distillation(z_pooled, smiles)
+            if fp_loss is not None:
+                self._val["fp"].append(float(fp_loss))
+                loss = loss + self.fp_weight * fp_loss
+            extras = {"inv": None, "ntxent": None}
+            self._val["predict"].append(float(terms.predict))
+            self._val["sigreg"].append(float(terms.sigreg))
+            self._val["sigreg_context"].append(float(terms.sigreg_context))
+            gap = self.ijepa_loss_fn.condition_bypass_gap(
+                tok_masked, hole, target_ema, valid=valid,
+            )
+            self._val["cond_true"].append(gap["predict_true"])
+            self._val["cond_shuf"].append(gap["predict_shuf"])
+            self._val["cond_zero"].append(gap["predict_zero"])
+            self._val["cond_gap_zero"].append(gap["gap_zero"])
+            self._val["cond_gap_shuf"].append(gap["gap_shuf"])
+            if rank_on:
+                z_rank = z_teacher_global
         else:
             with_proj = self.ssl_loss == "hybrid"
             out = self._encode_lejepa_views(views, with_projection=with_proj)
@@ -484,12 +802,21 @@ class DiscreteFlowSSLModule(L.LightningModule):
             if fp_loss is not None:
                 self._val["fp"].append(float(fp_loss))
                 loss = loss + self.fp_weight * fp_loss
+            if rank_on:
+                z_rank = self._online_global_z(z_global)
+        if rank_on and z_rank is not None:
+            self._append_val_rank(z_rank)
         self._val["loss"].append(loss.item())
         if extras["inv"] is not None:
             self._val["inv"].append(float(extras["inv"]))
+            self._val["inv_rel"].append(float(extras["inv_rel"]))
             self._val["sigreg"].append(float(extras["sigreg"]))
         if extras["ntxent"] is not None:
             self._val["ntxent"].append(float(extras["ntxent"]))
+
+    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
+        if self.ssl_loss == "ijepa":
+            self._update_ijepa_ema()
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         """Embed the encoder skeleton config so the ckpt is self-describing.
@@ -502,6 +829,15 @@ class DiscreteFlowSSLModule(L.LightningModule):
         cfg = getattr(self.encoder, "build_config", None)
         if cfg is not None:
             checkpoint["encoder_config"] = dict(cfg)
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Backfill ``encoder_ema`` when loading a pre-EMA checkpoint."""
+        if self.encoder_ema is None:
+            return
+        state = checkpoint.get("state_dict", {})
+        if any(k.startswith("encoder_ema.") for k in state):
+            return
+        self.encoder_ema.load_state_dict(self.encoder.state_dict())
 
     def on_fit_start(self) -> None:
         trainer = getattr(self, "trainer", None)
@@ -521,7 +857,18 @@ class DiscreteFlowSSLModule(L.LightningModule):
         }
         if self._val["inv"]:
             out["val/inv"] = float(np.mean(self._val["inv"]))
+            out["val/inv_rel"] = float(np.mean(self._val["inv_rel"]))
             out["val/sigreg"] = float(np.mean(self._val["sigreg"]))
+        if self._val["predict"]:
+            out["val/predict"] = float(np.mean(self._val["predict"]))
+            out["val/sigreg"] = float(np.mean(self._val["sigreg"]))
+            out["val/sigreg_context"] = float(np.mean(self._val["sigreg_context"]))
+        if self._val["cond_true"]:
+            out["val/cond_true"] = float(np.mean(self._val["cond_true"]))
+            out["val/cond_shuf"] = float(np.mean(self._val["cond_shuf"]))
+            out["val/cond_zero"] = float(np.mean(self._val["cond_zero"]))
+            out["val/cond_gap_zero"] = float(np.mean(self._val["cond_gap_zero"]))
+            out["val/cond_gap_shuf"] = float(np.mean(self._val["cond_gap_shuf"]))
         if self._val["view_diversity"]:
             out["val/view_diversity"] = float(np.mean(self._val["view_diversity"]))
         if self._val["fp"]:
@@ -529,15 +876,34 @@ class DiscreteFlowSSLModule(L.LightningModule):
         if self._val["ntxent"]:
             out["val/ntxent"] = float(np.mean(self._val["ntxent"]))
             out["val/hybrid_alpha"] = self._hybrid_alpha()
+        if self._val["rank_effective"]:
+            out["val/rank_effective"] = float(np.mean(self._val["rank_effective"]))
+            out["val/rank_numerical"] = float(np.mean(self._val["rank_numerical"]))
         out.update(self._val_probes.maybe_run(self))
         self.log_dict(out, prog_bar=True, sync_dist=True)
+        if self._val["cond_gap_zero"]:
+            margin = float(self.hparams.condition_margin)
+            gap_z = float(np.mean(self._val["cond_gap_zero"]))
+            gap_s = float(np.mean(self._val["cond_gap_shuf"]))
+            if gap_z < margin and gap_s < margin:
+                logger.warning(
+                    "predictor may be ignoring context: "
+                    "gap_zero=%.4f gap_shuf=%.4f < margin=%.4f "
+                    "(predict_true=%.4f predict_zero=%.4f predict_shuf=%.4f)",
+                    gap_z, gap_s, margin,
+                    float(np.mean(self._val["cond_true"])),
+                    float(np.mean(self._val["cond_zero"])),
+                    float(np.mean(self._val["cond_shuf"])),
+                )
         for k in self._val:
             self._val[k].clear()
 
     def configure_optimizers(self):
         hp = self.hparams
-        # Trainable encoder params = adapter (+ encode-time parameter if learnable);
-        # the DDiT backbone is frozen. time_logit is a scalar gate — no weight decay.
+        # Trainable encoder params = adapter, the DDiT backbone (when
+        # encoder.freeze_backbone is false), and the encode-time parameter (when
+        # learnable). Whatever has requires_grad goes in. time_logit is a scalar
+        # gate — no weight decay.
         decay: list[torch.nn.Parameter] = []
         no_decay: list[torch.nn.Parameter] = []
         for name, p in self.encoder.named_parameters():
@@ -547,6 +913,10 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 no_decay.append(p)
             else:
                 decay.append(p)
+        # ijepa's flow head lives on the loss module (not the encoder); it must
+        # train too. (lejepa/ntxent loss modules have no trainable params.)
+        if self.ijepa_loss_fn is not None:
+            decay.extend(p for p in self.ijepa_loss_fn.parameters() if p.requires_grad)
         groups: list[dict] = []
         if decay:
             groups.append({"params": decay, "weight_decay": hp.weight_decay})

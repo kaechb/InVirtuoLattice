@@ -90,6 +90,8 @@ class Adapter(nn.Module):
         *,
         return_projection: bool = False,
         normalize: bool = True,
+        return_tokens: bool = False,
+        hole_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute ``z_m`` (and optionally the SimCLR projection ``z_p``).
 
@@ -100,14 +102,22 @@ class Adapter(nn.Module):
             return_projection: if True, also return the projection-head output.
             normalize: L2-normalize outputs. LeJEPA needs raw pooled latents
                 (``normalize=False``); NT-Xent uses normalized projections.
+            return_tokens: if True, return ``(z_m, x)`` where ``x`` is the
+                per-token (pre-pool, post-norm) representation ``[B, T, D]`` — for
+                position-level objectives (I-JEPA) that pool specific token spans
+                themselves. Mutually exclusive with ``return_projection`` (tokens
+                win); ``z_m`` still honors ``normalize`` but ``x`` is always raw.
 
         Returns:
             ``z_m`` ``[B, d_adapter]`` (L2-normalized when ``normalize=True``), or
-            ``(z_m, z_p)`` with ``z_p`` ``[B, proj_dim]`` (also normalized when enabled).
+            ``(z_m, z_p)`` with ``z_p`` ``[B, proj_dim]`` (also normalized when enabled),
+            or ``(z_m, x)`` when ``return_tokens``.
         """
         x = self.input_proj(hidden_states_concat)
         # nn.TransformerEncoder expects ``src_key_padding_mask`` where True = ignore.
         key_padding_mask = attention_mask <= 0
+        if hole_mask is not None:
+            key_padding_mask = key_padding_mask | hole_mask.bool()
         x = self.encoder(x, src_key_padding_mask=key_padding_mask)
         x = self.norm(x)
         # Exclude BOS (idx 0) and EOS (last real token) from pooling, per README:
@@ -120,6 +130,8 @@ class Adapter(nn.Module):
             if normalize
             else pooled
         )
+        if return_tokens:
+            return z_m, x
         if not return_projection:
             return z_m
         z_p = self.proj_head(pooled)

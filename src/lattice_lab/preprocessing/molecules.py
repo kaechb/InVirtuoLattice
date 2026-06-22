@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -203,6 +204,45 @@ def seeded_views(smiles: str, k: int) -> list[str]:
     return [Chem.CanonSmiles(smiles)] if Chem.MolFromSmiles(smiles) else []
 
 
+def fragment_view_for_smiles(smiles: str) -> str | None:
+    """One fragment view for adapter encode; canonical SMILES fallback; else None."""
+    from rdkit import Chem
+
+    try:
+        views = smiles_to_fragment_views(smiles, n_views=1)
+        if views:
+            return views[0]
+    except Exception as exc:
+        logger.debug("fragment view failed for %r: %s", smiles, exc)
+    if Chem.MolFromSmiles(smiles) is None:
+        return None
+    return Chem.CanonSmiles(smiles)
+
+
+def build_smiles_fragment_views(
+    smiles_list: Sequence[str],
+    *,
+    n_jobs: int = 1,
+) -> dict[str, str]:
+    """Map unique SMILES → one fragment view; omits unfragmentable ligands."""
+    unique = list(dict.fromkeys(smiles_list))
+    if not unique:
+        return {}
+
+    def _pair(smi: str) -> tuple[str, str | None]:
+        return smi, fragment_view_for_smiles(smi)
+
+    if n_jobs in (0, 1):
+        pairs = [_pair(s) for s in unique]
+    else:
+        from joblib import Parallel, delayed
+
+        pairs = Parallel(n_jobs=n_jobs, backend="loky")(
+            delayed(_pair)(s) for s in unique
+        )
+    return {s: v for s, v in pairs if v is not None}
+
+
 def morgan_fingerprint(smiles: str, radius: int = 2, n_bits: int = 2048) -> np.ndarray | None:
     """Morgan fingerprint as a uint8 bit vector. ``None`` for invalid SMILES."""
     mol = Chem.MolFromSmiles(smiles)
@@ -243,12 +283,22 @@ def process_smiles_record(
     return {"smiles": std, "inchikey": key, "views": views}
 
 
-def molecule_qed_molwt(smiles: str) -> tuple[float, float] | None:
-    """Return ``(QED, MolWt)`` for a SMILES string, or ``None`` if invalid."""
+def molecule_probe_props(smiles: str) -> tuple[float, float, float] | None:
+    """Return ``(QED, MolWt, logP)`` for a SMILES string, or ``None`` if invalid."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    return float(QED.qed(mol)), float(Descriptors.MolWt(mol))
+    return (
+        float(QED.qed(mol)),
+        float(Descriptors.MolWt(mol)),
+        float(Crippen.MolLogP(mol)),
+    )
+
+
+def molecule_qed_molwt(smiles: str) -> tuple[float, float] | None:
+    """Return ``(QED, MolWt)`` for a SMILES string, or ``None`` if invalid."""
+    row = molecule_probe_props(smiles)
+    return None if row is None else (row[0], row[1])
 
 
 def fragment_view_column(columns) -> str:
@@ -270,6 +320,30 @@ def fragment_view_column_for_parquet(path) -> str:
     return fragment_view_column(pq.read_schema(path).names)
 
 
+def shards_have_body_ids(shards: list) -> bool:
+    """True when the first shard was written with a ``body_ids`` column."""
+    if not shards:
+        return False
+    import pyarrow.parquet as pq
+
+    return "body_ids" in pq.read_schema(shards[0]).names
+
+
+def load_smiles_tokenizer(path: str | Path):
+    """Discrete-flow SMILES tokenizer (``PreTrainedTokenizerFast`` json)."""
+    from transformers import PreTrainedTokenizerFast
+
+    p = Path(path)
+    if p.is_file():
+        return PreTrainedTokenizerFast(tokenizer_file=str(p))
+    return PreTrainedTokenizerFast.from_pretrained(str(p))
+
+
+def tokenize_fragment_view(view: str, tokenizer) -> list[int]:
+    """Tokenize a space-separated fragment view to body ids (no special tokens)."""
+    return tokenizer.encode(view, add_special_tokens=False)
+
+
 def dedup_records(records: Iterable[dict[str, object]]) -> list[dict[str, object]]:
     """Deduplicate by ``inchikey``, keeping first occurrence; preserves order."""
     seen: set[str] = set()
@@ -285,19 +359,27 @@ def dedup_records(records: Iterable[dict[str, object]]) -> list[dict[str, object
     return out
 
 
-def flatten_views_to_rows(records: Sequence[dict[str, object]]) -> list[dict[str, object]]:
-    """Explode each record's ``views`` list into one row per (molecule, view_idx)."""
+def flatten_views_to_rows(
+    records: Sequence[dict[str, object]],
+    *,
+    tokenizer=None,
+) -> list[dict[str, object]]:
+    """Explode each record's ``views`` list into one row per (molecule, view_idx).
+
+    When ``tokenizer`` is set, also stores ``body_ids`` (pretokenized fragment view).
+    """
     rows: list[dict[str, object]] = []
     for r in records:
         views = r["views"]
         assert isinstance(views, list)
         for i, v in enumerate(views):
-            rows.append(
-                {
-                    "smiles": r["smiles"],
-                    "inchikey": r["inchikey"],
-                    "view_idx": i,
-                    "fragment_view": v,
-                }
-            )
+            row: dict[str, object] = {
+                "smiles": r["smiles"],
+                "inchikey": r["inchikey"],
+                "view_idx": i,
+                "fragment_view": v,
+            }
+            if tokenizer is not None:
+                row["body_ids"] = tokenize_fragment_view(str(v), tokenizer)
+            rows.append(row)
     return rows

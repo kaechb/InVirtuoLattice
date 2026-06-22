@@ -5,7 +5,7 @@ encoder:
   # The ckpt is self-describing (embeds encoder_config), so the hook layer range,
   # dims and d_adapter all come from training — nothing is re-specified here.
   _target_: lattice_lab.models.builders.load_encoder_from_ckpt
-  ckpt: artifacts/adapter/ntxent/checkpoints/${ssl_run_id}/last.ckpt
+  ckpt: artifacts/adapter/checkpoints/${ssl_run_id}/last.ckpt
 
 resume_from: null
 
@@ -28,9 +28,6 @@ cross_target_margin: 2.0
 # Online hard-negative mining (must match data.hard_mining_mult).
 hard_mining_mult: ${data.hard_mining_mult}
 hard_skip_frac: 0.05
-
-finetune_adapter: false
-adapter_lr: 3.0e-5
 
 bedroc_alpha: 80.5
 seed: ${seed}

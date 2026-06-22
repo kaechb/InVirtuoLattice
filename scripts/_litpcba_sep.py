@@ -16,7 +16,7 @@ np.random.seed(0)
 
 CACHE = sys.argv[1]
 LABEL = sys.argv[2]
-TEST_PARQUET = "artifacts/processed/bindingdb/test_lit_pcba.parquet"
+TEST_PARQUET = "artifacts/preprocessing/processed/bindingdb/test_lit_pcba.parquet"
 DECOY_CAP = 4000   # per target, to bound cost
 
 

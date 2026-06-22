@@ -218,6 +218,20 @@ class EBMDataModule(L.LightningDataModule):
             _record("val_bdb", self._val_bdb_pool.store)
 
         distinct = {adapter for _, adapter in sources}
+        run_ids = {
+            store.manifest.extra.get("adapter_run_id")
+            for store in (
+                self._binder_store,
+                self._decoy_pool.store if self._decoy_pool else None,
+                self._bdb_pool.store if self._bdb_pool else None,
+            )
+            if store is not None
+        } - {None}
+        if len(run_ids) > 1:
+            raise ValueError(
+                "EBM z_m stores were built for DIFFERENT adapter run ids — "
+                f"rebuild Stage-4 pools for one adapter: {sorted(run_ids)}"
+            )
         if len(distinct) > 1:
             detail = "\n".join(f"  - {label:10s} → {adapter}" for label, adapter in sources)
             raise ValueError(

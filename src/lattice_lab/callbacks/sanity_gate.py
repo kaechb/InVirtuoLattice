@@ -31,7 +31,7 @@ class SanityGateCallback(Callback):
         split_seed: int = 0,
         val_max_pairs: int | None = None,
         bioisostere_csv: str | Path = DEFAULT_BIOISOSTERE_CSV,
-        qm9_csv: str | Path | None = "artifacts/raw/qm9.csv",
+        qm9_csv: str | Path | None = "artifacts/preprocessing/raw/qm9.csv",
         qm9_n_subset: int | None = None,
         batch_size: int = 64,
         include_baselines: bool = True,

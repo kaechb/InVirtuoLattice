@@ -16,7 +16,18 @@ from lattice_lab.preprocessing.molecules import smiles_to_fragment_views
 logger = logging.getLogger(__name__)
 
 
-def _frag_worker(args: tuple[int, str, int]) -> tuple[int, str] | None:
+def encode_views_inference(
+    encoder: DiscreteFlowEncoder,
+    views: Sequence[str],
+    device: str | torch.device = "cpu",
+    **kwargs: object,
+) -> torch.Tensor:
+    """``encode_views`` under ``no_grad`` + fp16 autocast on GPU (precompute/eval default)."""
+    dev = torch.device(device)
+    with torch.no_grad(), torch.autocast(
+        device_type=dev.type, dtype=torch.float16, enabled=dev.type == "cuda"
+    ):
+        return encoder.encode_views(views, device=dev, **kwargs)
     """Pickle-friendly worker: ``(orig_idx, smiles, seed) → (orig_idx, view) | None``."""
     i, smi, seed = args
     vs = smiles_to_fragment_views(smi, n_views=1, seed=seed)
@@ -79,8 +90,52 @@ def encode_views_batched(
         )
     for start in iterator:
         batch = list(views[start : start + batch_size])
-        z = encoder.encode_views(batch, device=device, normalize=normalize)
+        z = encode_views_inference(encoder, batch, device=device, normalize=normalize)
         out.append(z.detach().cpu())
+    return torch.cat(out, dim=0)
+
+
+@torch.no_grad()
+def encode_views_sum_pooled_batched(
+    encoder: DiscreteFlowEncoder,
+    views: Sequence[str],
+    *,
+    batch_size: int = 64,
+    device: str | torch.device = "cpu",
+    desc: str | None = None,
+) -> torch.Tensor:
+    """Sum-pool adapter token reps (not mean) — diagnostic for size-sensitive probes."""
+    from lattice_lab.backbone.discrete_flow import encode_smiles, pad_batch, prepare_backbone_tokens
+
+    encoder.adapter.eval()
+    bundle = encoder.bundle
+    out: list[torch.Tensor] = []
+    iterator = range(0, len(views), batch_size)
+    if desc is not None:
+        iterator = tqdm(
+            iterator,
+            desc=desc,
+            total=(len(views) + batch_size - 1) // batch_size,
+            dynamic_ncols=True,
+            leave=False,
+        )
+    for start in iterator:
+        batch = list(views[start : start + batch_size])
+        seqs = [encode_smiles(bundle, v) for v in batch]
+        ids, mask = pad_batch(seqs, pad_id=bundle.pad_id)
+        dev = torch.device(device)
+        ids = ids.to(dev)
+        mask = mask.to(dev)
+        _, attn = prepare_backbone_tokens(
+            ids, mask,
+            bos_id=bundle.bos_id, eos_id=bundle.eos_id, pad_id=bundle.pad_id,
+        )
+        with torch.autocast(
+            device_type=dev.type, dtype=torch.float16, enabled=dev.type == "cuda"
+        ):
+            _, tok = encoder.encode_token_ids(ids, mask, normalize=False, return_tokens=True)
+        m = attn.unsqueeze(-1).to(tok.dtype)
+        out.append((tok * m).sum(dim=1).detach().cpu())
     return torch.cat(out, dim=0)
 
 

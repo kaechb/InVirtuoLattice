@@ -13,7 +13,7 @@
 # Stage 7 — ensemble virtual screening on a compound library.
 #
 # Reads the variant-namespaced Stage-5 checkpoints
-#   artifacts/energy/<variant>/<run_id>/last.ckpt
+#   artifacts/energy/checkpoints/<run_id>/last.ckpt
 #
 # Pick the variant + edit the per-seed run ids and the library paths, then:
 #   VARIANT=lejepa sbatch scripts/slurm/stage7_predict_ensemble.sh
@@ -30,9 +30,9 @@ case "${VARIANT}" in
   ntxent) RUN_ID0=gi2762bi; RUN_ID1=uqcvdwg9; RUN_ID2=fn93bboy ;;
   *) echo "unknown VARIANT='${VARIANT}' (use lejepa|ntxent)" >&2; exit 1 ;;
 esac
-TARGET_FASTA=artifacts/raw/targets/thrb.fasta
+TARGET_FASTA=artifacts/preprocessing/raw/targets/thrb.fasta
 TARGET_NAME=THRB
-SMILES_FILE=artifacts/raw/libraries/example_library.csv
+SMILES_FILE=artifacts/preprocessing/raw/libraries/example_library.csv
 OUTPUT_CSV=artifacts/predictions/thrb_predictions.csv
 
 lattice_load_gpu_modules
@@ -42,9 +42,9 @@ lattice_require_gpu
 # The EBM checkpoints carry the full model (frozen adapter + energy head), so the
 # adapter is read straight from the first head ckpt — no separate Stage-2 adapter
 # to keep in sync.
-CKPT0="${REPO}/artifacts/energy/${VARIANT}/${RUN_ID0}/last.ckpt"
-CKPT1="${REPO}/artifacts/energy/${VARIANT}/${RUN_ID1}/last.ckpt"
-CKPT2="${REPO}/artifacts/energy/${VARIANT}/${RUN_ID2}/last.ckpt"
+CKPT0="${REPO}/artifacts/energy/checkpoints/${RUN_ID0}/last.ckpt"
+CKPT1="${REPO}/artifacts/energy/checkpoints/${RUN_ID1}/last.ckpt"
+CKPT2="${REPO}/artifacts/energy/checkpoints/${RUN_ID2}/last.ckpt"
 
 lattice_require_file "${CKPT0}" "edit the ${VARIANT} seed-0 run id in scripts/slurm/stage7_predict_ensemble.sh"
 lattice_require_file "${CKPT1}" "edit the ${VARIANT} seed-1 run id in scripts/slurm/stage7_predict_ensemble.sh"
@@ -56,9 +56,9 @@ mkdir -p "$(dirname "${REPO}/${OUTPUT_CSV}")"
 
 srun python -m lattice_lab.inference.predict_ensemble \
   --head-ckpts \
-    "artifacts/energy/${VARIANT}/${RUN_ID0}/last.ckpt" \
-    "artifacts/energy/${VARIANT}/${RUN_ID1}/last.ckpt" \
-    "artifacts/energy/${VARIANT}/${RUN_ID2}/last.ckpt" \
+    "artifacts/energy/checkpoints/${RUN_ID0}/last.ckpt" \
+    "artifacts/energy/checkpoints/${RUN_ID1}/last.ckpt" \
+    "artifacts/energy/checkpoints/${RUN_ID2}/last.ckpt" \
   --target-fasta "${TARGET_FASTA}" \
   --target-name "${TARGET_NAME}" \
   --smiles-file "${SMILES_FILE}" \

@@ -13,6 +13,7 @@ controlled uncertainty (≈ single-view spread / sqrt(K)).
 """
 from __future__ import annotations
 import argparse
+import shutil
 import numpy as np, pandas as pd, torch
 from pathlib import Path
 from rdkit import RDLogger
@@ -21,7 +22,7 @@ from lattice_lab.eval.lit_pcba import (
     _build_encoder,
     enforce_cache_adapter,
 )
-from lattice_lab.models.builders import adapter_fingerprint
+from lattice_lab.models.builders import adapter_fingerprint, adapter_run_id, eval_zm_cache_path
 # NOTE: seeded_views lives in the torch-free `molecules` module on purpose — loky
 # workers pickle it by reference and import only that module, so they don't
 # cold-import torch (which dominated multi-view cache build time on Lustre).
@@ -30,20 +31,55 @@ from lattice_lab.protein.store import EmbeddingStore
 RDLogger.DisableLog("rdApp.*")
 
 
+def _clear_store(store_path: Path) -> None:
+    """Delete an existing store so ``create`` rebuilds it from scratch."""
+    removed = False
+    for name in (EmbeddingStore.MANIFEST, EmbeddingStore.PIDS, EmbeddingStore.MEAN):
+        f = store_path / name
+        if f.exists():
+            f.unlink()
+            removed = True
+    perres = store_path / EmbeddingStore.PERRES_DIR
+    if perres.is_dir():
+        shutil.rmtree(perres)
+        removed = True
+    if removed:
+        print(f"cleared existing cache at {store_path}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-views", type=int, default=8)
-    ap.add_argument("--zm-cache", type=Path, required=True)
-    ap.add_argument("--test-parquet", type=Path, default=Path("artifacts/processed/bindingdb/test_lit_pcba.parquet"))
+    ap.add_argument("--zm-cache", type=Path, default=None,
+                    help="default: artifacts/evaluation/<adapter_run_id>/lit_pcba_zm_mv<N>")
+    ap.add_argument("--test-parquet", type=Path, default=Path("artifacts/preprocessing/processed/bindingdb/test_lit_pcba.parquet"))
     ap.add_argument("--adapter-ckpt", type=Path, required=True,
                     help="Stage-2 adapter .ckpt / run dir, OR a trained EBM .ckpt "
                          "(the adapter is extracted from it). Use the EBM ckpt so the "
                          "cache matches the heads that will score it.")
+    ap.add_argument("--adapter-run-id", default=None,
+                    help="Stage-2 W&B run id for the default zm-cache path when "
+                         "--adapter-ckpt is an EBM checkpoint")
     ap.add_argument("--protein-store", type=Path, default=Path("artifacts/protein_store/embeddings/esm2_650M"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--n-jobs", type=int, default=32)
+    ap.add_argument("--limit-targets", type=int, default=-1,
+                    help="encode only ligands for the first N protein-store targets (smoke)")
     a = ap.parse_args()
+    a.limit_targets = None if a.limit_targets < 0 else a.limit_targets
+    if a.zm_cache is None:
+        rid = a.adapter_run_id
+        if rid is None:
+            try:
+                rid = adapter_run_id(a.adapter_ckpt)
+            except ValueError as e:
+                raise SystemExit(
+                    f"{e} — pass --adapter-run-id (Stage-2 W&B run id) or --zm-cache"
+                ) from e
+        a.zm_cache = eval_zm_cache_path(rid, f"lit_pcba_zm_mv{a.n_views}")
+
+    _clear_store(a.zm_cache)
 
     from joblib import Parallel, delayed
     from tqdm.auto import tqdm
@@ -57,6 +93,10 @@ def main():
     print(f"opening protein store {a.protein_store} ...", flush=True)
     ps = EmbeddingStore.open(a.protein_store, mode="r")
     present = df["target_name"].astype(str).isin(ps.pid_to_row)
+    if a.limit_targets is not None:
+        kept = sorted(df.loc[present, "target_name"].astype(str).unique())[: a.limit_targets]
+        present = df["target_name"].astype(str).isin(kept)
+        print(f"limit-targets={a.limit_targets} → {len(kept)} targets", flush=True)
     # Dedupe identical SMILES strings first: MolToInchiKey (InChI gen) is slow,
     # and LIT-PCBA repeats the same ligand across many rows. This collapses only
     # byte-identical strings, so distinct molecules are never merged here.
@@ -95,10 +135,12 @@ def main():
 
     # --- Phase 3: batched GPU encode + per-ligand average ---
     enc = _build_encoder(adapter_ckpt=a.adapter_ckpt, device=a.device)
-    store = EmbeddingStore.create(a.zm_cache, embedding_dim=512,
+    d_adapter = int(enc.adapter.d_adapter)
+    store = EmbeddingStore.create(a.zm_cache, embedding_dim=d_adapter,
         model_name=f"lattice-adapter-mv{a.n_views}", dtype="float16", per_residue=False,
         extra={"source": str(a.test_parquet), "n_views": str(a.n_views),
                "adapter_ckpt": str(a.adapter_ckpt),
+               "adapter_run_id": str(a.zm_cache.parent.name),
                ADAPTER_FP_KEY: adapter_fingerprint(a.adapter_ckpt)})
     # Reject (or backfill) a reused cache that was built by a different adapter.
     enforce_cache_adapter(store, a.adapter_ckpt)

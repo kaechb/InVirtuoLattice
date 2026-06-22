@@ -1,10 +1,11 @@
 """SSL losses for paired molecule views.
 
 * **NT-Xent** — SimCLR-style contrastive loss (default).
-* **LeJEPA** — invariance (views match their batch mean) + SIGReg isotropy
-  regularizer: ``(1 - eff_lambda) * inv + eff_lambda * sigreg`` where
-  ``eff_lambda = lambda / batch_size`` (see ``galilai-group/lejepa`` and
-  ``LeJEPALoss``'s docstring for why).
+* **LeJEPA** — invariance loss + SIGReg isotropy regularizer:
+  ``L = (1 - lambda) * L_inv + lambda * L_sigreg`` (convex combination, see
+  ``galilai-group/lejepa`` and ``LeJEPALoss``'s docstring). Every view of a
+  molecule (intact shuffles + masked) is pulled directly toward that molecule's
+  intact center (no predictor); SIGReg keeps the target batch isotropic.
 """
 
 from __future__ import annotations
@@ -100,26 +101,48 @@ class SIGReg(nn.Module):
 class LeJEPALossTerms:
     """``inv``/``sigreg`` are the raw (unweighted) sub-losses, graph attached
     (not detached) so callers can take per-term gradients for diagnostics;
-    detach before logging as a scalar."""
+    detach before logging as a scalar.
+
+    ``inv_rel`` is a detached diagnostic: the invariance MSE divided by the
+    between-molecule variance of the per-molecule centers. ~1 means a molecule's
+    views are spread as widely as molecules are from each other (collapse /
+    uninformative); «1 means views of a molecule cluster much tighter than the
+    batch spreads (discriminative). The raw ``inv`` MSE is on unnormalized
+    latents, so its absolute value is uninterpretable on its own — this ratio is
+    what tells you whether the representation is actually discriminative."""
 
     total: torch.Tensor
     inv: torch.Tensor
     sigreg: torch.Tensor
+    inv_rel: torch.Tensor
 
 
 class LeJEPALoss(nn.Module):
-    """LeJEPA loss with separate global and local (masked) views.
+    """Minimal LeJEPA loss: invariance term + SIGReg isotropy regularizer.
 
-    Invariance pulls every view in ``z_all`` toward the mean of **global**
-    views only (``z_global``). SIGReg runs on all views. Latents should be
-    **unnormalized** pooled adapter outputs.
+    ``L = (1 - lambda) * L_inv + lambda * L_sigreg``
+
+    A convex combination, so ``lejepa_lambda in [0, 1]`` is a genuine *relative*
+    trade-off between the two terms.
+
+    * **Invariance**: every view of a molecule (intact fragment-shuffles +
+      masked-fragment views) is pulled toward that molecule's center — the mean
+      of its *intact* (target) views: ``mean ||z_all - center||^2``. No
+      predictor: the views are aligned directly. A predictor only earns its keep
+      when context↔target are information-asymmetric *and* paired with a
+      stop-grad/EMA target (I-JEPA); here the same encoder produces symmetric
+      views, so direct alignment is the honest objective and SIGReg is what
+      prevents collapse.
+    * **SIGReg**: runs on the batch of intact (target) embeddings only,
+      forcing the chemical map toward an isotropic Gaussian.
+
+    Latents should be **unnormalized** pooled adapter outputs.
 
     SIGReg's ``* proj.size(-2)`` (the formal Epps-Pulley statistic's batch-size
-    scaling) makes its gradient grow roughly linearly with batch size, unlike
-    ``inv``'s plain ``.mean()`` -- measured ~10000x raw gradient-norm gap at
-    batch_size=128. To keep ``lejepa_lambda`` meaningful across batch sizes
-    without altering SIGReg itself, it's divided by batch size at combination
-    time (``effective_lambda = lejepa_lambda / batch_size``).
+    scaling) makes the raw statistic grow ~linearly with batch size, unlike the
+    invariance MSE's plain ``.mean()``. We divide that ``B`` back out here so the
+    SIGReg term is ``O(1)`` and ``lambda`` is a clean, batch-size-independent
+    relative weight (rather than the old trick of dividing ``lambda`` by ``B``).
     """
 
     def __init__(
@@ -149,8 +172,8 @@ class LeJEPALoss(nn.Module):
     ) -> LeJEPALossTerms:
         """Compute LeJEPA loss.
 
-        ``z_global``: ``[B, Vg, D]`` global (fragment-shuffle) views.
-        ``z_all``: ``[B, Vg+Vl, D]`` global + local (masked-fragment) views.
+        ``z_global``: ``[B, Vg, D]`` intact (fragment-shuffle) target views.
+        ``z_all``: ``[B, Vg+Vl, D]`` all views (intact + masked-fragment).
         """
         if z_global.dim() != 3 or z_all.dim() != 3:
             raise ValueError(
@@ -160,16 +183,299 @@ class LeJEPALoss(nn.Module):
         if z_global.size(0) != z_all.size(0) or z_global.size(2) != z_all.size(2):
             raise ValueError("z_global and z_all batch/dim mismatch")
         if z_global.size(1) < 1:
-            raise ValueError("LeJEPALoss needs at least one global view")
-        centers = z_global.mean(dim=1, keepdim=True)
-        inv = (centers - z_all).square().mean()
-        sigreg = self.sigreg(z_all.transpose(0, 1))
-        # SIGReg's statistic scales ~linearly with batch size (it's the literal
-        # N-scaled Epps-Pulley statistic); divide lambda by batch size so it
-        # keeps a stable, batch-size-independent meaning. See class docstring.
-        effective_lambda = self.lejepa_lambda / z_global.size(0)
-        total = (1.0 - effective_lambda) * inv + effective_lambda * sigreg
-        return LeJEPALossTerms(total=total, inv=inv, sigreg=sigreg)
+            raise ValueError("LeJEPALoss needs >= 1 global (target) view")
+        center = z_global.mean(dim=1, keepdim=True)             # [B, 1, D]
+        inv = (z_all - center).square().mean()
+        # Per-sample SIGReg: the raw statistic carries an explicit *B factor
+        # (Epps-Pulley N-scaling); divide it back out so the term is O(1) and
+        # lambda is a clean relative weight. See class docstring.
+        sigreg = self.sigreg(z_global.transpose(0, 1)) / z_global.size(0)  # [Vg, B, D]
+        lam = self.lejepa_lambda
+        total = (1.0 - lam) * inv + lam * sigreg
+        # Diagnostic: invariance MSE relative to the between-molecule spread of
+        # the per-molecule centers. See LeJEPALossTerms.
+        with torch.no_grad():
+            c = center.squeeze(1)                                # [B, D]
+            baseline = (c - c.mean(dim=0, keepdim=True)).square().mean()
+            inv_rel = inv.detach() / baseline.clamp_min(1e-12)
+        return LeJEPALossTerms(total=total, inv=inv, sigreg=sigreg, inv_rel=inv_rel)
+
+
+@dataclass
+class IJEPALossTerms:
+    """``predict``/``sigreg``/``sigreg_context`` are the raw (unweighted) sub-losses,
+    graph attached. ``predict`` is visible+mask-token predictor → target cosine regression;
+    ``sigreg`` regularizes intact hole targets; ``sigreg_context`` anti-collapses
+    visible (non-hole) adapter reps."""
+
+    total: torch.Tensor
+    predict: torch.Tensor
+    sigreg: torch.Tensor
+    sigreg_context: torch.Tensor
+
+
+class _IJEPAPredictor(nn.Module):
+    """I-JEPA-style predictor: visible encoder reps + learnable mask tokens (pos embed).
+
+    Kept intentionally small (default 1 layer) so semantics stay in the encoder.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        max_positions: int = 512,
+        n_layers: int = 1,
+        n_heads: int = 2,
+        ff_mult: int = 2,
+    ) -> None:
+        super().__init__()
+        self.mask_token = nn.Parameter(torch.randn(1, dim) * 0.02)
+        self.pos_embed = nn.Embedding(int(max_positions), dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=n_heads,
+            dim_feedforward=dim * int(ff_mult),
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=int(n_layers))
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(
+        self,
+        tok: torch.Tensor,
+        hole: torch.Tensor,
+        *,
+        valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``tok`` ``[B,T,D]``, ``hole`` ``[B,T]`` → hole predictions ``[N,D]``."""
+        if tok.dim() != 3 or hole.shape != tok.shape[:2]:
+            raise ValueError(
+                f"predictor expects tok [B,T,D] and hole [B,T]; "
+                f"got {tuple(tok.shape)} vs {tuple(hole.shape)}"
+            )
+        b, _, dim = tok.shape
+        if valid is None:
+            valid = torch.ones(b, hole.size(1), dtype=torch.bool, device=tok.device)
+        visible = valid & ~hole
+
+        ctx_parts: list[torch.Tensor] = []
+        query_parts: list[torch.Tensor] = []
+        seq_lens: list[int] = []
+        for i in range(b):
+            hole_idx = hole[i].nonzero(as_tuple=True)[0]
+            if hole_idx.numel() == 0:
+                continue
+            vis_idx = visible[i].nonzero(as_tuple=True)[0]
+            max_pos = max(int(hole_idx.max()), int(vis_idx.max()) if vis_idx.numel() else 0)
+            if max_pos >= self.pos_embed.num_embeddings:
+                raise ValueError(
+                    f"token position {max_pos} >= max_positions "
+                    f"{self.pos_embed.num_embeddings}"
+                )
+            # Visible reps carry their position (same table as the mask-token
+            # queries) so the predictor reasons about where each visible token sits
+            # relative to the holes, instead of pooling a positionless bag.
+            ctx_parts.append(tok[i, vis_idx] + self.pos_embed(vis_idx))
+            query_parts.append(
+                self.mask_token.expand(hole_idx.numel(), dim) + self.pos_embed(hole_idx)
+            )
+            seq_lens.append(int(vis_idx.numel() + hole_idx.numel()))
+        if not ctx_parts:
+            return tok.new_zeros(0, dim)
+
+        max_len = max(seq_lens)
+        n_seq = len(ctx_parts)
+        seq = tok.new_zeros(n_seq, max_len, dim)
+        pad = torch.ones(n_seq, max_len, dtype=torch.bool, device=tok.device)
+        for j, (ctx, queries) in enumerate(zip(ctx_parts, query_parts)):
+            n = ctx.size(0) + queries.size(0)
+            seq[j, : ctx.size(0)] = ctx
+            seq[j, ctx.size(0) : n] = queries
+            pad[j, :n] = False
+        out = self.norm(self.transformer(seq, src_key_padding_mask=pad))
+        preds: list[torch.Tensor] = []
+        for j, (ctx, queries) in enumerate(zip(ctx_parts, query_parts)):
+            n_vis = ctx.size(0)
+            preds.append(out[j, n_vis : n_vis + queries.size(0)])
+        return torch.cat(preds, dim=0)
+
+
+def _visible_token_rows(tok: torch.Tensor, hole: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Stack visible (non-hole) adapter reps: ``[B,T,D]`` → ``[N_vis,D]``."""
+    return tok[(valid & ~hole).bool()]
+
+
+def _zero_visible_tokens(
+    tok: torch.Tensor, hole: torch.Tensor, valid: torch.Tensor
+) -> torch.Tensor:
+    out = tok.clone()
+    out[(valid & ~hole).bool()] = 0.0
+    return out
+
+
+def _shuffle_visible_tokens(
+    tok: torch.Tensor, hole: torch.Tensor, valid: torch.Tensor
+) -> torch.Tensor:
+    out = tok.clone()
+    for i in range(tok.size(0)):
+        vis = (valid[i] & ~hole[i]).nonzero(as_tuple=True)[0]
+        if vis.numel() > 1:
+            out[i, vis] = out[i, vis[torch.randperm(vis.numel(), device=tok.device)]]
+    return out
+
+
+class IJEPALoss(nn.Module):
+    """Per-token I-JEPA: visible reps + mask-token predictor → intact EMA targets.
+
+    ``L = (1 - lambda) * L_predict + lambda * L_sigreg [+ context_sigreg_lambda * L_ctx]``
+
+    One encoder pass on the masked sequence; **visible** adapter outputs (not ``<UNK>``
+    rows) feed the predictor together with learnable mask tokens carrying hole position
+    embeddings. Optional ``ijepa_block_hole_attn`` blocks hole keys in DDiT + adapter so
+    visible reps are context-only. ``target`` is the EMA encoder on the intact sequence
+    at the same indices.
+
+    Embeddings are **unnormalized** adapter token outputs (not mean-pooled).
+    """
+
+    def __init__(
+        self,
+        *,
+        dim: int,
+        lejepa_lambda: float = 0.05,
+        context_sigreg_lambda: float = 0.0,
+        sigreg_num_projections: int = 256,
+        sigreg_knots: int = 17,
+        sigreg_t_max: float = 3.0,
+        sigreg_eps: float = 1e-8,
+        ijepa_max_positions: int = 512,
+        ijepa_predictor_layers: int = 1,
+        ijepa_predictor_heads: int = 2,
+        ijepa_predictor_ff_mult: int = 2,
+    ) -> None:
+        super().__init__()
+        if not (0.0 <= lejepa_lambda <= 1.0):
+            raise ValueError(f"lejepa_lambda must be in [0, 1], got {lejepa_lambda}")
+        if context_sigreg_lambda < 0.0:
+            raise ValueError(
+                f"context_sigreg_lambda must be >= 0, got {context_sigreg_lambda}"
+            )
+        self.lejepa_lambda = float(lejepa_lambda)
+        self.context_sigreg_lambda = float(context_sigreg_lambda)
+        self.predictor = _IJEPAPredictor(
+            dim,
+            max_positions=int(ijepa_max_positions),
+            n_layers=int(ijepa_predictor_layers),
+            n_heads=int(ijepa_predictor_heads),
+            ff_mult=int(ijepa_predictor_ff_mult),
+        )
+        self.sigreg = SIGReg(
+            num_projections=sigreg_num_projections,
+            knots=sigreg_knots,
+            t_max=sigreg_t_max,
+            eps=sigreg_eps,
+        )
+
+    def _predict(
+        self,
+        tok: torch.Tensor,
+        hole: torch.Tensor,
+        *,
+        valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if valid is None:
+            valid = torch.ones_like(hole, dtype=torch.bool)
+        return self.predictor(tok, hole, valid=valid)
+
+    def predict_loss(
+        self,
+        tok: torch.Tensor,
+        hole: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Cosine regression: ``1 - cos(predictor(visible, mask_tok), stopgrad(target))``."""
+        pred = self._predict(tok, hole, valid=valid)
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"predict/target shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}"
+            )
+        return (
+            1.0 - torch.nn.functional.cosine_similarity(pred, target.detach(), dim=-1)
+        ).mean()
+
+    @torch.no_grad()
+    def condition_bypass_gap(
+        self,
+        tok: torch.Tensor,
+        hole: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        valid: torch.Tensor | None = None,
+    ) -> dict[str, float]:
+        """Does the predictor use visible context, or ignore it?"""
+        if valid is None:
+            valid = torch.ones_like(hole, dtype=torch.bool)
+        was_training = self.training
+        self.eval()
+
+        def _loss(t: torch.Tensor) -> torch.Tensor:
+            return self.predict_loss(t, hole, target, valid=valid)
+
+        l_true = _loss(tok)
+        l_zero = _loss(_zero_visible_tokens(tok, hole, valid))
+        l_shuf = _loss(_shuffle_visible_tokens(tok, hole, valid))
+        if was_training:
+            self.train()
+        return {
+            "predict_true": float(l_true),
+            "predict_shuf": float(l_shuf),
+            "predict_zero": float(l_zero),
+            "gap_zero": float(l_zero - l_true),
+            "gap_shuf": float(l_shuf - l_true),
+        }
+
+    def forward(
+        self,
+        tok: torch.Tensor,
+        hole: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        valid: torch.Tensor | None = None,
+        target_sigreg: torch.Tensor | None = None,
+    ) -> IJEPALossTerms:
+        """``tok`` ``[B,T,D]`` masked-view reps; ``hole`` ``[B,T]``; ``target`` ``[N,D]``."""
+        if tok.dim() != 3 or hole.dim() != 2:
+            raise ValueError(
+                f"IJEPALoss expects tok [B,T,D] and hole [B,T]; "
+                f"got {tuple(tok.shape)} hole={tuple(hole.shape)}"
+            )
+        if target.dim() != 2:
+            raise ValueError(f"IJEPALoss expects target [N,D], got {tuple(target.shape)}")
+        if valid is None:
+            valid = torch.ones_like(hole, dtype=torch.bool)
+        if hole.sum() < 1:
+            raise ValueError("IJEPALoss needs >= 1 hole token")
+        predict = self.predict_loss(tok, hole, target, valid=valid)
+        sig = target_sigreg if target_sigreg is not None else target.detach()
+        sigreg = self.sigreg(sig.unsqueeze(0)) / sig.size(0)
+        visible = _visible_token_rows(tok, hole, valid)
+        if visible.size(0) < 1:
+            sigreg_context = tok.new_zeros(())
+        else:
+            sigreg_context = self.sigreg(visible.unsqueeze(0)) / visible.size(0)
+        lam = self.lejepa_lambda
+        total = (
+            (1.0 - lam) * predict + lam * sigreg + self.context_sigreg_lambda * sigreg_context
+        )
+        return IJEPALossTerms(
+            total=total, predict=predict, sigreg=sigreg, sigreg_context=sigreg_context
+        )
 
 
 class _FingerprintCache:

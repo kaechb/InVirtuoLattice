@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage 0 — fetch the DUD-E benchmark into artifacts/raw/dude/.
+# Stage 0 — fetch the DUD-E benchmark into artifacts/preprocessing/raw/dude/.
 #
 # DUD-E (Mysinger et al., J. Med. Chem. 2012) is a 102-target virtual-screening
 # benchmark: experimentally-confirmed actives plus property-matched, topologically
@@ -26,7 +26,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DEST="${REPO}/artifacts/raw/dude"
+DEST="${REPO}/artifacts/preprocessing/raw/dude"
 BASE_URL="${DUDE_BASE_URL:-http://dude.docking.org/targets}"
 
 # Canonical 102-target DUD-E set (the same names DrugCLIP reports).

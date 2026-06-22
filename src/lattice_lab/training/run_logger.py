@@ -34,6 +34,45 @@ def _code_log_root() -> str:
     return "."
 
 
+def log_wandb_code(
+    loggers: list[Any] | None = None,
+    *,
+    root: str | Path = ".",
+) -> bool:
+    """Snapshot Python sources under ``root`` to the active W&B run(s).
+
+    Works with Lightning ``WandbLogger`` instances (``train.py``) or the global
+    ``wandb.run`` after ``wandb.init`` (``RunLogger`` / precompute CLIs).
+    """
+    root = str(root)
+    logged = False
+    if loggers:
+        from lightning.pytorch.loggers import WandbLogger as _WandbLogger
+
+        for lg in loggers:
+            if not isinstance(lg, _WandbLogger):
+                continue
+            exp = lg.experiment
+            log_code = getattr(exp, "log_code", None) if exp is not None else None
+            if callable(log_code):
+                log_code(root)
+                logged = True
+                logger.info(
+                    "wandb code logged from %s (run %s)",
+                    root,
+                    getattr(exp, "id", "?"),
+                )
+    elif _WANDB_AVAILABLE and _wandb.run is not None:
+        log_code = getattr(_wandb.run, "log_code", None)
+        if callable(log_code):
+            log_code(root)
+            logged = True
+            logger.info("wandb code logged from %s", root)
+    if not logged:
+        logger.debug("wandb code logging skipped (no active W&B run)")
+    return logged
+
+
 class RunLogger:
     """Bundles wandb logging with optional tqdm postfix updates.
 
@@ -63,16 +102,8 @@ class RunLogger:
             reinit=True,
         )
         self.enabled = True
-        code_root = _code_log_root()
-        log_code = getattr(self.run, "log_code", None)
-        if callable(log_code):
-            log_code(code_root)
-            logger.info("wandb run: %s (logged code from %s)", self.run.url, code_root)
-        else:
-            logger.warning(
-                "wandb %s has no run.log_code; upgrade wandb to log source snapshots",
-                getattr(_wandb, "__version__", "unknown"),
-            )
+        log_wandb_code(root=_code_log_root())
+        if self.run is not None:
             logger.info("wandb run: %s", self.run.url)
 
     @property

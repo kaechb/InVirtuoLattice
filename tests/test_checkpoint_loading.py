@@ -14,9 +14,11 @@ import pytest
 import torch
 
 from lattice_lab.models.builders import (
+    adapter_run_id,
     parse_adapter_state,
     parse_head_checkpoint,
     resolve_adapter_ckpt,
+    zm_store_path,
 )
 
 
@@ -56,6 +58,15 @@ def test_resolve_adapter_ckpt_from_run_dir(tmp_path: Path) -> None:
     _full_ckpt(run_dir, name="last.ckpt")
     resolved = resolve_adapter_ckpt(run_dir)
     assert resolved.name == "last.ckpt"
+
+
+def test_adapter_run_id_and_zm_store_path(tmp_path: Path) -> None:
+    run_dir = tmp_path / "xt4v2kk8"
+    run_dir.mkdir()
+    ckpt = _full_ckpt(run_dir, name="last.ckpt")
+    assert adapter_run_id(ckpt) == "xt4v2kk8"
+    assert zm_store_path(ckpt, "decoy_zm") == Path("artifacts/decoys/xt4v2kk8/decoy_zm")
+    assert zm_store_path(ckpt, "binder_zm") == Path("artifacts/binders/xt4v2kk8/binder_zm")
 
 
 def test_parse_adapter_state_rejects_no_adapter() -> None:
