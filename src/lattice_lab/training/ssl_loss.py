@@ -243,15 +243,14 @@ class LeJEPALoss(nn.Module):
 
 @dataclass
 class IJEPALossTerms:
-    """``predict``/``sigreg``/``sigreg_context`` are the raw (unweighted) sub-losses,
-    graph attached. ``predict`` is visible+mask-token predictor → target cosine regression;
-    ``sigreg`` regularizes intact hole targets; ``sigreg_context`` anti-collapses
-    visible (non-hole) adapter reps."""
+    """``predict``/``sigreg`` are the raw (unweighted) sub-losses, graph attached.
+    ``predict`` is visible+mask-token predictor → target cosine regression;
+    ``sigreg`` is the anti-collapse regularizer (SIGReg or VICReg) on the
+    **mean-pooled** intact ``z_m`` batch — the level at which collapse is observed."""
 
     total: torch.Tensor
     predict: torch.Tensor
     sigreg: torch.Tensor
-    sigreg_context: torch.Tensor
 
 
 class _IJEPAPredictor(nn.Module):
@@ -344,11 +343,6 @@ class _IJEPAPredictor(nn.Module):
         return torch.cat(preds, dim=0)
 
 
-def _visible_token_rows(tok: torch.Tensor, hole: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """Stack visible (non-hole) adapter reps: ``[B,T,D]`` → ``[N_vis,D]``."""
-    return tok[(valid & ~hole).bool()]
-
-
 def _zero_visible_tokens(
     tok: torch.Tensor, hole: torch.Tensor, valid: torch.Tensor
 ) -> torch.Tensor:
@@ -371,7 +365,7 @@ def _shuffle_visible_tokens(
 class IJEPALoss(nn.Module):
     """Per-token I-JEPA: visible reps + mask-token predictor → intact EMA targets.
 
-    ``L = (1 - lambda) * L_predict + lambda * L_sigreg [+ context_sigreg_lambda * L_ctx]``
+    ``L = (1 - lambda) * L_predict + lambda * L_reg``
 
     One encoder pass on the masked sequence; **visible** adapter outputs (not ``<UNK>``
     rows) feed the predictor together with learnable mask tokens carrying hole position
@@ -379,7 +373,11 @@ class IJEPALoss(nn.Module):
     visible reps are context-only. ``target`` is the EMA encoder on the intact sequence
     at the same indices.
 
-    Embeddings are **unnormalized** adapter token outputs (not mean-pooled).
+    ``L_predict`` is the per-token prediction cosine (unnormalized adapter token
+    outputs). ``L_reg`` is the anti-collapse regularizer (SIGReg or VICReg), applied
+    to the **mean-pooled** intact ``z_m`` batch ``[B, D]`` — the level at which the
+    pooled-representation rank actually collapses (token-level isotropy does not
+    constrain the per-molecule mean).
     """
 
     def __init__(
@@ -387,13 +385,12 @@ class IJEPALoss(nn.Module):
         *,
         dim: int,
         lejepa_lambda: float = 0.05,
-        context_sigreg_lambda: float = 0.0,
         sigreg_num_projections: int = 256,
         sigreg_knots: int = 17,
         sigreg_t_max: float = 3.0,
         sigreg_eps: float = 1e-8,
         # When true, VICReg (variance hinge + covariance penalty) replaces SIGReg
-        # as the anti-collapse regularizer on the target/context rows.
+        # as the pooled-z_m anti-collapse regularizer.
         use_vicreg: bool = False,
         vicreg_gamma: float = 1.0,
         vicreg_cov_coeff: float = 1.0,
@@ -405,12 +402,7 @@ class IJEPALoss(nn.Module):
         super().__init__()
         if not (0.0 <= lejepa_lambda <= 1.0):
             raise ValueError(f"lejepa_lambda must be in [0, 1], got {lejepa_lambda}")
-        if context_sigreg_lambda < 0.0:
-            raise ValueError(
-                f"context_sigreg_lambda must be >= 0, got {context_sigreg_lambda}"
-            )
         self.lejepa_lambda = float(lejepa_lambda)
-        self.context_sigreg_lambda = float(context_sigreg_lambda)
         self.predictor = _IJEPAPredictor(
             dim,
             max_positions=int(ijepa_max_positions),
@@ -508,11 +500,13 @@ class IJEPALoss(nn.Module):
         tok: torch.Tensor,
         hole: torch.Tensor,
         target: torch.Tensor,
+        z_pooled: torch.Tensor,
         *,
         valid: torch.Tensor | None = None,
-        target_sigreg: torch.Tensor | None = None,
     ) -> IJEPALossTerms:
-        """``tok`` ``[B,T,D]`` masked-view reps; ``hole`` ``[B,T]``; ``target`` ``[N,D]``."""
+        """``tok`` ``[B,T,D]`` masked-view reps; ``hole`` ``[B,T]``; ``target`` ``[N,D]``;
+        ``z_pooled`` ``[B_mol,D]`` online intact mean-pooled latents (graph-attached)
+        — the anti-collapse regularizer acts on this batch, not on token rows."""
         if tok.dim() != 3 or hole.dim() != 2:
             raise ValueError(
                 f"IJEPALoss expects tok [B,T,D] and hole [B,T]; "
@@ -520,25 +514,17 @@ class IJEPALoss(nn.Module):
             )
         if target.dim() != 2:
             raise ValueError(f"IJEPALoss expects target [N,D], got {tuple(target.shape)}")
+        if z_pooled.dim() != 2:
+            raise ValueError(f"IJEPALoss expects z_pooled [B,D], got {tuple(z_pooled.shape)}")
         if valid is None:
             valid = torch.ones_like(hole, dtype=torch.bool)
         if hole.sum() < 1:
             raise ValueError("IJEPALoss needs >= 1 hole token")
         predict = self.predict_loss(tok, hole, target, valid=valid)
-        sig = target_sigreg if target_sigreg is not None else target.detach()
-        sigreg = self._reg(sig)
-        visible = _visible_token_rows(tok, hole, valid)
-        if visible.size(0) < 1:
-            sigreg_context = tok.new_zeros(())
-        else:
-            sigreg_context = self._reg(visible)
+        sigreg = self._reg(z_pooled)
         lam = self.lejepa_lambda
-        total = (
-            (1.0 - lam) * predict + lam * sigreg + self.context_sigreg_lambda * sigreg_context
-        )
-        return IJEPALossTerms(
-            total=total, predict=predict, sigreg=sigreg, sigreg_context=sigreg_context
-        )
+        total = (1.0 - lam) * predict + lam * sigreg
+        return IJEPALossTerms(total=total, predict=predict, sigreg=sigreg)
 
 
 class _FingerprintCache:

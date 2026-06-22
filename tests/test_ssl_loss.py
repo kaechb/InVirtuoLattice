@@ -10,6 +10,7 @@ from lattice_lab.training.ssl_loss import (
     LeJEPALoss,
     NTXentLoss,
     SIGReg,
+    VICReg,
     lejepa_retrieval_acc1,
     top1_paired_accuracy,
 )
@@ -27,7 +28,8 @@ def _ijepa_batch(*, b: int = 2, t: int = 4, d: int = 32):
     )
     valid = torch.ones(b, t, dtype=torch.bool)
     target = torch.randn(int(hole.sum()), d)
-    return tok, hole, valid, target
+    z_pooled = torch.randn(b, d)  # mean-pooled intact z_m batch (anti-collapse reg input)
+    return tok, hole, valid, target, z_pooled
 
 
 def test_sigreg_forward_shape() -> None:
@@ -92,24 +94,41 @@ def test_lejepa_has_no_predictor() -> None:
 
 def test_ijepa_forward_finite_terms() -> None:
     loss_fn = IJEPALoss(dim=32, lejepa_lambda=0.05, sigreg_num_projections=16, sigreg_knots=9)
-    tok, hole, valid, target = _ijepa_batch(d=32)
-    terms = loss_fn(tok, hole, target, valid=valid)
-    for t in (terms.total, terms.predict, terms.sigreg, terms.sigreg_context):
+    tok, hole, valid, target, z_pooled = _ijepa_batch(d=32)
+    terms = loss_fn(tok, hole, target, z_pooled, valid=valid)
+    for t in (terms.total, terms.predict, terms.sigreg):
         assert t.ndim == 0 and torch.isfinite(t)
 
 
-def test_ijepa_context_sigreg_adds_to_total() -> None:
-    """context_sigreg_lambda > 0 contributes the visible-context anti-collapse term."""
-    tok, hole, valid, target = _ijepa_batch(d=32)
-    off = IJEPALoss(dim=32, lejepa_lambda=0.0, context_sigreg_lambda=0.0,
-                    sigreg_num_projections=8, sigreg_knots=9)
-    on = IJEPALoss(dim=32, lejepa_lambda=0.0, context_sigreg_lambda=1.0,
-                   sigreg_num_projections=8, sigreg_knots=9)
-    on.load_state_dict(off.state_dict())
-    t_off = off(tok, hole, target, valid=valid)
-    t_on = on(tok, hole, target, valid=valid)
-    assert torch.isfinite(t_on.sigreg_context)
-    assert abs(float(t_on.total - t_off.total - t_on.sigreg_context)) < 1e-5
+def test_ijepa_total_is_predict_plus_pooled_reg() -> None:
+    """total = (1-lambda)*predict + lambda*reg(z_pooled), with reg on the pooled batch."""
+    tok, hole, valid, target, z_pooled = _ijepa_batch(d=32)
+    loss_fn = IJEPALoss(dim=32, lejepa_lambda=0.3, sigreg_num_projections=8, sigreg_knots=9)
+    terms = loss_fn(tok, hole, target, z_pooled, valid=valid)
+    expected = 0.7 * terms.predict + 0.3 * terms.sigreg
+    assert abs(float(terms.total - expected)) < 1e-5
+
+
+def test_vicreg_penalizes_collapse() -> None:
+    """VICReg's variance hinge fires on collapsed rows, near-zero on spread rows."""
+    torch.manual_seed(0)
+    reg = VICReg(gamma=1.0, cov_coeff=1.0)
+    collapsed = torch.zeros(64, 32) + 0.01 * torch.randn(1, 32)
+    spread = torch.randn(64, 32)
+    assert float(reg(collapsed)) > float(reg(spread))
+    assert float(reg(spread)) < 0.5
+
+
+def test_ijepa_use_vicreg_swaps_regularizer() -> None:
+    """use_vicreg routes the pooled reg through VICReg, not SIGReg; grads still flow."""
+    tok, hole, valid, target, _ = _ijepa_batch(d=16)
+    loss_fn = IJEPALoss(dim=16, lejepa_lambda=0.5, use_vicreg=True)
+    assert loss_fn.sigreg is None and isinstance(loss_fn.vicreg, VICReg)
+    z_pooled = torch.randn(2, 16, requires_grad=True)
+    terms = loss_fn(tok, hole, target, z_pooled, valid=valid)
+    assert torch.isfinite(terms.sigreg)
+    terms.total.backward()
+    assert z_pooled.grad is not None and z_pooled.grad.norm().item() > 1e-6
 
 
 def test_gather_hole_tokens_position_aligned() -> None:
@@ -148,9 +167,9 @@ def test_ijepa_has_predictor_and_trains() -> None:
 def test_ijepa_predict_invariant_to_target_scale() -> None:
     """Cosine regression is invariant to the target's magnitude."""
     loss_fn = IJEPALoss(dim=16, lejepa_lambda=0.0, sigreg_num_projections=8, sigreg_knots=9)
-    tok, hole, valid, target = _ijepa_batch(b=1, t=5, d=16)
-    base = loss_fn(tok, hole, target, valid=valid).predict.item()
-    scaled = loss_fn(tok, hole, target * 100.0, valid=valid).predict.item()
+    tok, hole, valid, target, z_pooled = _ijepa_batch(d=16)
+    base = loss_fn(tok, hole, target, z_pooled, valid=valid).predict.item()
+    scaled = loss_fn(tok, hole, target * 100.0, z_pooled, valid=valid).predict.item()
     assert abs(base - scaled) < 1e-5
 
 
@@ -160,17 +179,19 @@ def test_ijepa_predict_stopgrad_blocks_target_grad() -> None:
     hole = torch.tensor([[False, True, True, False, False]])
     valid = torch.ones(1, 5, dtype=torch.bool)
     target = torch.randn(2, 16, requires_grad=True)
-    loss_fn(tok, hole, target, valid=valid).predict.backward()
+    z_pooled = torch.randn(1, 16)
+    loss_fn(tok, hole, target, z_pooled, valid=valid).predict.backward()
     assert tok.grad is not None and tok.grad.norm().item() > 1e-6
     assert target.grad is None
 
 
-def test_ijepa_sigreg_grad_flows_to_online_target() -> None:
+def test_ijepa_reg_grad_flows_to_pooled() -> None:
+    """The anti-collapse regularizer back-props into the pooled z_m batch."""
     loss_fn = IJEPALoss(dim=16, lejepa_lambda=1.0, sigreg_num_projections=8, sigreg_knots=9)
-    tok, hole, valid, target = _ijepa_batch(b=1, t=5, d=16)
-    target_online = torch.randn(int(hole.sum()), 16, requires_grad=True)
-    loss_fn(tok, hole, target, valid=valid, target_sigreg=target_online).total.backward()
-    assert target_online.grad is not None and target_online.grad.norm().item() > 1e-6
+    tok, hole, valid, target, _ = _ijepa_batch(d=16)
+    z_pooled = torch.randn(2, 16, requires_grad=True)
+    loss_fn(tok, hole, target, z_pooled, valid=valid).total.backward()
+    assert z_pooled.grad is not None and z_pooled.grad.norm().item() > 1e-6
 
 
 def test_ijepa_predictor_reduces_loss_when_visible_encodes_target() -> None:
@@ -181,20 +202,21 @@ def test_ijepa_predictor_reduces_loss_when_visible_encodes_target() -> None:
     tok = torch.zeros(1, 4, d)
     hole = torch.tensor([[False, True, True, False]])
     valid = torch.ones(1, 4, dtype=torch.bool)
+    z_pooled = torch.randn(1, d)
     tok[0, 0] = target[0]
     tok[0, 3] = target[1]
     opt = torch.optim.Adam(loss_fn.parameters(), lr=1e-3)
-    initial = loss_fn(tok, hole, target, valid=valid).predict.item()
+    initial = loss_fn(tok, hole, target, z_pooled, valid=valid).predict.item()
     for _ in range(500):
         opt.zero_grad()
-        loss_fn(tok, hole, target, valid=valid).predict.backward()
+        loss_fn(tok, hole, target, z_pooled, valid=valid).predict.backward()
         opt.step()
-    assert loss_fn(tok, hole, target, valid=valid).predict.item() < initial * 0.5
+    assert loss_fn(tok, hole, target, z_pooled, valid=valid).predict.item() < initial * 0.5
 
 
 def test_ijepa_condition_bypass_gap_keys() -> None:
     loss_fn = IJEPALoss(dim=16, lejepa_lambda=0.0, sigreg_num_projections=8, sigreg_knots=9)
-    tok, hole, valid, target = _ijepa_batch(b=2, t=5, d=16)
+    tok, hole, valid, target, _ = _ijepa_batch(d=16)
     stats = loss_fn.condition_bypass_gap(tok, hole, target, valid=valid)
     for k in ("predict_true", "predict_shuf", "predict_zero", "gap_zero", "gap_shuf"):
         assert k in stats and np.isfinite(stats[k])
@@ -209,12 +231,13 @@ def test_ijepa_condition_gap_after_training() -> None:
     tok = torch.zeros(1, 4, d)
     hole = torch.tensor([[False, True, True, False]])
     valid = torch.ones(1, 4, dtype=torch.bool)
+    z_pooled = torch.randn(1, d)
     tok[0, 0] = target[0]
     tok[0, 3] = target[1]
     opt = torch.optim.Adam(loss_fn.parameters(), lr=1e-3)
     for _ in range(300):
         opt.zero_grad()
-        loss_fn(tok, hole, target, valid=valid).predict.backward()
+        loss_fn(tok, hole, target, z_pooled, valid=valid).predict.backward()
         opt.step()
     stats = loss_fn.condition_bypass_gap(tok, hole, target, valid=valid)
     assert stats["predict_true"] < stats["predict_zero"]
@@ -227,10 +250,10 @@ def test_ijepa_gradients_flow_to_tok() -> None:
     hole = torch.tensor([[False, True, True, False, False], [True, False, True, False, False]])
     valid = torch.ones(2, 5, dtype=torch.bool)
     target = torch.randn(int(hole.sum()), 32)
-    target_online = torch.randn(int(hole.sum()), 32, requires_grad=True)
-    loss_fn(tok, hole, target, valid=valid, target_sigreg=target_online).total.backward()
+    z_pooled = torch.randn(2, 32, requires_grad=True)
+    loss_fn(tok, hole, target, z_pooled, valid=valid).total.backward()
     assert tok.grad is not None and tok.grad.norm().item() > 1e-6
-    assert target_online.grad is not None and target_online.grad.norm().item() > 1e-6
+    assert z_pooled.grad is not None and z_pooled.grad.norm().item() > 1e-6
 
 
 def test_ijepa_predictor_batched_matches_variable_lengths() -> None:

@@ -92,9 +92,8 @@ class DiscreteFlowSSLModule(L.LightningModule):
         ijepa_predictor_layers: int = 1,
         ijepa_predictor_heads: int = 2,
         ijepa_predictor_ff_mult: int = 2,
-        ijepa_context_sigreg_lambda: float = 0.0,
         # Replace SIGReg with VICReg (variance hinge + covariance penalty) as the
-        # I-JEPA anti-collapse regularizer on target/context rows.
+        # I-JEPA pooled-z_m anti-collapse regularizer.
         ijepa_use_vicreg: bool = False,
         ijepa_vicreg_gamma: float = 1.0,
         ijepa_vicreg_cov_coeff: float = 1.0,
@@ -181,7 +180,6 @@ class DiscreteFlowSSLModule(L.LightningModule):
             IJEPALoss(
                 dim=encoder.adapter.d_adapter,
                 lejepa_lambda=lejepa_lambda,
-                context_sigreg_lambda=ijepa_context_sigreg_lambda,
                 sigreg_num_projections=sigreg_num_projections,
                 sigreg_knots=sigreg_knots,
                 sigreg_t_max=sigreg_t_max,
@@ -218,7 +216,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
         )
         self._val: dict[str, list[float]] = {
             "loss": [], "acc": [], "inv": [], "inv_rel": [], "sigreg": [],
-            "predict": [], "sigreg_context": [], "view_diversity": [], "fp": [], "ntxent": [],
+            "predict": [], "view_diversity": [], "fp": [], "ntxent": [],
             "cond_true": [], "cond_shuf": [], "cond_zero": [],
             "cond_gap_zero": [], "cond_gap_shuf": [],
             "rank_effective": [], "rank_numerical": [],
@@ -705,7 +703,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 z_teacher_global,
             ) = self._encode_ijepa(views)
             terms = self.ijepa_loss_fn(
-                tok_masked, hole, target_ema, valid=valid, target_sigreg=target_online,
+                tok_masked, hole, target_ema, z_pooled, valid=valid,
             )
             loss = terms.total
             fp_loss = self._fp_distillation(z_pooled, smiles)
@@ -719,7 +717,6 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 {
                     "train/predict": terms.predict.detach(),
                     "train/sigreg": terms.sigreg.detach(),
-                    "train/sigreg_context": terms.sigreg_context.detach(),
                     "train/encode_time": self.encoder.encode_time_value,
                 },
                 on_step=True, batch_size=bs,
@@ -773,7 +770,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 z_teacher_global,
             ) = self._encode_ijepa(views)
             terms = self.ijepa_loss_fn(
-                tok_masked, hole, target_ema, valid=valid, target_sigreg=target_online,
+                tok_masked, hole, target_ema, z_pooled, valid=valid,
             )
             loss = terms.total
             fp_loss = self._fp_distillation(z_pooled, smiles)
@@ -783,7 +780,6 @@ class DiscreteFlowSSLModule(L.LightningModule):
             extras = {"inv": None, "ntxent": None}
             self._val["predict"].append(float(terms.predict))
             self._val["sigreg"].append(float(terms.sigreg))
-            self._val["sigreg_context"].append(float(terms.sigreg_context))
             gap = self.ijepa_loss_fn.condition_bypass_gap(
                 tok_masked, hole, target_ema, valid=valid,
             )
@@ -870,7 +866,6 @@ class DiscreteFlowSSLModule(L.LightningModule):
         if self._val["predict"]:
             out["val/predict"] = float(np.mean(self._val["predict"]))
             out["val/sigreg"] = float(np.mean(self._val["sigreg"]))
-            out["val/sigreg_context"] = float(np.mean(self._val["sigreg_context"]))
         if self._val["cond_true"]:
             out["val/cond_true"] = float(np.mean(self._val["cond_true"]))
             out["val/cond_shuf"] = float(np.mean(self._val["cond_shuf"]))
