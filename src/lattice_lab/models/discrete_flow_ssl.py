@@ -93,6 +93,11 @@ class DiscreteFlowSSLModule(L.LightningModule):
         ijepa_predictor_heads: int = 2,
         ijepa_predictor_ff_mult: int = 2,
         ijepa_context_sigreg_lambda: float = 0.0,
+        # Replace SIGReg with VICReg (variance hinge + covariance penalty) as the
+        # I-JEPA anti-collapse regularizer on target/context rows.
+        ijepa_use_vicreg: bool = False,
+        ijepa_vicreg_gamma: float = 1.0,
+        ijepa_vicreg_cov_coeff: float = 1.0,
         ijepa_collapse_diag_every_n_steps: int = 50,
         rank_subsample: int = 256,
         sigreg_num_projections: int = 256,
@@ -181,6 +186,9 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 sigreg_knots=sigreg_knots,
                 sigreg_t_max=sigreg_t_max,
                 sigreg_eps=sigreg_eps,
+                use_vicreg=ijepa_use_vicreg,
+                vicreg_gamma=ijepa_vicreg_gamma,
+                vicreg_cov_coeff=ijepa_vicreg_cov_coeff,
                 ijepa_predictor_layers=ijepa_predictor_layers,
                 ijepa_predictor_heads=ijepa_predictor_heads,
                 ijepa_predictor_ff_mult=ijepa_predictor_ff_mult,

@@ -44,6 +44,9 @@ ijepa_mask_mode: mixed  # ijepa only: fragment | span | mixed
 ijepa_ema_decay: 0.996      # ijepa only: EMA momentum for the clean (intact) target encoder
 ijepa_block_hole_attn: true  # ijepa: visible reps cannot attend to <UNK> keys in encoder
 ijepa_context_sigreg_lambda: 0.0  # ijepa: anti-collapse SIGReg on visible context reps
+ijepa_use_vicreg: false     # ijepa: replace SIGReg with VICReg (var hinge + cov penalty)
+ijepa_vicreg_gamma: 1.0     # ijepa: target per-dim std for the VICReg variance hinge
+ijepa_vicreg_cov_coeff: 1.0  # ijepa: weight of the VICReg off-diagonal covariance penalty
 ijepa_collapse_diag_every_n_steps: 50  # 0 disables; avoids per-step CPU SVD sync
 rank_subsample: 256  # max rows for train/collapse rank SVD diagnostics
 ijepa_predictor_layers: 1   # ijepa: keep small so encoder carries semantics

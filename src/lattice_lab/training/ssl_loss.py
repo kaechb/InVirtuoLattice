@@ -97,6 +97,46 @@ class SIGReg(nn.Module):
         return statistic.mean()
 
 
+class VICReg(nn.Module):
+    """VICReg variance + covariance regularizer on ``[N, D]`` rows.
+
+    Drop-in anti-collapse alternative to :class:`SIGReg`: a per-dimension
+    variance hinge (push each std up toward ``gamma``) plus an off-diagonal
+    covariance penalty (decorrelate dims). Unlike SIGReg it makes no
+    Gaussianity assumption and both terms are plain means, so it stays
+    well-behaved when the regularized batch ``N`` is small.
+
+    Returns ``var_term + cov_coeff * cov_term`` as a single scalar; the caller
+    scales it the same way it scaled SIGReg.
+    """
+
+    def __init__(
+        self, *, gamma: float = 1.0, cov_coeff: float = 1.0, eps: float = 1e-4
+    ) -> None:
+        super().__init__()
+        if gamma <= 0.0:
+            raise ValueError(f"gamma must be > 0, got {gamma}")
+        if cov_coeff < 0.0:
+            raise ValueError(f"cov_coeff must be >= 0, got {cov_coeff}")
+        self.gamma = float(gamma)
+        self.cov_coeff = float(cov_coeff)
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 2:
+            raise ValueError(f"VICReg expects [N, D], got {tuple(x.shape)}")
+        n, d = x.shape
+        if n < 2:
+            return x.new_zeros(())
+        x = x - x.mean(dim=0, keepdim=True)
+        std = torch.sqrt(x.var(dim=0) + self.eps)  # unbiased (n-1), matches cov
+        var_term = torch.relu(self.gamma - std).mean()
+        cov = (x.T @ x) / (n - 1)
+        off_diag = cov - torch.diag(torch.diagonal(cov))
+        cov_term = off_diag.square().sum() / d
+        return var_term + self.cov_coeff * cov_term
+
+
 @dataclass
 class LeJEPALossTerms:
     """``inv``/``sigreg`` are the raw (unweighted) sub-losses, graph attached
@@ -352,6 +392,11 @@ class IJEPALoss(nn.Module):
         sigreg_knots: int = 17,
         sigreg_t_max: float = 3.0,
         sigreg_eps: float = 1e-8,
+        # When true, VICReg (variance hinge + covariance penalty) replaces SIGReg
+        # as the anti-collapse regularizer on the target/context rows.
+        use_vicreg: bool = False,
+        vicreg_gamma: float = 1.0,
+        vicreg_cov_coeff: float = 1.0,
         ijepa_max_positions: int = 512,
         ijepa_predictor_layers: int = 1,
         ijepa_predictor_heads: int = 2,
@@ -373,12 +418,30 @@ class IJEPALoss(nn.Module):
             n_heads=int(ijepa_predictor_heads),
             ff_mult=int(ijepa_predictor_ff_mult),
         )
-        self.sigreg = SIGReg(
-            num_projections=sigreg_num_projections,
-            knots=sigreg_knots,
-            t_max=sigreg_t_max,
-            eps=sigreg_eps,
-        )
+        self.use_vicreg = bool(use_vicreg)
+        if self.use_vicreg:
+            self.vicreg = VICReg(gamma=vicreg_gamma, cov_coeff=vicreg_cov_coeff)
+            self.sigreg = None
+        else:
+            self.vicreg = None
+            self.sigreg = SIGReg(
+                num_projections=sigreg_num_projections,
+                knots=sigreg_knots,
+                t_max=sigreg_t_max,
+                eps=sigreg_eps,
+            )
+
+    def _reg(self, rows: torch.Tensor) -> torch.Tensor:
+        """Anti-collapse regularizer on ``[N, D]`` rows (SIGReg or VICReg).
+
+        SIGReg's raw statistic carries an explicit ``*N`` batch factor (see
+        :class:`SIGReg`), divided back out here so the term is ``O(1)`` and
+        ``lejepa_lambda`` stays batch-size-independent. VICReg is already a mean,
+        so it needs no rescaling.
+        """
+        if self.vicreg is not None:
+            return self.vicreg(rows)
+        return self.sigreg(rows.unsqueeze(0)) / rows.size(0)
 
     def _predict(
         self,
@@ -463,12 +526,12 @@ class IJEPALoss(nn.Module):
             raise ValueError("IJEPALoss needs >= 1 hole token")
         predict = self.predict_loss(tok, hole, target, valid=valid)
         sig = target_sigreg if target_sigreg is not None else target.detach()
-        sigreg = self.sigreg(sig.unsqueeze(0)) / sig.size(0)
+        sigreg = self._reg(sig)
         visible = _visible_token_rows(tok, hole, valid)
         if visible.size(0) < 1:
             sigreg_context = tok.new_zeros(())
         else:
-            sigreg_context = self.sigreg(visible.unsqueeze(0)) / visible.size(0)
+            sigreg_context = self._reg(visible)
         lam = self.lejepa_lambda
         total = (
             (1.0 - lam) * predict + lam * sigreg + self.context_sigreg_lambda * sigreg_context
