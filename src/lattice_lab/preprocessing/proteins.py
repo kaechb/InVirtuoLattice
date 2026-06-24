@@ -100,6 +100,11 @@ def cluster_proteins(
         return {r.pid: i for i, r in enumerate(records)}
 
     workdir = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="lattice_mmseqs_"))
+    # Start from a clean workdir: mmseqs refuses to overwrite an existing output
+    # database, so a stale `clu`/`db`/`tmp` left by a previous run makes
+    # `mmseqs cluster` exit non-zero even though it's installed and on PATH.
+    if workdir.exists():
+        shutil.rmtree(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     fasta = workdir / "input.fasta"
     with open(fasta, "w") as fh:
@@ -110,9 +115,11 @@ def cluster_proteins(
     tmp = workdir / "tmp"
     tmp.mkdir(exist_ok=True)
     tsv = workdir / "clu.tsv"
+    # Capture mmseqs output so a real failure surfaces *its* error (e.g. memory,
+    # bad input) instead of the generic "install it" message.
     try:
         subprocess.run(["mmseqs", "createdb", str(fasta), str(db)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       capture_output=True, text=True)
         subprocess.run(
             [
                 "mmseqs",
@@ -128,14 +135,16 @@ def cluster_proteins(
                 "0",
             ],
             check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
         )
         subprocess.run(["mmseqs", "createtsv", str(db), str(db), str(clu), str(tsv)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
-        enforce_mmseqs("cluster run failed", cause=exc)
-        logger.error("mmseqs failed (%s); falling back to identity clusters.", exc)
+        err_lines = (exc.stderr or exc.stdout or "").strip().splitlines()
+        tail = " | ".join(err_lines[-3:]) if err_lines else f"exit {exc.returncode}"
+        enforce_mmseqs(f"cluster run failed ({tail})", cause=exc)
+        logger.error("mmseqs failed (%s): %s; falling back to identity clusters.", exc, tail)
         return {r.pid: i for i, r in enumerate(records)}
 
     rep_to_idx: dict[str, int] = {}

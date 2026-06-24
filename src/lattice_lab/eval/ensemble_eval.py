@@ -31,7 +31,12 @@ import pandas as pd
 import torch
 
 from lattice_lab.ebm.head import EnergyHead
-from lattice_lab.eval.lit_pcba import _inchikey_or_none, enforce_cache_adapter
+from lattice_lab.eval.lit_pcba import (
+    N_VIEWS_KEY,
+    _inchikey_or_none,
+    enforce_cache_adapter,
+    enforce_cache_n_views,
+)
 from lattice_lab.eval.metrics import auroc, bedroc, ef_at_k
 from lattice_lab.models.builders import adapter_fingerprint, load_energy_head
 from lattice_lab.protein.store import EmbeddingStore
@@ -41,7 +46,12 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
-def _load_head(ckpt: Path, d_m: int, d_p: int, device: str) -> EnergyHead:
+def _load_head(
+    ckpt: Path,
+    d_m: int | None,
+    d_p: int | None,
+    device: str,
+) -> EnergyHead:
     return load_energy_head(ckpt, d_adapter=d_m, d_protein=d_p, device=device)
 
 
@@ -73,8 +83,18 @@ def main() -> None:
     ap.add_argument("--bedroc-alpha", type=float, default=80.5)
     ap.add_argument("--n-jobs", type=int, default=12)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--d-adapter", type=int, default=512)
-    ap.add_argument("--d-protein", type=int, default=1280)
+    ap.add_argument(
+        "--d-adapter",
+        type=int,
+        default=None,
+        help="override molecule latent dim (default: read from checkpoint)",
+    )
+    ap.add_argument(
+        "--d-protein",
+        type=int,
+        default=None,
+        help="override protein latent dim (default: read from checkpoint)",
+    )
     a = ap.parse_args()
 
     df = pd.read_parquet(a.test_parquet, columns=["target_name", "smiles", "is_active"])
@@ -97,6 +117,13 @@ def main() -> None:
     work = work.dropna(subset=["inchikey"]).reset_index(drop=True)
 
     zm = EmbeddingStore.open(a.zm_cache, mode="r")
+    recorded_views = zm.manifest.extra.get(N_VIEWS_KEY)
+    if recorded_views is None or int(recorded_views) < 2:
+        raise SystemExit(
+            f"{a.zm_cache} is not a multi-view cache ({N_VIEWS_KEY}={recorded_views!r}). "
+            f"Run build_multiview_cache with --n-views >= 2 first."
+        )
+    enforce_cache_n_views(zm, int(recorded_views))
     work = work[work["inchikey"].isin(zm.pid_to_row)].reset_index(drop=True)
 
     # Guard: every ensemble member must share one adapter (else their z_m live in

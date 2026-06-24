@@ -374,7 +374,6 @@ def test_lightning_module_fast_dev_run() -> None:
         dropout=0.0,
         corrupt_t=(0.1, 0.6),
         warmup_steps=1,
-        total_steps=10,
         train_rank_every_n_steps=1,
     )
     p0 = next(p for p in module.denoiser.parameters() if p.requires_grad).detach().clone()

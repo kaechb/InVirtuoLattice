@@ -49,7 +49,6 @@ class DenoisingJEPAModule(L.LightningModule):
         learning_rate: float = 1e-3,
         weight_decay: float = 0.01,
         warmup_steps: int = 500,
-        total_steps: int = 30_000,
         frag_sep_id: int = 4,
         shuffle_fragments: bool = True,
         align_lambda: float = 0.0,
@@ -222,6 +221,7 @@ class DenoisingJEPAModule(L.LightningModule):
         dm = getattr(trainer, "datamodule", None) if trainer is not None else None
         if dm is None:
             return
+        self._fragment_merge = str(getattr(dm, "shard_dir", "")).rstrip("/").endswith("_merge")
         for attr in ("val_ratio", "test_ratio", "split_seed"):
             if hasattr(dm, attr):
                 setattr(self._val_probes, attr, type(getattr(self._val_probes, attr))(getattr(dm, attr)))
@@ -378,18 +378,18 @@ class DenoisingJEPAModule(L.LightningModule):
         cfg = getattr(self, "build_config", None)
         if cfg is not None:
             checkpoint["encoder_config"] = dict(cfg)
+        # See discrete_flow_ssl: record the fragment-view variant so downstream
+        # stages auto-match the _merge stores (no env, no mismatch).
+        checkpoint["fragment_merge"] = bool(getattr(self, "_fragment_merge", False))
 
     def _resolve_total_steps(self) -> int:
-        configured = int(self.hparams.total_steps or 0)
-        if configured > 0:
-            return configured
         trainer = getattr(self, "trainer", None)
         est = getattr(trainer, "estimated_stepping_batches", None) if trainer else None
         if est is not None and math.isfinite(est) and est > 0:
             total = int(est)
-            logger.info("total_steps auto-derived from trainer: %d", total)
+            logger.info("cosine LR horizon from trainer: %d steps", total)
             return total
-        logger.warning("total_steps unset and trainer estimate unavailable; using 30000")
+        logger.warning("trainer estimate unavailable; cosine LR horizon fallback 30000")
         return 30_000
 
     def configure_optimizers(self):

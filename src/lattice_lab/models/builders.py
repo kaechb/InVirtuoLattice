@@ -62,6 +62,35 @@ def safe_torch_load(path: str | Path, *, weights_only: bool = True) -> dict:
         return torch.load(path, map_location="cpu", weights_only=weights_only)
 
 
+def merge_from_ckpt(ckpt: str | Path) -> bool:
+    """Whether the adapter at ``ckpt`` was trained on the merge (multi-granularity)
+    fragment-view variant.
+
+    This is the single source of truth that lets Stage-4/5/6 auto-select the
+    matching ``_merge`` z_m stores without being told — written by the SSL module's
+    ``on_save_checkpoint`` (``fragment_merge``). Missing key → ``False`` (legacy /
+    finest-partition runs). Reads only the top-level flag (``mmap`` defers the
+    weight tensors) so a shell wrapper can call it cheaply before the real job.
+    """
+    from pathlib import PosixPath, WindowsPath
+
+    path = resolve_adapter_ckpt(ckpt)
+    try:
+        with torch.serialization.safe_globals([PosixPath, WindowsPath]):
+            raw = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except Exception:
+        raw = safe_torch_load(path, weights_only=False)
+    if not isinstance(raw, dict):
+        return False
+    # Adapter ckpts carry it top-level; EBM ckpts carry it inside encoder_config
+    # (copied from the encoder's build_config), so a downstream EBM ckpt is also
+    # self-describing for the merge variant.
+    if raw.get("fragment_merge"):
+        return True
+    enc_cfg = raw.get("encoder_config")
+    return bool(isinstance(enc_cfg, dict) and enc_cfg.get("fragment_merge", False))
+
+
 _HEAD_PREFIX = "head."
 
 
@@ -110,19 +139,47 @@ def parse_head_checkpoint(raw: object) -> dict[str, torch.Tensor]:
     return head_state
 
 
+def infer_energy_head_dims(raw: object) -> tuple[int, int]:
+    """Return ``(d_m, d_p)`` from Lightning hyperparams or head weight shapes."""
+    if isinstance(raw, dict):
+        hp = raw.get("hyper_parameters")
+        if isinstance(hp, dict) and "d_adapter" in hp and "d_protein" in hp:
+            return int(hp["d_adapter"]), int(hp["d_protein"])
+    head_state = parse_head_checkpoint(raw)
+    try:
+        w0 = head_state["protein_proj.0.weight"]
+    except KeyError as e:
+        raise ValueError(
+            "cannot infer energy-head dims (missing protein_proj.0.weight)"
+        ) from e
+    d_hidden = int(w0.shape[0])
+    d_p = int(w0.shape[1])
+    if "mol_proj.weight" in head_state:
+        d_m = int(head_state["mol_proj.weight"].shape[1])
+    else:
+        d_m = d_hidden
+    return d_m, d_p
+
+
 def load_energy_head(
     head_ckpt: str | Path,
     *,
-    d_adapter: int,
-    d_protein: int,
+    d_adapter: int | None = None,
+    d_protein: int | None = None,
     device: str | torch.device = "cpu",
 ) -> EnergyHead:
     """Load a trained Stage-5 :class:`EnergyHead` (frozen, ``eval()``).
 
     ``head_ckpt`` is a full EBM Lightning ``.ckpt``; the head is pulled out of its
-    ``state_dict`` by the ``head.`` prefix.
+    ``state_dict`` by the ``head.`` prefix. When ``d_adapter`` / ``d_protein`` are
+    omitted, they are read from the checkpoint (hyperparams first, else head shapes).
     """
     raw = safe_torch_load(head_ckpt, weights_only=False)
+    if d_adapter is None or d_protein is None:
+        inf_m, inf_p = infer_energy_head_dims(raw)
+        d_adapter = inf_m if d_adapter is None else d_adapter
+        d_protein = inf_p if d_protein is None else d_protein
+        logger.info("inferred energy head dims d_m=%d d_p=%d", d_adapter, d_protein)
     head = EnergyHead(d_m=d_adapter, d_p=d_protein)
     head.load_state_dict(parse_head_checkpoint(raw))
     head.to(device).eval()
@@ -132,12 +189,25 @@ def load_energy_head(
     return head
 
 
-def parse_adapter_state(raw: object) -> dict[str, torch.Tensor]:
-    """Extract adapter weights (``encoder.adapter.*``) from a full Lightning ckpt.
+def parse_encoder_state(raw: object) -> dict[str, torch.Tensor]:
+    """Extract full encoder weights (``encoder.*``) from a Lightning ckpt."""
+    state = _checkpoint_state_dict(raw)
+    enc_state = {
+        k[len(_ENCODER_PREFIX):]: v
+        for k, v in state.items()
+        if k.startswith(_ENCODER_PREFIX)
+    }
+    if not enc_state:
+        raise ValueError(
+            "no encoder weights found (expected 'encoder.*' in a full Lightning checkpoint)"
+        )
+    if not all(isinstance(v, torch.Tensor) for v in enc_state.values()):
+        raise ValueError("encoder weights must be tensors")
+    return enc_state
 
-    Used only for fingerprinting the latent space — both a Stage-2 SSL ckpt and a
-    Stage-5 EBM ckpt carry the identical ``encoder.adapter.*`` entries.
-    """
+
+def parse_adapter_state(raw: object) -> dict[str, torch.Tensor]:
+    """Extract adapter weights (``encoder.adapter.*``) from a full Lightning ckpt."""
     state = _checkpoint_state_dict(raw)
     adapter_state = {
         k[len(_ADAPTER_PREFIX):]: v
@@ -182,29 +252,83 @@ def resolve_adapter_ckpt(adapter_ckpt: str | Path) -> Path:
     )
 
 
+def resolve_ssl_best_ckpt(adapter_ckpt: str | Path) -> Path:
+    """Best Stage-2 adapter by ``r2/mean`` (falls back to legacy structural / last)."""
+    path = Path(adapter_ckpt)
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise FileNotFoundError(f"adapter checkpoint not found: {adapter_ckpt}")
+    for pat in ("best-r2mean-*.ckpt", "best-r2struct-*.ckpt"):
+        hits = sorted(path.glob(pat), key=lambda p: p.stat().st_mtime, reverse=True)
+        if hits:
+            chosen = hits[0]
+            logger.info("resolved ssl best ckpt %s → %s", path, chosen.name)
+            return chosen
+    return resolve_adapter_ckpt(path)
+
+
+def resolve_ebm_ckpt(run_dir: str | Path) -> Path:
+    """Best Stage-5 EBM head by ``val/ef1`` (``ebm-*.ckpt``), else ``last.ckpt``."""
+    path = Path(run_dir)
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise FileNotFoundError(f"EBM checkpoint not found: {run_dir}")
+    hits = sorted(path.glob("ebm-*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if hits:
+        chosen = hits[0]
+        logger.info("resolved ebm best ckpt %s → %s", path, chosen.name)
+        return chosen
+    last = path / "last.ckpt"
+    if last.is_file():
+        return last
+    raise FileNotFoundError(f"no EBM checkpoint under {run_dir}")
+
+
 def adapter_run_id(adapter_ckpt: str | Path) -> str:
-    """W&B run id from ``.../checkpoints/<run_id>/last.ckpt``."""
-    path = resolve_adapter_ckpt(adapter_ckpt)
-    parent = path.parent
-    if path.name != "last.ckpt" or parent.name == "checkpoints":
+    """W&B run id from ``.../checkpoints/<run_id>/<any>.ckpt``."""
+    path = Path(adapter_ckpt)
+    if path.is_file():
+        run_dir = path.parent
+    else:
+        run_dir = path
+    if run_dir.name == "checkpoints":
+        path = resolve_ssl_best_ckpt(run_dir)
+        run_dir = path.parent
+    if run_dir.name == "checkpoints":
         raise ValueError(
             f"cannot infer adapter run id from {adapter_ckpt}; "
-            "expected .../checkpoints/<wandb_run_id>/last.ckpt"
+            "expected .../checkpoints/<wandb_run_id>/*.ckpt"
         )
+    return run_dir.name
+
+
+def ebm_run_id(ebm_ckpt: str | Path) -> str:
+    """W&B run id from ``.../checkpoints/<run_id>/<any>.ckpt``."""
+    path = resolve_ebm_ckpt(ebm_ckpt)
+    parent = path.parent
+    if parent.name == "checkpoints":
+        raise ValueError(f"cannot infer EBM run id from {ebm_ckpt}")
     return parent.name
 
 
-def zm_store_path(adapter_ckpt: str | Path, pool: str) -> Path:
+def zm_store_path(adapter_ckpt: str | Path, pool: str, *, merge: bool = False) -> Path:
     """Default Stage-4 z_m store for an adapter checkpoint.
 
     Layout: ``artifacts/decoys/<run_id>/{decoy_zm,bdb_zm}`` or
     ``artifacts/binders/<run_id>/binder_zm``.
+
+    ``merge=True`` appends a ``_merge`` suffix so stores built from the merged
+    (multi-granularity) fragment views never collide with the finest-granularity
+    ones — they encode different ``z_m`` and must stay separate on disk.
     """
     rid = adapter_run_id(adapter_ckpt)
+    suffix = "_merge" if merge else ""
     if pool == "binder_zm":
-        return Path(f"artifacts/binders/{rid}/binder_zm")
+        return Path(f"artifacts/binders/{rid}/binder_zm{suffix}")
     if pool in ("decoy_zm", "bdb_zm"):
-        return Path(f"artifacts/decoys/{rid}/{pool}")
+        return Path(f"artifacts/decoys/{rid}/{pool}{suffix}")
     raise ValueError(f"unknown z_m pool {pool!r}")
 
 
@@ -214,12 +338,10 @@ def eval_zm_cache_path(adapter_run_id: str, cache_name: str) -> Path:
 
 
 def adapter_state_fingerprint(adapter_state: Mapping[str, torch.Tensor]) -> str:
-    """Stable SHA-1 over adapter weights — a fingerprint of the latent space.
+    """Stable SHA-1 over a weight dict — fingerprint of the latent space.
 
-    Two encoders produce comparable ``z_m`` iff their adapters share this hash.
-    Used to guard z_m caches against being scored by a mismatched adapter
-    (the path string alone is unreliable: the same weights live in both the
-    Stage-2 adapter ckpt and every EBM ckpt that froze it).
+    ``adapter_fingerprint`` hashes the full ``encoder.*`` state (backbone + adapter
+    + time), since ``z_m`` depends on all of them when the backbone is finetuned.
     """
     h = hashlib.sha1()
     for k in sorted(adapter_state):
@@ -231,15 +353,16 @@ def adapter_state_fingerprint(adapter_state: Mapping[str, torch.Tensor]) -> str:
 
 
 def adapter_fingerprint(adapter_ckpt: str | Path) -> str:
-    """Fingerprint the adapter baked into any Stage-2 / EBM checkpoint."""
+    """Fingerprint the full encoder baked into any Stage-2 / EBM checkpoint."""
     path = resolve_adapter_ckpt(adapter_ckpt)
     raw = safe_torch_load(path, weights_only=False)
-    return adapter_state_fingerprint(parse_adapter_state(raw))
+    return adapter_state_fingerprint(parse_encoder_state(raw))
 
 
 def load_encoder_from_ckpt(
-    ckpt: str | Path,
+    ckpt: str | Path | None = None,
     *,
+    adapter_ckpt: str | Path | None = None,
     device: str | torch.device = "cpu",
     **overrides: object,
 ) -> DiscreteFlowEncoder:
@@ -255,8 +378,14 @@ def load_encoder_from_ckpt(
 
     Old checkpoints without ``encoder_config`` fall back to
     :data:`_FALLBACK_ENCODER_CONFIG` (override via ``**overrides``).
+
+    ``adapter_ckpt`` is a legacy alias for ``ckpt`` (Hydra configs predating
+    the switch to full-encoder loading).
     """
-    path = resolve_adapter_ckpt(ckpt)
+    resolved = ckpt or adapter_ckpt
+    if resolved is None:
+        raise TypeError("load_encoder_from_ckpt requires ckpt= or adapter_ckpt=")
+    path = resolve_adapter_ckpt(resolved)
     raw = safe_torch_load(path, weights_only=False)
     state = _checkpoint_state_dict(raw)
     enc_state = {
@@ -304,6 +433,11 @@ def load_encoder_from_ckpt(
     encoder.to(device).eval()
     for p in encoder.parameters():
         p.requires_grad_(False)
+    # Carry the adapter's fragment-view variant on the encoder so it rides into
+    # the EBM ckpt's encoder_config (EBMLitModule.on_save_checkpoint) — letting
+    # Stage-6 eval read the merge variant straight from the EBM checkpoint.
+    if isinstance(getattr(encoder, "build_config", None), dict):
+        encoder.build_config["fragment_merge"] = bool(raw.get("fragment_merge", False))
     logger.info(
         "loaded full encoder from %s (layers %d-%d, encode_time=%.4f)",
         path, encoder.backbone_layer_start, encoder.backbone_layer_end,

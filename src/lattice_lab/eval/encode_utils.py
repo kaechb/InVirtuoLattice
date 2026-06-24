@@ -11,7 +11,7 @@ import torch
 from tqdm.auto import tqdm
 
 from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
-from lattice_lab.preprocessing.molecules import smiles_to_fragment_views
+from lattice_lab.preprocessing.molecules import fragment_view
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +29,9 @@ def encode_views_inference(
     ):
         return encoder.encode_views(views, device=dev, **kwargs)
     """Pickle-friendly worker: ``(orig_idx, smiles, seed) → (orig_idx, view) | None``."""
-    i, smi, seed = args
-    vs = smiles_to_fragment_views(smi, n_views=1, seed=seed)
-    return (i, vs[0]) if vs else None
+    i, smi, _seed = args
+    v = fragment_view(smi, merge=False)  # faithful, full-coverage, deterministic
+    return (i, v) if v is not None else None
 
 
 def smiles_to_single_view(

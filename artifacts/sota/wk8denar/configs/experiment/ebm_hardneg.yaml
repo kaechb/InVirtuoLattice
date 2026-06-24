@@ -1,0 +1,18 @@
+# @package _global_
+# Online hard-negative mining: oversample 3x candidate decoys, keep the hardest.
+# python -m lattice_lab.train experiment=ebm_hardneg
+defaults:
+  - override /data: ebm
+  - override /model: ebm
+  - override /trainer: ebm
+  - override /callbacks: ebm
+
+tags: ["ebm", "hardneg"]
+
+data:
+  hard_mining_mult: 3        # model.hard_mining_mult interpolates this
+  frac_other_binder: 0.4
+  frac_non_binder: 0.15
+
+model:
+  hard_skip_frac: 0.05

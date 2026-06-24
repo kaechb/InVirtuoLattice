@@ -12,6 +12,6 @@ defaults:
   - override /callbacks: ssl_basic
 
 data:
-  return_smiles: true  # required when model.fp_weight > 0
+  return_smiles: true  # required when model.fp_weight > 0 (Morgan fp distillation)
 
 tags: ["ssl", "discrete_flow"]

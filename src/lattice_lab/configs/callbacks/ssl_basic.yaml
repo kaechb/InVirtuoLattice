@@ -1,11 +1,22 @@
+# Best by val-probe mean R² (logged as r2/mean each val epoch).
+# Listed first so Trainer.checkpoint_callback points at this best path.
+model_checkpoint_r2_mean:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: best-r2mean-{epoch:03d}-{step:06d}
+  monitor: r2/mean
+  mode: max
+  save_top_k: 1
+  save_last: false
+  auto_insert_metric_name: false
+
+# Always keep the final epoch (non-pipeline runs may still point here manually).
 model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: ssl-{epoch:03d}-{step:06d}
-  monitor: val/acc@1
-  mode: max
   save_last: true
-  save_top_k: 1
+  save_top_k: 0
   auto_insert_metric_name: false
 
 learning_rate_monitor:

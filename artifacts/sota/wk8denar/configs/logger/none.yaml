@@ -1,0 +1,1 @@
+# No logger. instantiate_loggers() returns [] for an empty node.

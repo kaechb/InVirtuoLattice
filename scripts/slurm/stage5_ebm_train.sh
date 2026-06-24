@@ -42,6 +42,7 @@ if [[ -n "${PIPELINE_ENV:-}" && -f "${PIPELINE_ENV}" ]]; then
   RUN_ID="${ADAPTER_RUN_ID:?missing ADAPTER_RUN_ID in ${PIPELINE_ENV} — run stage2 first}"
   METHOD="${PIPELINE_EBM_METHOD:-lejepa}"
   PIPELINE_MARKER="$(lattice_pipeline_marker)"
+  trap 'rm -f "${PIPELINE_MARKER:-}"' EXIT
 elif [[ "${1:-}" == lejepa || "${1:-}" == ntxent ]]; then
   METHOD="$1"
   RUN_ID="${2:-${RUN_ID:?set RUN_ID=<stage2_wandb_run_id> as \$2 or env RUN_ID=…}}"
@@ -65,14 +66,33 @@ lattice_job_banner "stage5 ${METHOD} start run_id=${RUN_ID} seed=${SEED}"
 
 lattice_load_gpu_modules
 lattice_cd_repo
-[[ -n "${PIPELINE_LOG_DIR:-}" ]] && trap 'lattice_pipeline_collect_logs_on_exit 5' EXIT
+lattice_pipeline_track_slurm_logs 5
 lattice_job_banner "modules loaded; checking gpu"
 lattice_require_gpu
 
 ADAPTER_CKPT="${REPO}/artifacts/adapter/checkpoints/${RUN_ID}/last.ckpt"
-DECOY_STORE="${REPO}/artifacts/decoys/${RUN_ID}/decoy_zm/manifest.json"
+SSL_CKPT_REL="artifacts/adapter/checkpoints/${RUN_ID}/last.ckpt"
+if [[ -n "${PIPELINE_ENV:-}" ]]; then
+  SSL_CKPT_REL="$(lattice_pipeline_ssl_ckpt "${RUN_ID}")"
+  ADAPTER_CKPT="${REPO}/${SSL_CKPT_REL}"
+  lattice_job_banner "pipeline ssl ckpt → ${SSL_CKPT_REL}"
+fi
 lattice_require_file "${ADAPTER_CKPT}" \
   "missing adapter ckpt — run stage2 first for RUN_ID=${RUN_ID}"
+
+# Merge variant follows the adapter (fragment_merge in its ckpt): read the
+# matching _merge z_m stores stage4 wrote. No env, no mismatch.
+MERGE_SUFFIX="$(lattice_ckpt_merge_suffix "${ADAPTER_CKPT}")"
+MERGE_STORE_ARGS=()
+if [[ -n "${MERGE_SUFFIX}" ]]; then
+  MERGE_STORE_ARGS=(
+    "data.decoy_store=artifacts/decoys/${RUN_ID}/decoy_zm${MERGE_SUFFIX}/"
+    "data.bdb_store=artifacts/decoys/${RUN_ID}/bdb_zm${MERGE_SUFFIX}"
+    "data.binder_store=artifacts/binders/${RUN_ID}/binder_zm${MERGE_SUFFIX}"
+  )
+fi
+
+DECOY_STORE="${REPO}/artifacts/decoys/${RUN_ID}/decoy_zm${MERGE_SUFFIX}/manifest.json"
 lattice_require_file "${DECOY_STORE}" \
   "missing decoy store — run stage4 for RUN_ID=${RUN_ID} first"
 
@@ -94,17 +114,44 @@ if lattice_smoke_enabled; then
   lattice_job_banner "SMOKE: max_steps=50 n_decoys=64 parquets=${SMOKE_PARQUET_DIR}"
 fi
 
-srun python -m lattice_lab.train "experiment=${EXPERIMENT}" \
-  "ssl_run_id=${RUN_ID}" \
-  "${TRAIN_EXTRA[@]}" \
-  "seed=${SEED}" \
-  callbacks.model_checkpoint.dirpath=artifacts/energy/checkpoints \
+LOGGER_EXTRA=()
+PIPELINE_CONFIG=()
+if [[ -n "${PIPELINE_ENV:-}" ]]; then
+  lattice_pipeline_source_env
+  if [[ -d "${PIPELINE_LOG_DIR}/configs" ]]; then
+    PIPELINE_CONFIG=(--config-path="${PIPELINE_LOG_DIR}/configs")
+  fi
+  WANDB_NAME="stage5_${RUN_ID}"
+  [[ "${N_SEEDS:-1}" -gt 1 ]] && WANDB_NAME="${WANDB_NAME}_s${SEED}"
+  LOGGER_EXTRA=("logger.wandb.name=${WANDB_NAME}")
+fi
+
+STAGE5_ARGS=(
+  "experiment=${EXPERIMENT}"
+  "ssl_run_id=${RUN_ID}"
+  "${TRAIN_EXTRA[@]}"
+  "${LOGGER_EXTRA[@]}"
+  "seed=${SEED}"
+  "${MERGE_STORE_ARGS[@]}"
+  data.batch_size=64
+  callbacks.model_checkpoint.dirpath=artifacts/energy/checkpoints
   trainer.precision=bf16-mixed
+)
+if [[ -n "${PIPELINE_ENV:-}" ]]; then
+  STAGE5_ARGS+=("model.encoder.ckpt=${SSL_CKPT_REL}")
+fi
+if [[ -n "${PIPELINE_LOG_DIR:-}" ]]; then
+  lattice_pipeline_save_train_args 5 "${PIPELINE_CONFIG[@]}" "${STAGE5_ARGS[@]}"
+fi
+
+srun python -m lattice_lab.train "${PIPELINE_CONFIG[@]}" "${STAGE5_ARGS[@]}"
 
 if [[ -n "${PIPELINE_ENV:-}" ]]; then
   EBM_RUN_ID="$(lattice_newest_subdir_since "${PIPELINE_MARKER}" "${REPO}/artifacts/energy/checkpoints")"
-  lattice_require_file "${REPO}/artifacts/energy/checkpoints/${EBM_RUN_ID}/last.ckpt" \
-    "stage5 seed=${SEED} finished but no new EBM checkpoint found (pipeline)"
-  echo "${EBM_RUN_ID}" > "${PIPELINE_ENV}.ebm.${SEED}"
-  lattice_job_banner "pipeline wrote EBM seed=${SEED} → ${EBM_RUN_ID}"
+  EBM_CKPT_REL="$(lattice_pipeline_ebm_ckpt "${EBM_RUN_ID}")"
+  lattice_require_file "${REPO}/${EBM_CKPT_REL}" \
+    "stage5 seed=${SEED} finished but no EBM checkpoint found (pipeline)"
+  echo "${EBM_RUN_ID}" > "$(lattice_pipeline_ebm_sidecar "${SEED}")"
+  rm -f "${PIPELINE_MARKER}"
+  lattice_job_banner "pipeline wrote EBM seed=${SEED} → ${PIPELINE_LOG_DIR}/ebm.${SEED} ckpt=${EBM_CKPT_REL}"
 fi

@@ -17,7 +17,7 @@ data:
 
 model:
   encoder:
-    adapter_ckpt: artifacts/adapter/checkpoints/${ssl_run_id}/last.ckpt
+    ckpt: artifacts/adapter/checkpoints/${ssl_run_id}/last.ckpt
 
 logger:
   wandb:

@@ -42,16 +42,22 @@ class Adapter(nn.Module):
         in_dim = d_backbone * n_backbone_layers
 
         self.input_proj = nn.Linear(in_dim, d_adapter)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_adapter,
-            nhead=n_heads,
-            dim_feedforward=d_adapter * ff_mult,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.n_layers = n_layers
+        if n_layers > 0:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_adapter,
+                nhead=n_heads,
+                dim_feedforward=d_adapter * ff_mult,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        else:
+            # ponytail: linear proj + pool only (no token mixing); PyTorch's
+            # TransformerEncoder(num_layers=0) still indexes layers[0] in forward.
+            self.encoder = None
         self.norm = nn.LayerNorm(d_adapter)
 
         self.proj_head = nn.Sequential(
@@ -114,11 +120,12 @@ class Adapter(nn.Module):
             or ``(z_m, x)`` when ``return_tokens``.
         """
         x = self.input_proj(hidden_states_concat)
-        # nn.TransformerEncoder expects ``src_key_padding_mask`` where True = ignore.
-        key_padding_mask = attention_mask <= 0
-        if hole_mask is not None:
-            key_padding_mask = key_padding_mask | hole_mask.bool()
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        if self.encoder is not None:
+            # nn.TransformerEncoder expects ``src_key_padding_mask`` where True = ignore.
+            key_padding_mask = attention_mask <= 0
+            if hole_mask is not None:
+                key_padding_mask = key_padding_mask | hole_mask.bool()
+            x = self.encoder(x, src_key_padding_mask=key_padding_mask)
         x = self.norm(x)
         # Exclude BOS (idx 0) and EOS (last real token) from pooling, per README:
         # "Mean pooling over token positions (excluding special tokens)". We assume

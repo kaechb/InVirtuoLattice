@@ -1,0 +1,17 @@
+# @package _global_
+# Stage-2 SSL on the discrete-flow (DDiT) backbone with fragment-shuffle views.
+# Pick the loss via model.ssl_loss (ntxent | lejepa | ijepa | hybrid); stage2_ssl.sh
+# sets METHOD-specific overrides.
+#
+#   python -m lattice_lab.train experiment=adapter_discrete_flow
+#   python -m lattice_lab.train experiment=adapter_discrete_flow model.ssl_loss=lejepa
+defaults:
+  - override /data: fragment_views
+  - override /model: discrete_flow
+  - override /trainer: adapter
+  - override /callbacks: ssl_basic
+
+data:
+  return_smiles: false  # set true with model.fp_weight > 0
+
+tags: ["ssl", "discrete_flow"]

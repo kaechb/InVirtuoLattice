@@ -1,0 +1,24 @@
+# Best by val-probe structural R² (logged as r2/mean_structural each val epoch).
+# Listed first so Trainer.checkpoint_callback points at this best path.
+model_checkpoint_r2_structural:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: best-r2struct-{epoch:03d}-{step:06d}
+  monitor: r2/mean_structural
+  mode: max
+  save_top_k: 1
+  save_last: false
+  auto_insert_metric_name: false
+
+# Always keep the final epoch for downstream stages (stage 4/5 default to last.ckpt).
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: ssl-{epoch:03d}-{step:06d}
+  save_last: true
+  save_top_k: 0
+  auto_insert_metric_name: false
+
+learning_rate_monitor:
+  _target_: lightning.pytorch.callbacks.LearningRateMonitor
+  logging_interval: step

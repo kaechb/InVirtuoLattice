@@ -1,0 +1,25 @@
+# @package _global_
+# EBM hard-negative training on NT-Xent adapter + decoy pools.
+#
+#   python -m lattice_lab.train experiment=ebm_hardneg_ntxent
+defaults:
+  - ebm_hardneg
+
+tags: ["ebm", "hardneg", "ntxent"]
+
+# W&B run id from Stage 2 (edit after adapter SSL training).
+ssl_run_id: 1kfmwoar
+
+data:
+  decoy_store: artifacts/decoys/${ssl_run_id}/decoy_zm/
+  bdb_store: artifacts/decoys/${ssl_run_id}/bdb_zm
+  binder_store: artifacts/binders/${ssl_run_id}/binder_zm
+
+model:
+  encoder:
+    adapter_ckpt: artifacts/adapter/checkpoints/${ssl_run_id}/last.ckpt
+
+logger:
+  wandb:
+    group: ssl_compare_ntxent
+    name: ebm_hardneg_ntxent

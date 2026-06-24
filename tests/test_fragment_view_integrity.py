@@ -1,9 +1,11 @@
 """Integrity checks for the *fragmented*-SMILES views the model actually encodes.
 
 Stage-2 SSL never feeds the model a plain SMILES — it feeds a ``fragment_view``:
-a space-separated, shuffled subset of BRICS fragments (each carrying dummy-atom
-tokens like ``[1*]``/``[16*]``), where the **space is the fragment separator**
-(token id 4, ``frag_sep_id``). Two failure modes would silently corrupt training:
+a space-separated, shuffled set of *all* BRICS fragments (each carrying
+matched dummy-atom tokens like ``[1*]``/``[2*]``), where the **space is the fragment
+separator** (token id 4, ``frag_sep_id``). The full fragment set is encoded —
+never a subset, which would drop atoms and encode a different molecule. Two
+failure modes would silently corrupt training:
 
 1. The 204-token char tokenizer has **no UNK**, so any out-of-vocab token is
    *dropped*, not flagged — a fragment could be silently mangled.

@@ -38,17 +38,30 @@ SSL_CKPT="artifacts/adapter/checkpoints/${RUN_ID}/last.ckpt"
 
 lattice_load_gpu_modules
 lattice_cd_repo
-[[ -n "${PIPELINE_LOG_DIR:-}" ]] && trap 'lattice_pipeline_collect_logs_on_exit 4' EXIT
+lattice_pipeline_track_slurm_logs 4
 lattice_require_gpu
+
+if [[ -n "${PIPELINE_ENV:-}" && -f "${PIPELINE_ENV}" ]]; then
+  SSL_CKPT="$(lattice_pipeline_ssl_ckpt "${RUN_ID}")"
+  lattice_job_banner "pipeline ssl ckpt → ${SSL_CKPT}"
+fi
 
 export WANDB_MODE=disabled
 
 lattice_require_file "${REPO}/${SSL_CKPT}" \
   "missing adapter checkpoint for RUN_ID=${RUN_ID}"
 
+# Merge variant follows the adapter itself (fragment_merge flag in its ckpt), so
+# the moses/bindingdb sources and the decoy_zm/bdb_zm/binder_zm stores always
+# match how the adapter was trained — the precompute CLIs derive the store suffix
+# from the same ckpt, so they need no flag.
+MERGE_SUFFIX="$(lattice_ckpt_merge_suffix "${REPO}/${SSL_CKPT}")"
+[[ -n "${MERGE_SUFFIX}" ]] && lattice_job_banner "adapter trained on merge views → ${MERGE_SUFFIX} stores"
+lattice_sync_moses_shards_to_flash "${MERGE_SUFFIX}"
+
 PRECOMPUTE_LIMIT=()
-TRAIN_PARQUET="artifacts/preprocessing/processed/bindingdb/threshold_90/train.parquet"
-VAL_PARQUET="artifacts/preprocessing/processed/bindingdb/threshold_90/val.parquet"
+TRAIN_PARQUET="artifacts/preprocessing/processed/bindingdb${MERGE_SUFFIX}/threshold_90/train.parquet"
+VAL_PARQUET="artifacts/preprocessing/processed/bindingdb${MERGE_SUFFIX}/threshold_90/val.parquet"
 if lattice_smoke_enabled; then
   PRECOMPUTE_LIMIT=(--limit "$(lattice_smoke_precompute_limit)")
   SMOKE_PARQUET_DIR="${SMOKE_PARQUET_DIR:-${REPO}/logs/slurm/smoke-$$}"
@@ -59,7 +72,7 @@ if lattice_smoke_enabled; then
 fi
 
 srun python -m lattice_lab.ebm.precompute_decoys \
-  --shard-dir "${LATTICE_FLASH_PROCESSED}/moses" \
+  --shard-dir "${LATTICE_FLASH_PROCESSED}/moses${MERGE_SUFFIX}" \
   --adapter-ckpt "${SSL_CKPT}" \
   --batch-size 512 \
   "${PRECOMPUTE_LIMIT[@]}" \

@@ -46,8 +46,10 @@ OVERWRITE_ARGS=()
 
 lattice_load_gpu_modules
 lattice_cd_repo
-[[ -n "${PIPELINE_LOG_DIR:-}" ]] && trap 'lattice_pipeline_collect_logs_on_exit 3' EXIT
+lattice_pipeline_track_slurm_logs 3
 lattice_require_gpu
+
+export WANDB_MODE=disabled
 
 for _fasta in bindingdb_targets.fasta lit_pcba_targets.fasta; do
   srun python -m lattice_lab.protein.precompute \

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from collections.abc import Sequence
@@ -310,36 +311,39 @@ def main() -> None:
     )
     _resolve_device(args.device)
 
-    with RunLogger(
-        project=args.wandb_project,
-        run_name=args.wandb_run_name,
-        config={k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-        tags=["stage-3", args.backend],
-    ) as rl:
-        summary = precompute_embeddings(
-            fasta_path=args.fasta,
-            store_dir=args.store,
-            backend=args.backend,
-            model_name=args.model_name,
-            embedding_dim=args.embedding_dim,
-            device=args.device,
-            dtype=args.dtype,
-            max_length=args.max_length,
-            batch_size=args.batch_size,
-            min_len=args.min_len,
-            max_len=args.max_len,
-            require_canonical=not args.no_canonical_filter,
-            per_residue=args.per_residue,
-            overwrite=args.overwrite,
-            run_logger=rl,
-        )
-        rl.log({
-            "protein/summary/n_input": summary.n_input,
-            "protein/summary/n_after_filter": summary.n_after_filter,
-            "protein/summary/n_already_in_store": summary.n_already_in_store,
-            "protein/summary/n_embedded": summary.n_embedded,
-            "protein/summary/seconds": summary.seconds,
-        })
+    embed_kwargs = dict(
+        fasta_path=args.fasta,
+        store_dir=args.store,
+        backend=args.backend,
+        model_name=args.model_name,
+        embedding_dim=args.embedding_dim,
+        device=args.device,
+        dtype=args.dtype,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        min_len=args.min_len,
+        max_len=args.max_len,
+        require_canonical=not args.no_canonical_filter,
+        per_residue=args.per_residue,
+        overwrite=args.overwrite,
+    )
+    if os.environ.get("WANDB_MODE", "online") == "disabled":
+        summary = precompute_embeddings(**embed_kwargs, run_logger=None)
+    else:
+        with RunLogger(
+            project=args.wandb_project,
+            run_name=args.wandb_run_name,
+            config={k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+            tags=["stage-3", args.backend],
+        ) as rl:
+            summary = precompute_embeddings(**embed_kwargs, run_logger=rl)
+            rl.log({
+                "protein/summary/n_input": summary.n_input,
+                "protein/summary/n_after_filter": summary.n_after_filter,
+                "protein/summary/n_already_in_store": summary.n_already_in_store,
+                "protein/summary/n_embedded": summary.n_embedded,
+                "protein/summary/seconds": summary.seconds,
+            })
 
     logger.info("done: %s", summary)
 

@@ -1,0 +1,27 @@
+# @package _global_
+# Evaluation config. Runs Trainer.validate on a trained checkpoint:
+#   python -m lattice_lab.eval ckpt_path=/path/to/last.ckpt
+defaults:
+  - _self_
+  - paths: default
+  - trainer: ebm
+  - data: ebm
+  - model: ebm
+  - logger: csv
+  - experiment: null
+
+task_name: eval
+tags: ["eval"]
+seed: 0
+ckpt_path: ???
+
+n_decoys: 600
+d_adapter: 512
+d_protein: 1280
+ssl_run_id: ed7yw5vq
+
+hydra:
+  run:
+    dir: ${paths.log_dir}/${task_name}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  job:
+    chdir: false

@@ -27,6 +27,53 @@ were **not** carried over; their reusable helpers were extracted into small,
 single-purpose modules (`models/builders.py`, `models/schedules.py`,
 `models/encode.py`, `data/cluster_sampler.py`).
 
+## Molecule fragment views — faithful representation & the `merge` variant
+
+Every molecule (binder, decoy, MOSES SSL example) is encoded by the DDiT+adapter
+from a **fragment view**: a space-separated string of BRICS fragments. Two
+functions in `preprocessing/molecules.py` produce them, and the split is
+load-bearing:
+
+- **`fragment_view(smiles, *, merge=False)` — faithful, full coverage.** Used
+  everywhere `z_m` must *be* the molecule: decoy/binder precompute (Stage 4), the
+  EBM (Stage 5), eval (Stage 6). It cuts the molecule at BRICS bonds into a true
+  partition via `BRICS.BreakBRICSBonds`, so every heavy atom is preserved.
+  `merge=False` cuts *all* BRICS bonds (finest); `merge=True` cuts a random subset
+  (coarser, still full coverage).
+- **`augment_fragment_views(...)` — SSL augmentation only.** May *drop* fragments
+  (I-JEPA-style masking) and vary granularity, then shuffle. Used only to build
+  the MOSES SSL corpus, where the model should learn to be robust to perturbed
+  views.
+
+> **Correctness fix (why this split exists).** The earlier single
+> `smiles_to_fragment_views` sampled a *random subset* of BRICS fragments
+> (`rng.sample`) as the one stored view, so ~45% of molecules — binders **and**
+> decoys — were encoded from an *incomplete* molecule. With online hard-negative
+> mining this capped Stage-5 InfoNCE / EF well below the original `lattice` stack
+> regardless of `d_adapter`. Two traps to avoid if you touch this: never use
+> `BRICS.BRICSDecompose` for a faithful view (it returns a *deduplicated set of
+> building blocks*, dropping repeated fragments — not a partition), and never bake
+> `drop` into the stored view (the SSL datamodule applies mask/shuffle **online**
+> per contrastive view, so nothing lossy belongs in the stores).
+
+### The `merge` variant and how it stays consistent
+
+`merge=True` is an alternative *coarser* granularity for the whole pipeline,
+toggled by a single `MERGE` env var (default `MERGE=0` = finest faithful):
+
+- **Stages 1–2 choose it** (`MERGE=1`): Stage 1 writes a parallel dataset under
+  `*_merge` dirs (`moses_merge`, `bindingdb_merge`) and Stage 2 trains the adapter
+  on it. *Stage 1 and Stage 2 must use the same `MERGE`* — Stage 2 reads the
+  `moses${suffix}` shards Stage 1 produced.
+- **Stage 2 records the choice in the adapter checkpoint** — `fragment_merge` is
+  embedded by the SSL module's `on_save_checkpoint`.
+- **Stages 4/5/6 read it back from the checkpoint** (`builders.merge_from_ckpt`,
+  via `lattice_ckpt_merge_suffix`) and auto-select the matching
+  `decoy_zm_merge` / `bdb_zm_merge` / `binder_zm_merge` stores — and for eval the
+  flag rides into the EBM ckpt's `encoder_config`. A merge-trained adapter can
+  never be paired with finest-partition stores; set `MERGE` wrong on a downstream
+  stage and it's ignored, the checkpoint wins.
+
 ## Layout
 
 ```
@@ -166,14 +213,20 @@ vars** — you don't edit the script files.
 
 | Stage | Script | Args / env | Output |
 |---|---|---|---|
-| 1 | `stage1_preprocess.sh` | — | BindingDB curation + 90% MMseqs2 split |
-| 2 | `stage2_ssl.sh` | `METHOD`, optional `RUN_NAME` | `artifacts/adapter/checkpoints/<run_id>/last.ckpt` |
+| 1 | `stage1_preprocess.sh` | `MERGE` (0/1) | BindingDB curation + 90% MMseqs2 split |
+| 2 | `stage2_ssl.sh` | `METHOD`, `MERGE` (0/1), optional `RUN_NAME` | `artifacts/adapter/checkpoints/<run_id>/last.ckpt` |
 | 3 | `stage3_protein_precompute.sh` | `PROTEIN` (`esm2`\|`esmc`), `OVERWRITE` | frozen ESM-2 / ESM C store |
 | 4 | `stage4_precompute_decoys.sh` | `RUN_ID` (Stage-2 W&B id) | `artifacts/decoys/<run_id>/…`, `artifacts/binders/<run_id>/…` |
 | 5 | `stage5_ebm_train.sh` | `METHOD`, `RUN_ID` (Stage-2); optional `--three-seeds` | `artifacts/energy/checkpoints/<run_id>/last.ckpt` |
 | 6 | `stage6_eval.sh` | `RUN_ID` or three EBM ids; optional `--single-view` + `SSL_RUN_ID` | mv4 cache + CSV, ensemble JSON, or 1-view CSV |
 | 7 | `stage7_predict_ensemble.sh` | edit paths + seed ids in script | virtual screening CSV |
-| — | `run_pipeline.sh` | `METHOD`, `PROTEIN`, `N_SEEDS`, optional `RUN_NAME` | submits stages 2→6 (same stage scripts) with SLURM dependencies |
+| — | `run_pipeline.sh` | `METHOD`, `PROTEIN`, `N_SEEDS`, `MERGE`, optional `RUN_NAME` | submits stages 2→6 (same stage scripts) with SLURM dependencies |
+
+**`MERGE` (default `0`).** Selects the fragment-view granularity (see *Molecule
+fragment views* above). Set it only on **Stage 1 and Stage 2** (and `run_pipeline.sh`,
+which threads it through); Stages 4–6 derive it from the adapter checkpoint, so you
+never pass it there. `MERGE=1` reads/writes the parallel `*_merge` datasets and
+`*_zm_merge` stores. The two variants coexist on disk, so you can build both.
 
 **Run-id convention.** Stage 2 prints a W&B run id; that same id keys Stage-4
 decoy pools and is passed to Stage 5 as `RUN_ID`. Stage 5 prints one W&B run id
@@ -186,6 +239,8 @@ sbatch scripts/slurm/stage2_ssl.sh ntxent
 sbatch scripts/slurm/stage2_ssl.sh ijepa
 sbatch scripts/slurm/stage2_ssl.sh ijepa my_ablation_name   # optional W&B run name
 sbatch scripts/slurm/stage2_ssl.sh denoise
+MERGE=1 sbatch scripts/slurm/stage1_preprocess.sh           # coarser variant: build it first…
+MERGE=1 sbatch scripts/slurm/stage2_ssl.sh lejepa           # …then train on it (Stage 4–6 follow the ckpt)
 # → note the W&B run id, e.g. nsw2w2z5
 
 # --- Stage 4: z_m pools (any Stage-2 ckpt; encoder type auto-detected) ---
@@ -210,13 +265,20 @@ sbatch --dependency=afterok:<stage4_jobid> scripts/slurm/stage5_ebm_train.sh lej
 
 **Full pipeline (stages 2→6, dependency chain):** run from the login node — **not**
 `sbatch`. `run_pipeline.sh` submits the same stage scripts with `PIPELINE_ENV` set;
-stage 2 writes the adapter W&B id, stage 5 writes per-seed EBM ids to
-`<pipeline_id>.env.ebm.<seed>`, and stages 4/6 read those automatically.
+stage 2 snapshots Hydra configs into that directory; stage 5 trains against the
+snapshot so later repo edits cannot change EBM settings mid-pipeline.
+
+`run_pipeline.sh` starts at Stage 2, so build the matching Stage-1 dataset first
+(e.g. `MERGE=1 sbatch scripts/slurm/stage1_preprocess.sh`) and pass the same
+`MERGE` to the pipeline; it seeds `MERGE` into `PIPELINE_ENV` and every stage
+follows the adapter checkpoint from there.
 
 ```bash
 ./scripts/slurm/run_pipeline.sh lejepa
 PROTEIN=esmc RUN_NAME=ijepa_ablation ./scripts/slurm/run_pipeline.sh ijepa
-N_SEEDS=3 ./scripts/slurm/run_pipeline.sh lejepa          # three seeds → stage6_ensemble_eval path
+N_SEEDS=3 ./scripts/slurm/run_pipeline.sh lejepa          # fresh run: stages 2–4 once, EBM ×3, ensemble eval
+MULTISEED=1 ADAPTER_RUN_ID=avy80iqo ./scripts/slurm/run_pipeline.sh   # existing run: only stage 5 ×3 + stage 6
+MERGE=1 ./scripts/slurm/run_pipeline.sh lejepa            # coarser fragment-view variant end-to-end
 SMOKE=1 ./scripts/slurm/run_pipeline.sh lejepa           # fast wiring test (~1h total)
 ```
 
@@ -246,6 +308,7 @@ stage2 ─┬─→ stage3 ─┐
 | `RUN_NAME` | — | Optional W&B run name for stage 2 (positional `$2`) |
 | `PROTEIN` | `esm2` | Stage 3: `esm2` or `esmc` (pipeline sets `OVERWRITE=0` for incremental embed) |
 | `N_SEEDS` | `1` | Stage-5 seeds; `3` runs ensemble eval, else single-checkpoint eval |
+| `MULTISEED` | `0` | `1` + `ADAPTER_RUN_ID` (or `PIPELINE_ENV`) = re-submit stage 5 ×3 + stage 6 only |
 | `SMOKE` | `0` | `1` = smoke mode (see above) |
 
 Stage 3 skips pids already in the protein store; stages 4–6 rebuild decoy pools
@@ -380,6 +443,17 @@ python -m lattice_lab.preprocessing.run_preprocessing \
     --output artifacts/preprocessing/processed/moses \
     --n-views 3 --n-jobs 16
 ```
+
+Both commands write **faithful, full-coverage** fragment views by default (no
+atoms dropped); SSL masking/shuffle happens online in the datamodule. Add
+`--merge` to either command to build the coarser multi-granularity variant
+instead — it appends `_merge` to the output dir (`moses_merge`,
+`bindingdb_merge`), so the two datasets coexist. On SLURM this is the `MERGE=1`
+env var (see the stage table above); keep it consistent across Stage 1 and 2.
+
+MMseqs2 (the Stage-1 clustering dep) runs in a fresh per-run workdir
+(`_mmseqs_cluster/`), wiped each run, so a previous run's leftovers can't make
+`mmseqs cluster` abort; on a genuine failure its own stderr is surfaced.
 
 ### Stage 2 — Molecule encoder (DDiT + adapter SSL)
 

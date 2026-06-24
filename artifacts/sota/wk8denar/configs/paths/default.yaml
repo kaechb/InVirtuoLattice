@@ -1,0 +1,5 @@
+# Repo root stays the working dir (hydra.job.chdir=false), so the data paths in
+# data/*.yaml remain repo-root-relative exactly like the original pipeline.
+root_dir: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}}
+log_dir: ${paths.root_dir}/logs
+output_dir: ${hydra:runtime.output_dir}

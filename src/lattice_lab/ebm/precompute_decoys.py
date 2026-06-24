@@ -11,7 +11,12 @@ import torch
 from tqdm.auto import tqdm
 
 from lattice_lab.eval.encode_utils import encode_views_inference
-from lattice_lab.models.builders import adapter_run_id, build_eval_encoder, zm_store_path
+from lattice_lab.models.builders import (
+    adapter_run_id,
+    build_eval_encoder,
+    merge_from_ckpt,
+    zm_store_path,
+)
 from lattice_lab.preprocessing.molecules import fragment_view_column_for_parquet
 from lattice_lab.protein.store import EmbeddingStore
 
@@ -139,7 +144,10 @@ def main() -> None:
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     args.limit = None if args.limit < 0 else args.limit
     if args.store_path is None:
-        args.store_path = zm_store_path(args.adapter_ckpt, "decoy_zm")
+        # Store variant follows the adapter (recorded in its ckpt) — never the env.
+        args.store_path = zm_store_path(
+            args.adapter_ckpt, "decoy_zm", merge=merge_from_ckpt(args.adapter_ckpt)
+        )
     run(args)
 
 

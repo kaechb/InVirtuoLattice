@@ -19,6 +19,7 @@ from pathlib import Path
 from rdkit import RDLogger
 from lattice_lab.eval.lit_pcba import (
     ADAPTER_FP_KEY,
+    N_VIEWS_KEY,
     _build_encoder,
     enforce_cache_adapter,
 )
@@ -138,7 +139,7 @@ def main():
     d_adapter = int(enc.adapter.d_adapter)
     store = EmbeddingStore.create(a.zm_cache, embedding_dim=d_adapter,
         model_name=f"lattice-adapter-mv{a.n_views}", dtype="float16", per_residue=False,
-        extra={"source": str(a.test_parquet), "n_views": str(a.n_views),
+        extra={"source": str(a.test_parquet), N_VIEWS_KEY: str(a.n_views),
                "adapter_ckpt": str(a.adapter_ckpt),
                "adapter_run_id": str(a.zm_cache.parent.name),
                ADAPTER_FP_KEY: adapter_fingerprint(a.adapter_ckpt)})

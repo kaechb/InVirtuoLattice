@@ -33,3 +33,12 @@ core.*
 # negation below can re-include the small tokenizer (a model asset, not data).
 artifacts/*
 !artifacts/tokenizer/
+!artifacts/sota/
+!artifacts/sota/**/README.md
+!artifacts/sota/**/runs.json
+!artifacts/sota/**/results/
+!artifacts/sota/**/results/**
+!artifacts/sota/**/pipeline.env
+!artifacts/sota/**/configs/
+!artifacts/sota/**/configs/**
+# zm_cache/ and *.ckpt live on disk only (large binaries)

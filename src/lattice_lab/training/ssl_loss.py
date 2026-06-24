@@ -143,13 +143,8 @@ class LeJEPALossTerms:
     (not detached) so callers can take per-term gradients for diagnostics;
     detach before logging as a scalar.
 
-    ``inv_rel`` is a detached diagnostic: the invariance MSE divided by the
-    between-molecule variance of the per-molecule centers. ~1 means a molecule's
-    views are spread as widely as molecules are from each other (collapse /
-    uninformative); «1 means views of a molecule cluster much tighter than the
-    batch spreads (discriminative). The raw ``inv`` MSE is on unnormalized
-    latents, so its absolute value is uninterpretable on its own — this ratio is
-    what tells you whether the representation is actually discriminative."""
+    ``inv_rel`` is a detached diagnostic: invariance MSE divided by the
+    between-molecule variance of per-molecule centers."""
 
     total: torch.Tensor
     inv: torch.Tensor
@@ -162,27 +157,14 @@ class LeJEPALoss(nn.Module):
 
     ``L = (1 - lambda) * L_inv + lambda * L_sigreg``
 
-    A convex combination, so ``lejepa_lambda in [0, 1]`` is a genuine *relative*
-    trade-off between the two terms.
+    * **Invariance**: ``mean ||z_all - center||^2`` where ``center`` is the mean
+      of intact (target) views per molecule.
+    * **SIGReg**: Epps-Pulley statistic on the batch of intact target embeddings.
 
-    * **Invariance**: every view of a molecule (intact fragment-shuffles +
-      masked-fragment views) is pulled toward that molecule's center — the mean
-      of its *intact* (target) views: ``mean ||z_all - center||^2``. No
-      predictor: the views are aligned directly. A predictor only earns its keep
-      when context↔target are information-asymmetric *and* paired with a
-      stop-grad/EMA target (I-JEPA); here the same encoder produces symmetric
-      views, so direct alignment is the honest objective and SIGReg is what
-      prevents collapse.
-    * **SIGReg**: runs on the batch of intact (target) embeddings only,
-      forcing the chemical map toward an isotropic Gaussian.
+    Latents should be unnormalized pooled adapter outputs.
 
-    Latents should be **unnormalized** pooled adapter outputs.
-
-    SIGReg's ``* proj.size(-2)`` (the formal Epps-Pulley statistic's batch-size
-    scaling) makes the raw statistic grow ~linearly with batch size, unlike the
-    invariance MSE's plain ``.mean()``. We divide that ``B`` back out here so the
-    SIGReg term is ``O(1)`` and ``lambda`` is a clean, batch-size-independent
-    relative weight (rather than the old trick of dividing ``lambda`` by ``B``).
+    SIGReg's raw statistic scales with batch size; divide by ``B`` here so
+    ``lejepa_lambda`` is batch-size-independent (see ``forward``).
     """
 
     def __init__(
@@ -243,21 +225,59 @@ class LeJEPALoss(nn.Module):
 
 @dataclass
 class IJEPALossTerms:
-    """``predict``/``sigreg`` are the raw (unweighted) sub-losses, graph attached.
-    ``predict`` is visible+mask-token predictor → target cosine regression;
-    ``sigreg`` is the anti-collapse regularizer (SIGReg or VICReg) on the
-    **mean-pooled** intact ``z_m`` batch — the level at which collapse is observed."""
+    """Raw (unweighted) sub-losses with graph attached."""
 
     total: torch.Tensor
     predict: torch.Tensor
+    glob: torch.Tensor
+    inv: torch.Tensor
     sigreg: torch.Tensor
+    gram: torch.Tensor
+
+
+def gram_anchoring_loss(
+    tok_online: torch.Tensor,
+    tok_target: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """Gram anchoring (DINOv3): match the student's patch-patch similarity matrix
+    to a stop-grad teacher's, per molecule.
+
+    Each entry of the per-molecule Gram matrix is the cosine similarity between two
+    patches (tokens). Matching Gram matrices constrains the *second-order statistics
+    across patches* — the structure of dense features — without forcing the feature
+    values themselves to match, which is what stabilizes dense representations over
+    long training schedules.
+
+    ``tok_online``/``tok_target`` are ``[B,T,D]`` per-token reps (the target is
+    detached here); ``valid`` is ``[B,T]`` bool. Returns a scalar averaged over
+    molecules, each normalized by its patch count squared so it is length-invariant.
+
+    ponytail: single-scale only. DINOv3 also anchors across image resolutions, but a
+    token sequence has no resolution axis, so only the patch (token) axis applies.
+    """
+    if tok_online.shape != tok_target.shape:
+        raise ValueError(
+            f"gram online/target shape mismatch: "
+            f"{tuple(tok_online.shape)} vs {tuple(tok_target.shape)}"
+        )
+    if tok_online.dim() != 3 or valid.shape != tok_online.shape[:2]:
+        raise ValueError(
+            f"gram expects tok [B,T,D] and valid [B,T]; "
+            f"got {tuple(tok_online.shape)} valid={tuple(valid.shape)}"
+        )
+    on = torch.nn.functional.normalize(tok_online, dim=-1)
+    tg = torch.nn.functional.normalize(tok_target, dim=-1)
+    gram_on = torch.bmm(on, on.transpose(1, 2))                 # [B,T,T] cos(patch_i, patch_j)
+    gram_tg = torch.bmm(tg, tg.transpose(1, 2)).detach()
+    pair = (valid.unsqueeze(2) & valid.unsqueeze(1)).to(gram_on.dtype)
+    sq = (gram_on - gram_tg).square() * pair                    # zero out pad rows/cols
+    p = valid.sum(dim=1).clamp_min(1).to(gram_on.dtype)         # patches per molecule
+    return (sq.flatten(1).sum(dim=1) / (p * p)).mean()
 
 
 class _IJEPAPredictor(nn.Module):
-    """I-JEPA-style predictor: visible encoder reps + learnable mask tokens (pos embed).
-
-    Kept intentionally small (default 1 layer) so semantics stay in the encoder.
-    """
+    """Small transformer: visible encoder reps + mask-token queries (with position embed)."""
 
     def __init__(
         self,
@@ -296,51 +316,82 @@ class _IJEPAPredictor(nn.Module):
                 f"predictor expects tok [B,T,D] and hole [B,T]; "
                 f"got {tuple(tok.shape)} vs {tuple(hole.shape)}"
             )
-        b, _, dim = tok.shape
+        b, t_len, dim = tok.shape
+        device = tok.device
         if valid is None:
-            valid = torch.ones(b, hole.size(1), dtype=torch.bool, device=tok.device)
+            valid = torch.ones(b, t_len, dtype=torch.bool, device=device)
         visible = valid & ~hole
 
-        ctx_parts: list[torch.Tensor] = []
-        query_parts: list[torch.Tensor] = []
-        seq_lens: list[int] = []
-        for i in range(b):
-            hole_idx = hole[i].nonzero(as_tuple=True)[0]
-            if hole_idx.numel() == 0:
-                continue
-            vis_idx = visible[i].nonzero(as_tuple=True)[0]
-            max_pos = max(int(hole_idx.max()), int(vis_idx.max()) if vis_idx.numel() else 0)
-            if max_pos >= self.pos_embed.num_embeddings:
-                raise ValueError(
-                    f"token position {max_pos} >= max_positions "
-                    f"{self.pos_embed.num_embeddings}"
-                )
-            # Visible reps carry their position (same table as the mask-token
-            # queries) so the predictor reasons about where each visible token sits
-            # relative to the holes, instead of pooling a positionless bag.
-            ctx_parts.append(tok[i, vis_idx] + self.pos_embed(vis_idx))
-            query_parts.append(
-                self.mask_token.expand(hole_idx.numel(), dim) + self.pos_embed(hole_idx)
-            )
-            seq_lens.append(int(vis_idx.numel() + hole_idx.numel()))
-        if not ctx_parts:
+        n_vis = visible.sum(dim=1)
+        n_hole = hole.sum(dim=1)
+        active = n_hole > 0
+        if not bool(active.any()):
             return tok.new_zeros(0, dim)
 
-        max_len = max(seq_lens)
-        n_seq = len(ctx_parts)
-        seq = tok.new_zeros(n_seq, max_len, dim)
-        pad = torch.ones(n_seq, max_len, dtype=torch.bool, device=tok.device)
-        for j, (ctx, queries) in enumerate(zip(ctx_parts, query_parts)):
-            n = ctx.size(0) + queries.size(0)
-            seq[j, : ctx.size(0)] = ctx
-            seq[j, ctx.size(0) : n] = queries
-            pad[j, :n] = False
+        tok_a = tok[active]
+        visible_a = visible[active]
+        hole_a = hole[active]
+        n_vis_a = n_vis[active]
+        b_a = tok_a.size(0)
+
+        vis_cum = torch.where(
+            visible_a, visible_a.long().cumsum(dim=1) - 1, 0
+        )
+        hole_cum = torch.where(hole_a, hole_a.long().cumsum(dim=1) - 1, 0)
+
+        vis_b, vis_t = visible_a.nonzero(as_tuple=True)
+        hole_b, hole_t = hole_a.nonzero(as_tuple=True)
+        max_pos = 0
+        if vis_t.numel():
+            max_pos = max(max_pos, int(vis_t.max()))
+        if hole_t.numel():
+            max_pos = max(max_pos, int(hole_t.max()))
+        if max_pos >= self.pos_embed.num_embeddings:
+            raise ValueError(
+                f"token position {max_pos} >= max_positions "
+                f"{self.pos_embed.num_embeddings}"
+            )
+
+        seq_lens = n_vis_a + n_hole[active]
+        max_len = int(seq_lens.max())
+        seq = tok.new_zeros(b_a, max_len, dim)
+        arange = torch.arange(max_len, device=device)
+        pad = arange.unsqueeze(0) >= seq_lens.unsqueeze(1)
+
+        if vis_b.numel():
+            seq[vis_b, vis_cum[vis_b, vis_t]] = (
+                tok_a[vis_b, vis_t] + self.pos_embed(vis_t)
+            )
+        if hole_b.numel():
+            seq[hole_b, n_vis_a[hole_b] + hole_cum[hole_b, hole_t]] = (
+                self.mask_token + self.pos_embed(hole_t)
+            )
+
         out = self.norm(self.transformer(seq, src_key_padding_mask=pad))
-        preds: list[torch.Tensor] = []
-        for j, (ctx, queries) in enumerate(zip(ctx_parts, query_parts)):
-            n_vis = ctx.size(0)
-            preds.append(out[j, n_vis : n_vis + queries.size(0)])
-        return torch.cat(preds, dim=0)
+        return out[hole_b, n_vis_a[hole_b] + hole_cum[hole_b, hole_t]]
+
+
+def _mean_visible_pool(
+    tok: torch.Tensor, hole: torch.Tensor, valid: torch.Tensor
+) -> torch.Tensor:
+    """Mean-pool visible (non-hole, valid) token reps per row: ``[B,T,D]`` → ``[B,D]``."""
+    vis = (valid & ~hole).to(tok.dtype).unsqueeze(-1)
+    return (tok * vis).sum(dim=1) / vis.sum(dim=1).clamp_min(1.0)
+
+
+class _GlobalReadout(nn.Module):
+    """Maps pooled visible context to a global embedding prediction."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(self, ctx: torch.Tensor) -> torch.Tensor:
+        return self.net(ctx)
 
 
 def _zero_visible_tokens(
@@ -363,21 +414,13 @@ def _shuffle_visible_tokens(
 
 
 class IJEPALoss(nn.Module):
-    """Per-token I-JEPA: visible reps + mask-token predictor → intact EMA targets.
+    """Per-token I-JEPA plus optional global readout and shuffle-invariance terms.
 
-    ``L = (1 - lambda) * L_predict + lambda * L_reg``
+    ``L = (1 - lambda) * (L_predict + w_glob * L_glob + w_inv * L_inv) + lambda * L_reg``
 
-    One encoder pass on the masked sequence; **visible** adapter outputs (not ``<UNK>``
-    rows) feed the predictor together with learnable mask tokens carrying hole position
-    embeddings. Optional ``ijepa_block_hole_attn`` blocks hole keys in DDiT + adapter so
-    visible reps are context-only. ``target`` is the EMA encoder on the intact sequence
-    at the same indices.
-
-    ``L_predict`` is the per-token prediction cosine (unnormalized adapter token
-    outputs). ``L_reg`` is the anti-collapse regularizer (SIGReg or VICReg), applied
-    to the **mean-pooled** intact ``z_m`` batch ``[B, D]`` — the level at which the
-    pooled-representation rank actually collapses (token-level isotropy does not
-    constrain the per-molecule mean).
+    ``L_glob``: cosine(readout(mean_visible(tok)), stopgrad(z_teacher)). ``L_inv``:
+    MSE between the online intact pooled embedding and the stop-grad EMA-teacher
+    pooled embedding of a different fragment shuffle (asymmetric → collapse-safe).
     """
 
     def __init__(
@@ -385,12 +428,13 @@ class IJEPALoss(nn.Module):
         *,
         dim: int,
         lejepa_lambda: float = 0.05,
+        glob_weight: float = 1.0,
+        inv_weight: float = 0.1,
+        gram_weight: float = 0.0,
         sigreg_num_projections: int = 256,
         sigreg_knots: int = 17,
         sigreg_t_max: float = 3.0,
         sigreg_eps: float = 1e-8,
-        # When true, VICReg (variance hinge + covariance penalty) replaces SIGReg
-        # as the pooled-z_m anti-collapse regularizer.
         use_vicreg: bool = False,
         vicreg_gamma: float = 1.0,
         vicreg_cov_coeff: float = 1.0,
@@ -402,7 +446,15 @@ class IJEPALoss(nn.Module):
         super().__init__()
         if not (0.0 <= lejepa_lambda <= 1.0):
             raise ValueError(f"lejepa_lambda must be in [0, 1], got {lejepa_lambda}")
+        if glob_weight < 0.0 or inv_weight < 0.0 or gram_weight < 0.0:
+            raise ValueError(
+                f"glob_weight, inv_weight, gram_weight must be >= 0, "
+                f"got {glob_weight}, {inv_weight}, {gram_weight}"
+            )
         self.lejepa_lambda = float(lejepa_lambda)
+        self.glob_weight = float(glob_weight)
+        self.inv_weight = float(inv_weight)
+        self.gram_weight = float(gram_weight)
         self.predictor = _IJEPAPredictor(
             dim,
             max_positions=int(ijepa_max_positions),
@@ -410,6 +462,7 @@ class IJEPALoss(nn.Module):
             n_heads=int(ijepa_predictor_heads),
             ff_mult=int(ijepa_predictor_ff_mult),
         )
+        self.glob_readout = _GlobalReadout(dim)
         self.use_vicreg = bool(use_vicreg)
         if self.use_vicreg:
             self.vicreg = VICReg(gamma=vicreg_gamma, cov_coeff=vicreg_cov_coeff)
@@ -464,6 +517,40 @@ class IJEPALoss(nn.Module):
             1.0 - torch.nn.functional.cosine_similarity(pred, target.detach(), dim=-1)
         ).mean()
 
+    def glob_loss(
+        self,
+        tok: torch.Tensor,
+        hole: torch.Tensor,
+        z_teacher: torch.Tensor,
+        *,
+        valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``1 - cos(readout(mean_visible(tok)), stopgrad(z_teacher))`` per row."""
+        if valid is None:
+            valid = torch.ones_like(hole, dtype=torch.bool)
+        if z_teacher.shape != (tok.size(0), tok.size(-1)):
+            raise ValueError(
+                f"z_teacher must be [B,D] matching tok batch; "
+                f"got {tuple(z_teacher.shape)} vs tok {tuple(tok.shape)}"
+            )
+        ctx = _mean_visible_pool(tok, hole, valid)
+        pred = self.glob_readout(ctx)
+        return (
+            1.0 - torch.nn.functional.cosine_similarity(pred, z_teacher.detach(), dim=-1)
+        ).mean()
+
+    @staticmethod
+    def inv_loss(z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
+        """MSE between an online pooled embedding and a stop-grad EMA-teacher target.
+
+        Both are pooled embeddings of the same molecules under *different* fragment
+        shuffles. ``z_b`` is the stop-grad teacher (caller detaches): this asymmetry
+        is the anti-collapse mechanism, so no VICReg/SIGReg is needed for ``inv``.
+        """
+        if z_a.shape != z_b.shape:
+            raise ValueError(f"z_a/z_b shape mismatch: {tuple(z_a.shape)} vs {tuple(z_b.shape)}")
+        return torch.nn.functional.mse_loss(z_a, z_b)
+
     @torch.no_grad()
     def condition_bypass_gap(
         self,
@@ -503,10 +590,18 @@ class IJEPALoss(nn.Module):
         z_pooled: torch.Tensor,
         *,
         valid: torch.Tensor | None = None,
+        z_teacher_rows: torch.Tensor | None = None,
+        z_inv_target: torch.Tensor | None = None,
+        gram_online: torch.Tensor | None = None,
+        gram_target: torch.Tensor | None = None,
+        gram_valid: torch.Tensor | None = None,
     ) -> IJEPALossTerms:
-        """``tok`` ``[B,T,D]`` masked-view reps; ``hole`` ``[B,T]``; ``target`` ``[N,D]``;
-        ``z_pooled`` ``[B_mol,D]`` online intact mean-pooled latents (graph-attached)
-        — the anti-collapse regularizer acts on this batch, not on token rows."""
+        """``tok`` ``[B,T,D]``; ``z_pooled`` ``[B_mol,D]`` for ``L_reg``.
+
+        When ``gram_weight > 0``, ``gram_online``/``gram_target`` are the intact-view
+        per-token reps ``[B_mol,T,D]`` from the online and EMA encoders (with
+        ``gram_valid`` ``[B_mol,T]``) and a Gram-anchoring term is added.
+        """
         if tok.dim() != 3 or hole.dim() != 2:
             raise ValueError(
                 f"IJEPALoss expects tok [B,T,D] and hole [B,T]; "
@@ -521,10 +616,38 @@ class IJEPALoss(nn.Module):
         if hole.sum() < 1:
             raise ValueError("IJEPALoss needs >= 1 hole token")
         predict = self.predict_loss(tok, hole, target, valid=valid)
+        if self.glob_weight > 0.0:
+            if z_teacher_rows is None:
+                raise ValueError("z_teacher_rows required when glob_weight > 0")
+            glob = self.glob_loss(tok, hole, z_teacher_rows, valid=valid)
+        else:
+            glob = tok.new_zeros(())
+        if self.inv_weight > 0.0:
+            if z_inv_target is None:
+                raise ValueError("z_inv_target required when inv_weight > 0")
+            inv = self.inv_loss(z_pooled, z_inv_target.detach())
+        else:
+            inv = tok.new_zeros(())
+        if self.gram_weight > 0.0:
+            if gram_online is None or gram_target is None or gram_valid is None:
+                raise ValueError(
+                    "gram_online, gram_target, gram_valid required when gram_weight > 0"
+                )
+            gram = gram_anchoring_loss(gram_online, gram_target, gram_valid)
+        else:
+            gram = tok.new_zeros(())
         sigreg = self._reg(z_pooled)
         lam = self.lejepa_lambda
-        total = (1.0 - lam) * predict + lam * sigreg
-        return IJEPALossTerms(total=total, predict=predict, sigreg=sigreg)
+        main = (
+            predict
+            + self.glob_weight * glob
+            + self.inv_weight * inv
+            + self.gram_weight * gram
+        )
+        total = (1.0 - lam) * main + lam * sigreg
+        return IJEPALossTerms(
+            total=total, predict=predict, glob=glob, inv=inv, sigreg=sigreg, gram=gram,
+        )
 
 
 class _FingerprintCache:
@@ -579,13 +702,9 @@ def tanimoto_target_matrix(
 def similarity_distillation_loss(
     z_m: torch.Tensor, target_sim: torch.Tensor
 ) -> torch.Tensor:
-    """MSE between the cosine-similarity geometry of ``z_m`` and a target
-    similarity matrix (e.g. Tanimoto), over off-diagonal pairs only.
+    """MSE between off-diagonal cosine similarities of ``z_m`` and ``target_sim``.
 
-    ``z_m`` must be L2-normalized (the adapter does this), so ``z_m @ z_m.T``
-    is cosine similarity. Aligning it to the Morgan-FP Tanimoto matrix pulls
-    chemically similar molecules together and dissimilar ones apart — the
-    structure plain instance-discrimination SSL never learns.
+    ``z_m`` must be L2-normalized so ``z_m @ z_m.T`` is cosine similarity.
     """
     b = z_m.shape[0]
     cos = z_m @ z_m.t()                            # [B, B]

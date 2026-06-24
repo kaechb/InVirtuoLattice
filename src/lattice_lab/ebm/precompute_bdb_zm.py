@@ -45,7 +45,12 @@ from tqdm.auto import tqdm
 
 from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
 from lattice_lab.eval.encode_utils import encode_views_inference
-from lattice_lab.models.builders import adapter_run_id, build_eval_encoder, zm_store_path
+from lattice_lab.models.builders import (
+    adapter_run_id,
+    build_eval_encoder,
+    merge_from_ckpt,
+    zm_store_path,
+)
 from lattice_lab.preprocessing.molecules import fragment_view_for_smiles
 from lattice_lab.protein.store import EmbeddingStore
 
@@ -292,7 +297,10 @@ def main() -> None:
     )
     args.limit = None if args.limit < 0 else args.limit
     if args.store_path is None:
-        args.store_path = zm_store_path(args.adapter_ckpt, "bdb_zm")
+        # Store variant follows the adapter (recorded in its ckpt) — never the env.
+        args.store_path = zm_store_path(
+            args.adapter_ckpt, "bdb_zm", merge=merge_from_ckpt(args.adapter_ckpt)
+        )
     run(args)
 
 

@@ -11,7 +11,8 @@
 #
 # Stage 1 — BindingDB curation + MOSES fragment-view preprocessing.
 #
-#   sbatch scripts/slurm/stage1_preprocess.sh
+#   sbatch scripts/slurm/stage1_preprocess.sh          # MERGE=0: finest BRICS (default)
+#   MERGE=1 sbatch scripts/slurm/stage1_preprocess.sh  # coarser BRICS (_merge output dirs)
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:?submit from repo root: sbatch scripts/slurm/stage1_preprocess.sh}"
@@ -22,7 +23,16 @@ lattice_load_cpu_modules
 lattice_cd_repo
 
 OUT_BINDINGDB="${REPO}/artifacts/preprocessing/processed/bindingdb"
-OUT_MOSES="${REPO}/artifacts/preprocessing/processed/moses_id"
+OUT_MOSES="${REPO}/artifacts/preprocessing/processed/moses"
+MERGE="${MERGE:-0}"
+case "${MERGE}" in
+  0|false|no|"") MERGE_FLAG=() ;;
+  1|true|yes)   MERGE_FLAG=(--merge) ;;
+  *)
+    echo "MERGE=${MERGE} (want 0 or 1)" >&2
+    exit 1
+    ;;
+esac
 
 srun python -m lattice_lab.preprocessing.run_bindingdb \
   --bindingdb-tsv "${REPO}/artifacts/preprocessing/raw/bindingdb/BindingDB_All.tsv" \
@@ -30,11 +40,11 @@ srun python -m lattice_lab.preprocessing.run_bindingdb \
   --output-dir "${OUT_BINDINGDB}" \
   --identity 90 \
   --n-jobs 128 \
-  --tokenizer-path "${REPO}/artifacts/tokenizer/smiles_new.json"
+  --tokenizer-path "${REPO}/artifacts/tokenizer/smiles_new.json" "${MERGE_FLAG[@]}" --overwrite
 
 srun python -m lattice_lab.preprocessing.run_preprocessing \
   --input "${REPO}/artifacts/preprocessing/raw/moses.csv" \
   --output "${OUT_MOSES}" \
   --n-views 3 \
   --n-jobs 128 \
-  --tokenizer-path "${REPO}/artifacts/tokenizer/smiles_new.json"
+  --tokenizer-path "${REPO}/artifacts/tokenizer/smiles_new.json" "${MERGE_FLAG[@]}" --overwrite

@@ -2,8 +2,9 @@
 
 Reads a CSV/TXT of SMILES, runs the per-molecule pipeline in parallel, deduplicates
 by InChIKey, and writes parquet shards of ~``rows_per_shard`` rows each. Shard
-filenames are deterministic (``shard_0000.parquet``) so re-running with the same
-output directory is idempotent: existing shards are skipped.
+filenames are deterministic (``shard_0000.parquet``). By default, existing shards are
+kept and new output is appended at the next index; pass ``--overwrite`` to replace
+them.
 
 Usage::
 
@@ -71,16 +72,27 @@ def run(
     seed: int = 0,
     filter_overrides: dict[str, float] | None = None,
     tokenizer_path: Path | None = None,
+    merge: bool = False,
+    overwrite: bool = False,
 ) -> dict[str, int]:
     """Run the preprocessing pipeline. Returns a summary dict with row counts.
 
-    Idempotency: if ``output_dir`` already contains ``shard_NNNN.parquet`` files,
-    they are kept and the next available index is used for new shards. Pipeline
-    output is fully determined by inputs + ``seed`` per molecule.
+    Idempotency: unless ``overwrite`` is set, existing ``shard_*.parquet`` files
+    are kept and the next available index is used for new shards. Pipeline output
+    is fully determined by inputs + ``seed`` per molecule.
 
     When ``tokenizer_path`` is set, each row also gets a ``body_ids`` column so
     Stage-2 SSL can skip runtime tokenization (shuffle/mask still happen online).
+
+    ``merge`` selects the coarser multi-granularity BRICS partition. **Default
+    off** — the stored ``fragment_view`` is the faithful, full-coverage molecule
+    (``view_idx==0`` feeds the decoy pool, which must not drop atoms), and the SSL
+    datamodule applies mask/shuffle *online* per contrastive view. When ``merge``
+    is on, ``_merge`` is appended to the output dir basename so merged and
+    finest-granularity datasets don't collide.
     """
+    if merge and not output_dir.name.endswith("_merge"):
+        output_dir = output_dir.with_name(output_dir.name + "_merge")
     output_dir.mkdir(parents=True, exist_ok=True)
     n_jobs = n_jobs or max(1, (os.cpu_count() or 2) - 1)
 
@@ -96,7 +108,7 @@ def run(
     smiles_list = _read_smiles(input_path)
     logger.info("read %d SMILES from %s", len(smiles_list), input_path)
 
-    fn = partial(process_smiles_record, n_views=n_views, pf=pf)
+    fn = partial(process_smiles_record, n_views=n_views, pf=pf, merge=merge)
 
     accumulated_records: list[dict[str, object]] = []
     for batch in tqdm(list(_batched(smiles_list, chunk_size)), desc="batches"):
@@ -113,9 +125,17 @@ def run(
     rows = flatten_views_to_rows(records, tokenizer=tokenizer)
     logger.info("kept %d molecules → %d view rows", len(records), len(rows))
 
-    # Detect next shard index for idempotent re-runs.
-    existing = sorted(output_dir.glob("shard_*.parquet"))
-    next_idx = len(existing)
+    # Detect next shard index for idempotent re-runs (or replace when overwriting).
+    if overwrite:
+        removed = 0
+        for p in output_dir.glob("shard_*.parquet"):
+            p.unlink()
+            removed += 1
+        if removed:
+            logger.info("overwrite: removed %d existing shard(s) from %s", removed, output_dir)
+        next_idx = 0
+    else:
+        next_idx = len(sorted(output_dir.glob("shard_*.parquet")))
 
     for shard_i, start in enumerate(range(0, len(rows), rows_per_shard)):
         df = pd.DataFrame(rows[start : start + rows_per_shard])
@@ -136,6 +156,14 @@ def main() -> None:
     parser.add_argument("--input", required=True, type=Path, help="SMILES file (.smi/.csv/.txt)")
     parser.add_argument("--output", required=True, type=Path, help="output directory for parquet shards")
     parser.add_argument("--n-views", type=int, default=3, help="fragment-view augmentations per molecule")
+    # Multi-granularity merge augmentation. Absent → faithful, full-coverage stored
+    # views (view_idx==0 feeds the decoy pool and must not drop atoms); SSL
+    # masking/shuffle is applied online by the datamodule, never baked into shards.
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="coarser multi-granularity BRICS partition; appends _merge to --output "
+             "(default: finest faithful full-coverage partition)",
+    )
     parser.add_argument("--rows-per-shard", type=int, default=1_000_000)
     parser.add_argument("--n-jobs", type=int, default=None)
     parser.add_argument("--chunk-size", type=int, default=50_000)
@@ -145,6 +173,11 @@ def main() -> None:
         type=Path,
         default=None,
         help="optional SMILES tokenizer json; adds body_ids column to shards",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="remove existing shard_*.parquet files in --output before writing",
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -163,6 +196,8 @@ def main() -> None:
         chunk_size=args.chunk_size,
         seed=args.seed,
         tokenizer_path=args.tokenizer_path,
+        merge=args.merge,
+        overwrite=args.overwrite,
     )
     logger.info("summary: %s", summary)
 

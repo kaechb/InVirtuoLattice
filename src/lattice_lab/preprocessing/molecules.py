@@ -5,7 +5,7 @@ Order of operations (each step is pure and unit-tested):
 1. ``standardize_smiles`` — largest fragment, neutralize, canonical tautomer.
 2. ``passes_property_filter`` — MW/logP/atom whitelist gate.
 3. ``inchikey_of`` — canonical key for deduplication.
-4. ``smiles_to_fragment_views`` — produce K augmented space-separated fragment views.
+4. ``fragment_view`` (faithful, full-coverage) / ``augment_fragment_views`` (SSL aug).
 5. ``morgan_fingerprint`` — Morgan FP for retrieval / sanity (NOT used for training).
 
 These functions are intentionally side-effect free; the orchestrator in
@@ -151,45 +151,157 @@ def _brics_fragment_smiles(mol: Chem.Mol) -> list[str]:
     return out
 
 
-def smiles_to_fragment_views(
+def _brics_partition(mol: Chem.Mol, bonds_to_cut) -> list[str] | None:
+    """Cut ``mol`` at the given BRICS bonds and return the resulting pieces as
+    canonical SMILES.
+
+    A true **partition**: every heavy atom lands in exactly one piece, so summed
+    over pieces the heavy-atom count is conserved — unlike
+    :func:`_brics_fragment_smiles` (``BRICSDecompose``), which returns the
+    *deduplicated set of building blocks* and therefore loses repeated fragments.
+
+    Attachment points use **unique same-number pairs**: the ``i``-th cut bond
+    becomes ``[i*]`` on *both* resulting stubs, so a view's dummy labels form
+    matched pairs that identify which two stubs were bonded (and the view is
+    reassemblable). This is why we cut with :func:`Chem.FragmentOnBonds` +
+    explicit ``dummyLabels`` rather than :func:`BRICS.BreakBRICSBonds`, whose
+    labels encode the BRICS *environment type* (``[12*]`` pairs with ``[5*]``,
+    never another ``[12*]``) and so don't form same-number matched pairs.
+
+    ``bonds_to_cut`` is a subset of ``BRICS.FindBRICSBonds(mol)``; cutting fewer
+    bonds yields fewer, larger pieces (coarser granularity). Returns ``None`` if
+    cutting fails (caller falls back to the whole-molecule SMILES).
+    """
+    bonds_to_cut = list(bonds_to_cut)
+    if not bonds_to_cut:
+        smi = Chem.MolToSmiles(mol)
+        return [smi] if Chem.MolFromSmiles(smi) is not None else None
+
+    bond_indices: list[int] = []
+    for (a1, a2), _labels in bonds_to_cut:
+        bond = mol.GetBondBetweenAtoms(a1, a2)
+        if bond is None:
+            return None
+        bond_indices.append(bond.GetIdx())
+    # Cut i → isotope i+1 on both stubs → matched same-number pair [i+1*]…[i+1*].
+    dummy_labels = [(i + 1, i + 1) for i in range(len(bond_indices))]
+
+    try:
+        broken = Chem.FragmentOnBonds(
+            mol, bond_indices, addDummies=True, dummyLabels=dummy_labels
+        )
+        pieces = Chem.GetMolFrags(broken, asMols=True, sanitizeFrags=True)
+    except Exception as exc:  # RDKit raises non-standard errors on odd scaffolds.
+        logger.debug("BRICS partition failed: %s", exc)
+        return None
+    out: list[str] = []
+    for piece in pieces:
+        smi = Chem.MolToSmiles(piece)
+        if Chem.MolFromSmiles(smi) is None:
+            return None
+        out.append(smi)
+    return out
+
+
+def fragment_view(
+    smiles: str,
+    *,
+    merge: bool = False,
+    max_pieces: int = 7,
+    seed: int | None = None,
+) -> str | None:
+    """One **faithful**, full-coverage fragment view of the *whole* molecule.
+
+    This is the representation every downstream consumer must use when the
+    molecule's ``z_m`` has to faithfully encode the molecule — decoy/binder
+    precompute, EBM ranking, eval. It never drops atoms (heavy-atom count is
+    conserved across the joined fragments).
+
+    - ``merge=False``: cut *all* BRICS bonds → finest partition, joined in
+      canonical (sorted) order — deterministic, no ``seed`` needed.
+    - ``merge=True``: cut a random subset of BRICS bonds → a coarser partition
+      (``2..max_pieces`` pieces) that still tiles the whole molecule. ``seed``
+      makes it reproducible per molecule.
+
+    Returns canonical SMILES for unfragmentable molecules, ``None`` if RDKit
+    can't parse ``smiles``.
+    """
+    from rdkit.Chem import BRICS
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    canon = Chem.MolToSmiles(mol)
+    bonds = list(BRICS.FindBRICSBonds(mol))
+    if not bonds:
+        return canon
+    if merge:
+        rng = random.Random(seed)
+        n_pieces = rng.randint(2, min(max_pieces, len(bonds) + 1))
+        cut = rng.sample(bonds, min(n_pieces - 1, len(bonds)))
+        frags = _brics_partition(mol, cut)
+        # A single piece still carrying dummy stubs (only possible if a ring bond
+        # was cut, e.g. rBRICS) is a lone unpaired fragment — emit the clean whole
+        # molecule instead, matching the merge=False branch below.
+        if not frags or len(frags) <= 1:
+            return canon
+        return " ".join(frags)
+    frags = _brics_partition(mol, bonds)
+    if not frags or len(frags) <= 1:
+        return canon
+    return " ".join(sorted(frags))
+
+
+def augment_fragment_views(
     smiles: str,
     n_views: int = 3,
     *,
+    merge: bool = True,
     max_fragments: int = 7,
     seed: int | None = None,
     max_attempts: int = 64,
 ) -> list[str]:
-    """Generate ``n_views`` distinct space-separated fragment views for ``smiles``.
+    """Generate ``n_views`` **full-coverage** fragment views for SSL.
 
-    Uses RDKit BRICS decomposition (no external fragmentation dependency). Each
-    view samples a random number of fragments in ``[1, min(max_fragments, 7)]``,
-    shuffles them, and joins with spaces — the format expected by the
-    discrete-flow tokenizer.
+    Every view tiles the *whole* molecule (no atoms dropped) — two composable ops:
+
+    - ``merge``: vary granularity by cutting a random subset of BRICS bonds
+      (coarser, still full coverage).
+    - order shuffle (always): the discrete-flow SSL datamodule also reshuffles
+      online; this just seeds extra distinct stored views.
+
+    Fragment dropping (I-JEPA-style atom masking) is intentionally *not* offered:
+    it orphans attachment stubs (e.g. a lone ``[1*]c1ccccc1``) and breaks the
+    invertible matched-pair labelling. The SSL datamodule applies any masking
+    online instead. For a single faithful view, call :func:`fragment_view`.
     """
+    from rdkit.Chem import BRICS
+
     rng = random.Random(seed)
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return []
     canon = Chem.MolToSmiles(mol)
-    frags = _brics_fragment_smiles(mol)
-    if len(frags) <= 1:
+    bonds = list(BRICS.FindBRICSBonds(mol))
+    finest = _brics_partition(mol, bonds) if bonds else None
+    if not finest or len(finest) <= 1:
         return [canon]
 
-    max_frags = min(max_fragments, 7, len(frags))
     views: list[str] = []
     seen: set[str] = set()
     attempts = 0
     while len(views) < n_views and attempts < max_attempts:
         attempts += 1
-        k = rng.randint(1, max_frags)
-        if k == 1:
-            if canon not in seen:
-                seen.add(canon)
-                views.append(canon)
-            continue
-        chosen = rng.sample(frags, min(k, len(frags)))
-        rng.shuffle(chosen)
-        view = " ".join(chosen)
+        frags: list[str] | None = None
+        if merge and rng.random() < 0.5:
+            n_pieces = rng.randint(2, min(max_fragments, len(bonds) + 1))
+            frags = _brics_partition(mol, rng.sample(bonds, min(n_pieces - 1, len(bonds))))
+        # A single piece still carrying dummy stubs (only from a ring cut, e.g.
+        # rBRICS) is a lone unpaired fragment; fall back to the finest partition.
+        if not frags or len(frags) <= 1:
+            frags = list(finest)
+        rng.shuffle(frags)
+        view = " ".join(frags) if frags else canon
         if view not in seen:
             seen.add(view)
             views.append(view)
@@ -197,41 +309,56 @@ def smiles_to_fragment_views(
 
 
 def seeded_views(smiles: str, k: int) -> list[str]:
-    """Up to ``k`` deterministic seeded fragment views (per-molecule seed derived
-    from the SMILES, so runs are reproducible). Falls back to the canonical SMILES
-    for un-fragmentable molecules and ``[]`` for RDKit-unparseable ones.
+    """Up to ``k`` deterministic, **faithful** multi-granularity views (per-molecule
+    seed derived from the SMILES, so runs are reproducible). Used to ensemble a
+    molecule's ``z_m`` over fragmentations at eval — every view is full coverage
+    (varying coarseness via :func:`fragment_view`), never a lossy subset.
 
     Defined here (a torch-free module) so ``joblib``/``loky`` workers that call it
     don't cold-import torch at spawn — the slow part of multi-view cache builds.
     """
     import hashlib
 
-    seed = int.from_bytes(hashlib.sha1(smiles.encode()).digest()[:4], "little")
-    views = smiles_to_fragment_views(smiles, n_views=k, seed=seed)
-    if views:
-        return views
-    return [Chem.CanonSmiles(smiles)] if Chem.MolFromSmiles(smiles) else []
+    if Chem.MolFromSmiles(smiles) is None:
+        return []
+    base = int.from_bytes(hashlib.sha1(smiles.encode()).digest()[:4], "little")
+    views: list[str] = []
+    seen: set[str] = set()
+    # View 0 is the deterministic finest decomposition; the rest vary granularity.
+    for i in range(max(1, k)):
+        v = fragment_view(smiles, merge=(i > 0), seed=base + i)
+        if v and v not in seen:
+            seen.add(v)
+            views.append(v)
+    return views or [Chem.CanonSmiles(smiles)]
 
 
-def fragment_view_for_smiles(smiles: str) -> str | None:
-    """One fragment view for adapter encode; canonical SMILES fallback; else None."""
-    from rdkit import Chem
+def fragment_view_for_smiles(smiles: str, *, merge: bool = False) -> str | None:
+    """One faithful, full-coverage fragment view for adapter encode; canonical
+    SMILES fallback; ``None`` if RDKit can't parse it.
+
+    ``merge=False`` (default): finest BRICS partition. ``merge=True``: coarser
+    partition, seeded deterministically from ``smiles``.
+    """
+    import hashlib
 
     try:
-        views = smiles_to_fragment_views(smiles, n_views=1)
-        if views:
-            return views[0]
+        seed = None
+        if merge:
+            seed = int.from_bytes(hashlib.sha1(smiles.encode()).digest()[:4], "little")
+        v = fragment_view(smiles, merge=merge, seed=seed)
+        if v is not None:
+            return v
     except Exception as exc:
         logger.debug("fragment view failed for %r: %s", smiles, exc)
-    if Chem.MolFromSmiles(smiles) is None:
-        return None
-    return Chem.CanonSmiles(smiles)
+    return Chem.CanonSmiles(smiles) if Chem.MolFromSmiles(smiles) is not None else None
 
 
 def build_smiles_fragment_views(
     smiles_list: Sequence[str],
     *,
     n_jobs: int = 1,
+    merge: bool = False,
 ) -> dict[str, str]:
     """Map unique SMILES → one fragment view; omits unfragmentable ligands."""
     unique = list(dict.fromkeys(smiles_list))
@@ -239,7 +366,7 @@ def build_smiles_fragment_views(
         return {}
 
     def _pair(smi: str) -> tuple[str, str | None]:
-        return smi, fragment_view_for_smiles(smi)
+        return smi, fragment_view_for_smiles(smi, merge=merge)
 
     if n_jobs in (0, 1):
         pairs = [_pair(s) for s in unique]
@@ -270,13 +397,16 @@ def process_smiles_record(
     n_views: int = 3,
     pf: PropertyFilter | None = None,
     seed: int | None = None,
+    merge: bool = False,
 ) -> dict[str, object] | None:
-    """End-to-end per-molecule pipeline.
+    """End-to-end per-molecule pipeline for SSL preprocessing.
 
     Returns a record dict (or ``None`` if the molecule is rejected) with keys:
-    ``smiles`` (canonical), ``inchikey``, ``views`` (list of fragment strings).
-
-    This is the unit dispatched to worker processes by the orchestrator.
+    ``smiles`` (canonical), ``inchikey``, ``views``. Views are always faithful,
+    full-coverage fragmentations (``view_idx==0`` is a lossless molecule for the
+    decoy pool); the SSL datamodule applies masking/shuffle online. ``merge``
+    bakes coarser multi-granularity partitions into the shards. This is the unit
+    dispatched to worker processes by the orchestrator.
     """
     std = standardize_smiles(smiles)
     if std is None:
@@ -286,7 +416,7 @@ def process_smiles_record(
     key = inchikey_of(std)
     if key is None:
         return None
-    views = smiles_to_fragment_views(std, n_views=n_views, seed=seed)
+    views = augment_fragment_views(std, n_views=n_views, merge=merge, seed=seed)
     if not views:
         return None
     return {"smiles": std, "inchikey": key, "views": views}

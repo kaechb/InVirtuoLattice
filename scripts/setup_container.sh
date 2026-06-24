@@ -56,7 +56,7 @@ ensure_module_cmd() {
     done
   fi
   command -v module >/dev/null 2>&1 || type module >/dev/null 2>&1 \
-    || die "the 'module' command is unavailable; run this on a LUMI login node."
+    || die "the 'module' command xis unavailable; run this on a LUMI login node."
 }
 
 persist_env() {

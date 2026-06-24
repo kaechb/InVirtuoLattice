@@ -1,22 +1,9 @@
 """Validation probes for Stage-2 SSL (t-SNE + linear R² on chemistry props).
 
-Each validation epoch (configurable) samples molecules from the MOSES val split,
-encodes them to ``z_m``, fits Ridge probes for every descriptor in
-:data:`PROBE_DESCRIPTOR_NAMES` (QED, molWt, logP plus the non-additive
-FractionCSP3 / BertzCT / BalabanJ) and for sum-pooled molWt, and logs a 2D t-SNE
-scatter (PCA→t-SNE) colored by each descriptor to W&B. The additive descriptors
-(QED/molWt/logP) are ~linear in fingerprint bits, so they mainly detect collapse;
-the structural ones are non-linear graph functions a linear probe cannot recover
-from a fingerprint-aligned space, so ``r2/mean_structural`` is the less-circular
-signal of representation quality. LeJEPA and hybrid (which anneals toward LeJEPA)
-use unnormalized ``z_m`` (matching SIGReg); NT-Xent uses L2-normalized ``z_m``
-(matching downstream deploy).
-
-Rank diagnostics are logged for BOTH the raw and L2-normalized ``z_m`` for every
-method (``rank/{effective,numerical}_{raw,norm}``), so the InfoNCE-vs-LeJEPA rank
-comparison is apples-to-apples and not confounded by the per-method probe
-normalization. ``rank/{effective,numerical}`` remains the method-appropriate
-primary (norm for NT-Xent, raw for LeJEPA/hybrid).
+Samples molecules from the MOSES val split, encodes to ``z_m``, fits Ridge
+probes for :data:`PROBE_DESCRIPTOR_NAMES`, and logs PCA→t-SNE colored by each
+descriptor. NT-Xent probes use L2-normalized ``z_m``; other losses use raw ``z_m``.
+Rank diagnostics are logged for both raw and normalized ``z_m``.
 """
 
 from __future__ import annotations
@@ -118,7 +105,7 @@ def _l2_normalize_rows(z: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
 class SslValProbeResult:
     r2: dict[str, float]  # per-descriptor R², keyed by PROBE_DESCRIPTOR_NAMES
     mean_r2: float  # legacy summary: mean over (qed, molwt) — kept for run continuity
-    mean_r2_structural: float  # mean over the non-additive descriptors (the real signal)
+    mean_r2_structural: float  # mean over PROBE_STRUCTURAL_NAMES
     n_probe: int
     n_train: int
     n_test: int

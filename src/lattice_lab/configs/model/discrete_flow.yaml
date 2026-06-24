@@ -5,10 +5,10 @@ encoder:
   ckpt_path: artifacts/checkpoints/invirtuo_gen.ckpt
   tokenizer_path: artifacts/tokenizer/smiles_new.json
   # 0-indexed inclusive DDiT block indices whose hiddens are concatenated.
-  backbone_layer_start: 11
+  backbone_layer_start: 8
   backbone_layer_end: 11
   d_adapter: ${d_adapter}
-  adapter_n_layers: 4
+  adapter_n_layers: 0
   learnable_time: true
   encode_time: 0.98
   freeze_backbone: false
@@ -17,47 +17,46 @@ encoder:
 # Token id of the fragment separator (space) in the discrete-flow tokenizer.
 frag_sep_id: 4
 
-learning_rate: 1.0e-4
+learning_rate: 1.0e-5
 weight_decay: 0.01
 warmup_steps: 500
-total_steps: 30000        # cosine-decay horizon (affects LR shape only)
 
 # ssl_loss: ntxent (InfoNCE) | lejepa (invariance + SIGReg) | hybrid (ntxent
 # annealed in favor of lejepa over hybrid_anneal_steps) | ijepa (flow matching
 # at masked positions + SIGReg; reuses lejepa_mask_frac / lejepa_n_local_views)
-ssl_loss: ntxent
+ssl_loss: null
 temperature: 0.1          # ntxent/hybrid only
-# Morgan-fingerprint similarity distillation. fp_weight>0 aligns cosine(z_m)
-# with Tanimoto similarity — the LATTICE baseline used 2.0. Works for ntxent,
-# lejepa, and hybrid (distillation runs on a normalized copy of z_m, so
-# lejepa/hybrid's unnormalized latents are untouched). Requires
-# data.return_smiles=true.
+# Morgan-fingerprint similarity distillation on L2-normalized z_m. Requires data.return_smiles=true.
 fp_weight: 0
+fp_anneal_steps: 5000  # linear decay to 0 over this many steps; 0 = constant fp_weight
 fp_radius: 2
 fp_bits: 2048
-lejepa_lambda: 0.001       # lejepa/hybrid/ijepa: (1-lambda)*main + lambda*reg (ijepa reg = pooled z_m)
-lejepa_n_global_views: 1  # lejepa/hybrid only
-lejepa_n_local_views: 2    # lejepa/hybrid: masked locals; ijepa: K masked views per intact
-lejepa_mask_frac: 0.1     # min mask fraction (fixed when lejepa_mask_frac_max is null)
-lejepa_mask_frac_max: 0.3 # optional max; when set, each masked view samples uniform [min, max]
+lejepa_lambda: 0.01       # lejepa/hybrid/ijepa: (1-lambda)*main + lambda*reg (ijepa reg = pooled z_m)
+lejepa_n_global_views: 2  # lejepa/hybrid only
+lejepa_n_local_views: 4    # lejepa/hybrid: masked locals; ijepa: K masked views per intact
+lejepa_mask_frac: 0.3     # min mask fraction (fixed when lejepa_mask_frac_max is null)
+lejepa_mask_frac_max: 0.6 # optional max; when set, each masked view samples uniform [min, max]
 ijepa_mask_mode: mixed  # ijepa only: fragment | span | mixed
-ijepa_ema_decay: 0.996      # ijepa only: EMA momentum for the clean (intact) target encoder
+ijepa_ema_decay: 0.99      # ijepa only: initial EMA decay; cosine-scheduled to 1.0 over training
 ijepa_block_hole_attn: true  # ijepa: visible reps cannot attend to <UNK> keys in encoder
-ijepa_use_vicreg: false     # ijepa: pooled-z_m anti-collapse reg — false=SIGReg, true=VICReg (var hinge + cov penalty)
+ijepa_use_vicreg: false      # ijepa: pooled-z_m anti-collapse reg — false=SIGReg, true=VICReg (var hinge + cov penalty). SIGReg's rank signal is ~40x weaker than its scale signal (0.004→0.16 across the whole rank spectrum vs 0.004→0.39 for a 10x scale change), so it fails to oppose rank collapse; VICReg's cov term goes 1→249 over the same rank range.
 ijepa_vicreg_gamma: 1.0     # ijepa: target per-dim std for the VICReg variance hinge
 ijepa_vicreg_cov_coeff: 1.0  # ijepa: weight of the VICReg off-diagonal covariance penalty
 ijepa_collapse_diag_every_n_steps: 50  # 0 disables; avoids per-step CPU SVD sync
 rank_subsample: 256  # max rows for train/collapse rank SVD diagnostics
-ijepa_predictor_layers: 1   # ijepa: keep small so encoder carries semantics
+ijepa_predictor_layers: 1
 ijepa_predictor_heads: 1
 ijepa_predictor_ff_mult: 2
+ijepa_glob_weight: 1.0
+ijepa_inv_weight: 0.1  # online intact pooled vs stop-grad EMA-teacher of a different shuffle (asymmetric, collapse-safe)
+ijepa_gram_weight: 0.0  # ijepa: DINOv3 Gram anchoring — match online intact patch-Gram to stop-grad EMA teacher's; stabilizes dense feats over long schedules. 0 disables.
 lejepa_mask_token_id: null  # default [UNK] (never PAD)
 sigreg_num_projections: 512
 sigreg_knots: 17
 sigreg_t_max: 5.0
 sigreg_eps: 1.0e-8
 hybrid_anneal_steps: 0  # hybrid only: alpha 1.0(ntxent)->0.0(lejepa) linearly by this step
-train_rank_every_n_steps: 50  # 0 disables; teacher/global pooled z_m rank (train + val)
+train_rank_every_n_steps: 500  # 0 disables; teacher/global pooled z_m rank (train + val)
 log_grad_norms: false  # lejepa/hybrid only: per-term grad L2 norm (expensive; diagnostic runs only)
 # ijepa only: warn when val/cond_gap_zero and val/cond_gap_shuf fall below this
 condition_margin: 0.01

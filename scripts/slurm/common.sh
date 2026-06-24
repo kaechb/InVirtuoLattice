@@ -81,8 +81,86 @@ lattice_newest_subdir_since() {
 }
 
 lattice_pipeline_marker() {
-  mkdir -p "${REPO}/logs/slurm/pipeline"
-  mktemp "${REPO}/logs/slurm/pipeline/marker.XXXXXX"
+  lattice_pipeline_source_env
+  local dir="${PIPELINE_LOG_DIR:-${REPO}/logs/slurm/pipeline}"
+  mkdir -p "${dir}"
+  mktemp "${dir}/marker.XXXXXX"
+}
+
+lattice_pipeline_ebm_sidecar() {
+  local seed="$1"
+  lattice_pipeline_source_env
+  if [[ -n "${PIPELINE_LOG_DIR:-}" ]]; then
+    echo "${PIPELINE_LOG_DIR}/ebm.${seed}"
+  else
+    echo "${PIPELINE_ENV:?missing PIPELINE_ENV}.ebm.${seed}"
+  fi
+}
+
+# Repo-relative checkpoint paths (needs python env — call after lattice_load_*_modules).
+lattice_rel_ckpt() {
+  python - "${REPO}" "$@" <<'PY'
+import sys
+from pathlib import Path
+from lattice_lab.models.builders import resolve_ebm_ckpt, resolve_ssl_best_ckpt
+
+repo = Path(sys.argv[1])
+kind, arg = sys.argv[2], sys.argv[3]
+resolver = resolve_ebm_ckpt if kind == "ebm" else resolve_ssl_best_ckpt
+p = Path(resolver(arg))
+try:
+    print(p.relative_to(repo))
+except ValueError:
+    print(p)
+PY
+}
+
+lattice_pipeline_ssl_ckpt() {
+  lattice_rel_ckpt ssl "artifacts/adapter/checkpoints/${1:?run_id}"
+}
+
+lattice_pipeline_ebm_ckpt() {
+  lattice_rel_ckpt ebm "artifacts/energy/checkpoints/${1:?run_id}"
+}
+
+# Move pipeline.env into the run-id log dir; leave PIPELINE_ENV as a symlink so
+# already-submitted jobs keep the submit-time path.
+lattice_pipeline_install_env() {
+  [[ -n "${PIPELINE_ENV:-}" && -n "${PIPELINE_LOG_DIR:-}" ]] || return 0
+  local canonical="${PIPELINE_LOG_DIR}/pipeline.env"
+  mkdir -p "${PIPELINE_LOG_DIR}"
+  if [[ -L "${PIPELINE_ENV}" ]]; then
+    return 0
+  fi
+  if [[ -f "${PIPELINE_ENV}" ]]; then
+    mv -f "${PIPELINE_ENV}" "${canonical}"
+  elif [[ ! -f "${canonical}" ]]; then
+    echo "pipeline.env missing at install (${PIPELINE_ENV})" >&2
+    return 1
+  fi
+  ln -sf "${canonical}" "${PIPELINE_ENV}"
+}
+
+# Freeze Hydra yaml tree + CLI overrides under the run dir so later pipeline
+# stages (e.g. stage 5) are not affected by repo config edits after stage 2.
+lattice_pipeline_snapshot_configs() {
+  [[ -n "${PIPELINE_LOG_DIR:-}" ]] || return 0
+  local dst="${PIPELINE_LOG_DIR}/configs"
+  [[ -d "${dst}" ]] && return 0
+  local src="${REPO}/src/lattice_lab/configs"
+  if [[ ! -d "${src}" ]]; then
+    echo "missing Hydra configs: ${src}" >&2
+    return 1
+  fi
+  cp -a "${src}" "${dst}"
+  lattice_job_banner "snapshotted configs → ${dst}"
+}
+
+lattice_pipeline_save_train_args() {
+  local stage="$1"
+  shift
+  [[ -n "${PIPELINE_LOG_DIR:-}" ]] || return 0
+  printf '%s\n' "$@" > "${PIPELINE_LOG_DIR}/stage${stage}.train.args"
 }
 
 lattice_pipeline_source_env() {
@@ -90,6 +168,62 @@ lattice_pipeline_source_env() {
     # shellcheck disable=SC1090
     source "${PIPELINE_ENV}"
   fi
+}
+
+# Update or append KEY=VAL in an existing pipeline.env (login-node only).
+lattice_pipeline_set_env() {
+  local key="$1" val="$2" f="${PIPELINE_ENV:?missing PIPELINE_ENV}"
+  local tmp="${f}.tmp.$$"
+  grep -v "^${key}=" "${f}" > "${tmp}" 2>/dev/null || : > "${tmp}"
+  echo "${key}=${val}" >> "${tmp}"
+  mv "${tmp}" "${f}"
+}
+
+# Suffix for the merge (multi-granularity) dataset/store variant. Driven by the
+# MERGE env var (0/1), threaded through the pipeline so every stage reads the
+# matching moses_merge / bindingdb_merge shards and decoy_zm_merge / bdb_zm_merge
+# / binder_zm_merge stores. Empty for the default finest-partition variant.
+lattice_merge_suffix() {
+  case "${MERGE:-0}" in
+    1|true|yes) echo "_merge" ;;
+    0|false|no|"") echo "" ;;
+    *)
+      echo "MERGE=${MERGE} (want 0 or 1)" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Stage 1 writes MOSES shards under the repo; stage 2/4 read from LUSTRE flash.
+# ponytail: ~300MB–2GB rsync once beats debugging path mismatches every run.
+lattice_sync_moses_shards_to_flash() {
+  local suffix="${1:-}"
+  local src="${REPO}/artifacts/preprocessing/processed/moses${suffix}"
+  local dst="${LATTICE_FLASH_PROCESSED}/moses${suffix}"
+  if compgen -G "${src}/shard_"*.parquet > /dev/null; then
+    mkdir -p "${dst}"
+    lattice_job_banner "sync moses${suffix} → ${dst}"
+    rsync -r --omit-dir-times --no-perms --no-owner --no-group "${src}/" "${dst}/"
+    return 0
+  fi
+  if compgen -G "${dst}/shard_"*.parquet > /dev/null; then
+    lattice_job_banner "moses${suffix} already on flash (${dst})"
+    return 0
+  fi
+  echo "no moses shards in ${src} or ${dst} — run stage1 first" >&2
+  return 1
+}
+
+# Authoritative merge suffix for a *trained adapter*: reads the fragment_merge
+# flag the SSL module embedded in its checkpoint, so Stage 4/5 pick the matching
+# stores no matter how (or whether) they were launched — no env, no mismatch.
+# Needs the python env loaded (call after lattice_load_gpu_modules).
+lattice_ckpt_merge_suffix() {
+  python - "$1" <<'PY'
+import sys
+from lattice_lab.models.builders import merge_from_ckpt
+print("_merge" if merge_from_ckpt(sys.argv[1]) else "", end="")
+PY
 }
 
 # Stage 2 calls this once ADAPTER_RUN_ID is known; later stages read PIPELINE_LOG_DIR from env.
@@ -128,6 +262,33 @@ lattice_pipeline_collect_slurm_logs() {
   [[ -f "${err}" ]] && mv -f "${err}" "${PIPELINE_LOG_DIR}/${stem}.err"
 }
 
+# Pipeline jobs: symlink SLURM logs into PIPELINE_LOG_DIR immediately, mv on EXIT.
+lattice_pipeline_track_slurm_logs() {
+  local stage="$1"
+  [[ -n "${PIPELINE_ENV:-}" && -f "${PIPELINE_ENV}" ]] || return 0
+  if [[ -z "${PIPELINE_LOG_DIR:-}" ]]; then
+    lattice_pipeline_source_env
+  fi
+  [[ -n "${PIPELINE_LOG_DIR:-}" ]] || return 0
+  mkdir -p "${PIPELINE_LOG_DIR}"
+
+  local base="${REPO}/logs/slurm/stage${stage}" out err stem
+  if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    stem="stage${stage}.seed${SLURM_ARRAY_TASK_ID}"
+    out="${base}/${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.out"
+    err="${base}/${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.err"
+  else
+    stem="stage${stage}"
+    out="${base}/${SLURM_JOB_ID}.out"
+    err="${base}/${SLURM_JOB_ID}.err"
+  fi
+
+  ln -sf "${out}" "${PIPELINE_LOG_DIR}/${stem}.out"
+  ln -sf "${err}" "${PIPELINE_LOG_DIR}/${stem}.err"
+  trap "lattice_pipeline_collect_logs_on_exit ${stage}" EXIT
+  lattice_job_banner "pipeline logs → ${PIPELINE_LOG_DIR}/${stem}.{out,err}"
+}
+
 lattice_pipeline_collect_logs_on_exit() {
   local stage="$1"
   lattice_pipeline_collect_slurm_logs "${stage}" || true
@@ -141,12 +302,12 @@ lattice_smoke_precompute_limit() {
   echo "${SMOKE_PRECOMPUTE_LIMIT:-5000}"
 }
 
-# Sample BDB train/val + a few LIT-PCBA targets into $1 (needs python — call after module load).
+# Sample BDB train/val + LIT-PCBA test rows into $1 (needs python — call after module load).
 lattice_make_smoke_parquets() {
   local out_dir="$1"
   local bdb_dir="${2:-${REPO}/artifacts/preprocessing/processed/bindingdb/threshold_90}"
   local n_rows="${3:-${SMOKE_PARQUET_ROWS:-5000}}"
-  local n_lit_targets="${4:-${SMOKE_LITPCBA_TARGETS:-3}}"
+  local n_lit_targets="${4:-${SMOKE_LITPCBA_TARGETS:-0}}"
   local py=""
   mkdir -p "${out_dir}"
   if command -v python >/dev/null 2>&1; then
@@ -174,7 +335,9 @@ for split in ("train", "val"):
 
 test_src = bdb.parent / "test_lit_pcba.parquet"
 test = pd.read_parquet(test_src)
-targets = sorted(test["target_name"].astype(str).unique())[:n_lit]
+targets = sorted(test["target_name"].astype(str).unique())
+if n_lit > 0:
+    targets = targets[:n_lit]
 sub = test[test["target_name"].astype(str).isin(targets)]
 p = out / "test_lit_pcba.parquet"
 sub.to_parquet(p)

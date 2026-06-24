@@ -1,0 +1,36 @@
+{
+  "pipeline_id": "20260623-200554-67560",
+  "adapter_run_id": "wk8denar",
+  "run_name": "unmerged_low_momentum",
+  "method": "ijepa",
+  "protein": "esm2",
+  "ebm_method": "lejepa",
+  "merge": false,
+  "n_seeds": 3,
+  "wandb": {
+    "ssl": "wk8denar",
+    "ebm_seed0": "qit0ptvp",
+    "ebm_seed1": "026fdpv4",
+    "ebm_seed2": "bbxnh19w"
+  },
+  "checkpoints": {
+    "ssl": "ssl/last.ckpt",
+    "ebm_seed0": "ebm/seed0/ebm_best.ckpt",
+    "ebm_seed1": "ebm/seed1/ebm_best.ckpt",
+    "ebm_seed2": "ebm/seed2/ebm_best.ckpt"
+  },
+  "ebm_best_step": {
+    "seed0": 12000,
+    "seed1": 10000,
+    "seed2": 12000
+  },
+  "eval": {
+    "benchmark": "LIT-PCBA",
+    "n_views": 4,
+    "zm_cache": "zm_cache/lit_pcba_zm_mv4",
+    "results_json": "results/ensemble_mv4.json",
+    "results_csv": "results/ensemble_mv4.csv",
+    "stage6_job": 19486268,
+    "stage6_note": "Pipeline stage6 read ebm.1 sidecar as qit0ptvp (race with seed0); ensemble JSON used seed0 ckpt twice + seed2. Re-run ensemble_eval with the three ebm_best.ckpt files here for a true 3-seed average."
+  }
+}

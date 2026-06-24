@@ -19,7 +19,6 @@ and re-embed to recover them).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 from pathlib import Path
@@ -27,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from rdkit import Chem, RDLogger
+from rdkit import RDLogger
 from tqdm.auto import tqdm
 
 from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder
@@ -38,13 +37,14 @@ from lattice_lab.models.builders import (
     build_eval_encoder,
     load_energy_head,
 )
-from lattice_lab.preprocessing.molecules import smiles_to_fragment_views
+from lattice_lab.preprocessing.molecules import inchikey_of, seeded_views
 from lattice_lab.protein.store import EmbeddingStore
 
 RDLogger.DisableLog("rdApp.*")
 logger = logging.getLogger(__name__)
 
 ADAPTER_FP_KEY = "adapter_fp"
+N_VIEWS_KEY = "n_views"
 
 
 def enforce_cache_adapter(store: EmbeddingStore, adapter_ckpt: Path | str) -> None:
@@ -83,6 +83,35 @@ def enforce_cache_adapter(store: EmbeddingStore, adapter_ckpt: Path | str) -> No
     )
 
 
+def enforce_cache_n_views(store: EmbeddingStore, n_views: int) -> None:
+    """Reject a z_m cache built with a different view count than we expect."""
+    recorded = store.manifest.extra.get(N_VIEWS_KEY)
+    if recorded is None:
+        if n_views <= 1:
+            return
+        raise ValueError(
+            f"z_m cache {store.path} has no {N_VIEWS_KEY} metadata but scoring "
+            f"expects n_views={n_views}. Delete it and rebuild with "
+            f"build_multiview_cache or lit_pcba --n-views {n_views}."
+        )
+    if int(recorded) != n_views:
+        raise ValueError(
+            f"z_m cache {store.path} was built with n_views={recorded} but scoring "
+            f"expects n_views={n_views}. Delete the cache and rebuild."
+        )
+
+
+def require_zm_cache_complete(store: EmbeddingStore, inchikeys: list[str]) -> None:
+    """Fail fast when scoring would silently miss ligands."""
+    missing = sorted({ik for ik in inchikeys if ik not in store.pid_to_row})
+    if missing:
+        raise ValueError(
+            f"z_m cache {store.path} is missing {len(missing)} / "
+            f"{len(set(inchikeys))} unique ligands (e.g. {missing[:3]}). "
+            f"Rebuild the cache before scoring."
+        )
+
+
 # --------------------------------------------------------------------------
 # Loaders
 # --------------------------------------------------------------------------
@@ -112,11 +141,8 @@ def _build_head(
 
 
 def _inchikey_or_none(smiles: str) -> str | None:
-    """Compute a canonical InChIKey, or ``None`` if RDKit can't parse the SMILES."""
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    return Chem.MolToInchiKey(mol) or None
+    """Canonical InChIKey for cache lookup (same helper as preprocessing)."""
+    return inchikey_of(smiles)
 
 
 def fragment_views(smiles: str, n_views: int = 1) -> list[str]:
@@ -133,17 +159,10 @@ def fragment_views(smiles: str, n_views: int = 1) -> list[str]:
     ~0.90 cosine). Falls back to the canonical SMILES if rBRICS can't produce a
     round-tripping cut, or returns ``[]`` if RDKit can't parse the SMILES.
     """
-    if Chem.MolFromSmiles(smiles) is None:
-        return []
-    seed = int.from_bytes(hashlib.sha1(smiles.encode("utf-8")).digest()[:4], "little")
-    vs = smiles_to_fragment_views(smiles, n_views=n_views, seed=seed)
-    return vs if vs else [Chem.CanonSmiles(smiles)]
-
-
-def _fragment_view(smiles: str) -> str | None:
-    """One deterministic fragment view, or ``None`` if unparseable."""
-    vs = fragment_views(smiles, n_views=1)
-    return vs[0] if vs else None
+    # Faithful, full-coverage multi-granularity views (seeded per-molecule for
+    # reproducibility) — averaging their z_m denoises the latent without ever
+    # encoding a lossy fragment subset.
+    return seeded_views(smiles, n_views)
 
 
 def precompute_zm_for_smiles(
@@ -155,22 +174,16 @@ def precompute_zm_for_smiles(
     batch_size: int,
     device: str,
     n_jobs: int = 1,
+    n_views: int = 4,
 ) -> int:
-    """Encode missing-from-store ``(inchikey → z_m)`` pairs in batches.
+    """Encode missing ``(inchikey → z_m)`` pairs, averaging ``n_views`` seeded views.
 
-    Three phases, each with its own progress bar:
-
-    1. **Dedupe**: drop rows whose InChIKey is already cached or seen earlier
-       in this run. O(N) with a set.
-    2. **Fragmentize**: convert each surviving SMILES to a DDiT view (or
-       canonical-SMILES fallback). This is the slow CPU step; runs in parallel
-       across ``n_jobs`` worker processes via joblib.
-    3. **Encode**: batch the views through DDiT+adapter on the configured
-       device and append ``(InChIKey, z_m)`` to the cache.
-
-    Idempotent: re-running skips already-cached InChIKeys. Returns the number
-    of new rows actually written to the cache.
+    Matches ``build_multiview_cache``: fragmentize K deterministic views per
+    ligand, encode all views, store ``mean(z_m)`` per InChIKey. Idempotent.
     """
+    if n_views < 1:
+        raise ValueError(f"n_views must be >= 1, got {n_views}")
+
     # --- Phase 1: dedupe (fast, O(N) with a set) -------------------------
     unique: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -182,29 +195,32 @@ def precompute_zm_for_smiles(
             continue
         seen.add(ik)
         unique.append((ik, smi))
-    n_already_cached = sum(1 for ik in inchikeys if ik in store.pid_to_row)
+    n_already_cached = len({ik for ik in inchikeys if ik in store.pid_to_row})
     logger.info(
-        "dedupe: %d rows → %d unique ligands (already in cache: %d)",
+        "dedupe: %d rows → %d unique ligands to encode (%d unique already cached)",
         len(inchikeys), len(unique), n_already_cached,
     )
     if not unique:
         return 0
 
-    # --- Phase 2: fragmentize, optionally parallel ------------------------
+    # --- Phase 2: K seeded views per ligand -------------------------------
     unique_smiles = [s for _, s in unique]
-    logger.info("fragmentizing %d unique ligands with n_jobs=%d", len(unique), n_jobs)
+    logger.info(
+        "fragmentizing %d unique ligands × %d views with n_jobs=%d",
+        len(unique), n_views, n_jobs,
+    )
     if n_jobs in (0, 1):
-        views_out: list[str | None] = []
-        for s in tqdm(unique_smiles, desc="fragmentize",
-                      unit="mol", dynamic_ncols=True):
-            views_out.append(_fragment_view(s))
+        view_lists = [
+            fragment_views(s, n_views)
+            for s in tqdm(unique_smiles, desc="fragmentize", unit="mol", dynamic_ncols=True)
+        ]
     else:
         from joblib import Parallel, delayed
 
-        views_out = list(
+        view_lists = list(
             tqdm(
                 Parallel(n_jobs=n_jobs, backend="loky", return_as="generator")(
-                    delayed(_fragment_view)(s) for s in unique_smiles
+                    delayed(fragment_views)(s, n_views) for s in unique_smiles
                 ),
                 total=len(unique_smiles),
                 desc="fragmentize",
@@ -214,32 +230,44 @@ def precompute_zm_for_smiles(
         )
 
     pending_ids: list[str] = []
-    pending_views: list[str] = []
+    pending_view_lists: list[list[str]] = []
     n_skipped_fragment = 0
-    for (ik, _), v in zip(unique, views_out):
-        if v is None:
+    for (ik, _), vs in zip(unique, view_lists):
+        if not vs:
             n_skipped_fragment += 1
             continue
         pending_ids.append(ik)
-        pending_views.append(v)
+        pending_view_lists.append(vs)
     logger.info(
-        "fragmentize: %d valid views, %d rdkit-rejected",
+        "fragmentize: %d valid ligands, %d rdkit-rejected",
         len(pending_ids), n_skipped_fragment,
     )
     if not pending_ids:
         return 0
 
-    # --- Phase 3: GPU batched encode ------------------------------------
+    # --- Phase 3: batched GPU encode + per-ligand view average ------------
     n_written = 0
-    pbar = tqdm(range(0, len(pending_ids), batch_size),
-                desc="encode z_m", unit="batch", dynamic_ncols=True)
+    pbar = tqdm(
+        range(0, len(pending_ids), batch_size),
+        desc=f"encode z_m×{n_views}",
+        unit="batch",
+        dynamic_ncols=True,
+    )
     for i in pbar:
-        ids = pending_ids[i : i + batch_size]
-        views = pending_views[i : i + batch_size]
+        chunk_ids = pending_ids[i : i + batch_size]
+        chunk_views = pending_view_lists[i : i + batch_size]
+        flat: list[str] = []
+        offs: list[int] = []
+        for vs in chunk_views:
+            offs.append(len(vs))
+            flat.extend(vs)
         with torch.no_grad():
-            z_m = encoder.encode_views(views, device=device)
-        arr = z_m.detach().cpu().to(torch.float16).numpy()
-        n_written += store.append_mean(ids, arr)
+            zf = encoder.encode_views(flat, device=device).detach().cpu().to(torch.float32).numpy()
+        out, p = [], 0
+        for n in offs:
+            out.append(zf[p : p + n].mean(0))
+            p += n
+        n_written += store.append_mean(chunk_ids, np.asarray(out, dtype=np.float16))
     return n_written
 
 
@@ -407,27 +435,33 @@ def evaluate(args: argparse.Namespace) -> pd.DataFrame:
     zm_store = EmbeddingStore.create(
         args.zm_cache,
         embedding_dim=d_adapter,
-        model_name="lattice-adapter-v1",
+        model_name=f"lattice-adapter-mv{args.n_views}" if args.n_views > 1 else "lattice-adapter-v1",
         dtype="float16",
         per_residue=False,
         extra={
             "source": str(args.test_parquet),
             "adapter_ckpt": str(args.adapter_ckpt),
             ADAPTER_FP_KEY: adapter_fingerprint(args.adapter_ckpt),
+            N_VIEWS_KEY: str(args.n_views),
         },
     )
-    # Reject (or backfill) a reused cache that was built by a different adapter.
     enforce_cache_adapter(zm_store, args.adapter_ckpt)
+    enforce_cache_n_views(zm_store, args.n_views)
 
-    n_new = precompute_zm_for_smiles(
-        encoder,
-        smiles_list=work["smiles"].tolist(),
-        inchikeys=work["inchikey"].tolist(),
-        store=zm_store,
-        batch_size=args.batch_size,
-        device=args.device,
-        n_jobs=args.n_jobs,
-    )
+    if args.skip_zm_precompute:
+        require_zm_cache_complete(zm_store, work["inchikey"].tolist())
+        n_new = 0
+    else:
+        n_new = precompute_zm_for_smiles(
+            encoder,
+            smiles_list=work["smiles"].tolist(),
+            inchikeys=work["inchikey"].tolist(),
+            store=zm_store,
+            batch_size=args.batch_size,
+            device=args.device,
+            n_jobs=args.n_jobs,
+            n_views=args.n_views,
+        )
     logger.info("z_m cache: %d entries (%d newly written)", zm_store.manifest.count, n_new)
 
     head = _build_head(
@@ -523,6 +557,10 @@ def main() -> None:
                         help="if set, write a per-target energy-distribution violin "
                              "PNG (actives vs inactives) here, matching Stage-7 inference")
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--n-views", type=int, default=4,
+                        help="seeded rBRICS views per ligand; z_m is the mean embedding")
+    parser.add_argument("--skip-zm-precompute", action="store_true",
+                        help="score from an existing zm cache only (stage6 after build_multiview_cache)")
     parser.add_argument("--n-jobs", type=int, default=1,
                         help="Parallel workers for the CPU fragmentize step "
                              "(set to e.g. cpu_count() - 1 to speed up the first run)")
@@ -553,7 +591,7 @@ def main() -> None:
                 raise SystemExit(
                     f"{e} — pass --adapter-run-id (Stage-2 W&B run id) or --zm-cache"
                 ) from e
-        args.zm_cache = eval_zm_cache_path(rid, "lit_pcba_zm_sv")
+        args.zm_cache = eval_zm_cache_path(rid, f"lit_pcba_zm_mv{args.n_views}" if args.n_views > 1 else "lit_pcba_zm_sv")
     args.ef_percents = tuple(float(x) for x in args.ef_percents.split(","))
     args.d_protein = 1280
     args.limit_targets = None if args.limit_targets < 0 else args.limit_targets

@@ -190,6 +190,7 @@ def _ligand_view_maps(
     overwrite: bool,
     n_jobs: int,
     tokenizer_path: Path | None,
+    merge: bool = False,
 ) -> tuple[dict[str, str], dict[str, list[int]] | None]:
     """Load or compute SMILES → fragment_view (+ optional body_ids)."""
     want_body = tokenizer_path is not None
@@ -205,7 +206,7 @@ def _ligand_view_maps(
     if not views:
         unique = list(dict.fromkeys(r.smiles for r in rows))
         logger.info("fragmentizing %d unique BindingDB ligands (n_jobs=%d)", len(unique), n_jobs)
-        views = build_smiles_fragment_views(unique, n_jobs=n_jobs)
+        views = build_smiles_fragment_views(unique, n_jobs=n_jobs, merge=merge)
         logger.info("fragment views: %d / %d unique ligands", len(views), len(unique))
 
     if want_body and body_ids is None:
@@ -288,6 +289,12 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--overwrite", action="store_true",
                    help="Re-run all stages even if output files already exist.")
+    p.add_argument(
+        "--merge",
+        action="store_true",
+        help="coarser multi-granularity BRICS partition; appends _merge to --output-dir "
+             "(default: finest faithful full-coverage views for EBM)",
+    )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
@@ -303,6 +310,8 @@ def main() -> None:
     logger.info("identity thresholds: %s", thresholds)
 
     out_root: Path = args.output_dir
+    if args.merge and not out_root.name.endswith("_merge"):
+        out_root = out_root.with_name(out_root.name + "_merge")
     out_root.mkdir(parents=True, exist_ok=True)
 
     # ---------- 1. Held-out reference targets (for the homology filter) ------
@@ -377,6 +386,7 @@ def main() -> None:
         overwrite=args.overwrite,
         n_jobs=args.n_jobs,
         tokenizer_path=args.tokenizer_path,
+        merge=args.merge,
     )
     if rewrite_curated:
         _write_parquet(

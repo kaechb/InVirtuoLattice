@@ -1,0 +1,46 @@
+_target_: lattice_lab.data.EBMDataModule
+
+train_parquet: artifacts/preprocessing/processed/bindingdb/threshold_90/train.parquet
+val_parquet: artifacts/preprocessing/processed/bindingdb/threshold_90/val.parquet
+protein_store: artifacts/protein_store/embeddings/esm2_650M/
+decoy_store: artifacts/decoys/decoy_zm_ssl2/
+bdb_store: artifacts/decoys/bdb_zm_ssl2
+
+# Precomputed binder z_m (Stage-4b, lattice_lab.ebm.precompute_binders). null =
+# encode binders live on the first epoch (cached in-process). Set to skip the
+# warm-up entirely; valid only for a frozen adapter.
+binder_store: null
+
+batch_size: 64
+n_decoys: ${n_decoys}
+hard_mining_mult: 1
+binders_only: true
+binder_threshold_nm: null
+
+# Hard-negative decoy mix (BDB other-target binders + annotated non-binders).
+frac_other_binder: 0.4
+frac_non_binder: 0.15
+
+# Fixed validation mix (decouples val/* from training decoys). null = reuse train mix.
+val_decoy_store: null
+val_bdb_store: null
+val_frac_other_binder: 0.4
+val_frac_non_binder: 0.15
+
+# MMseqs2 cluster-weighted protein sampling.
+cluster_weighted_sampler: false
+cluster_min_identity: 0.5
+cluster_cache_dir: artifacts/energy/checkpoints
+
+# Overlap decoy assembly + protein lookups with GPU compute (leave 1 of the 7
+# allocated CPUs for the main process). Workers inherit the in-RAM pools via
+# copy-on-write fork, so RAM is not duplicated per worker.
+num_workers: 6
+
+# Copy the decoy/BDB/protein stores into RAM at setup instead of doing random
+# memmap reads from Lustre every step (the main cause of Stage-5 "freezing").
+# The pools are a few GB total, comfortably within the 60G job allocation.
+# Override with LATTICE_POOLS_RAM=0/1 or this flag if you keep them on /flash.
+load_pools_to_ram: true
+
+seed: ${seed}

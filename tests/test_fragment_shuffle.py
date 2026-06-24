@@ -10,10 +10,14 @@ import pytest
 
 from lattice_lab.data.fragment_views import (
     FragmentViewDataset,
+    join_fragment_ids,
+    mask_frags,
     mask_fragment_ids,
+    mask_local_frags,
     mask_local_ids,
     mask_span_ids,
     shuffle_fragment_ids,
+    shuffle_frags,
     split_fragment_ids,
 )
 from lattice_lab.preprocessing.molecules import fragment_view_column
@@ -112,6 +116,52 @@ def test_deterministic_given_rng() -> None:
     assert a == b
 
 
+# Cases spanning the branches: multi-fragment, single-fragment (token mask),
+# empty, leading/trailing separators, two-fragment edge.
+_EQUIV_CASES = [
+    [10, SEP, 20, 21, SEP, 30, SEP, 40],
+    [5, 6, 7, 8],
+    [],
+    [SEP, 5, 6, SEP],
+    [10, SEP, 20],
+    [SEP, SEP],
+]
+
+
+@pytest.mark.parametrize("ids", _EQUIV_CASES)
+@pytest.mark.parametrize("seed", range(8))
+def test_frag_list_path_matches_flat_ids_path(ids: list[int], seed: int) -> None:
+    """The pre-split fragment helpers used by the model must produce bit-identical
+    output (same RNG draws) to the flat-ids helpers they wrap — the whole point of
+    the optimization is to be a pure speedup, not a behavior change."""
+    sep, mask_id = SEP, 99
+    for frac in (0.1, 0.5):
+        for mode in ("fragment", "span", "mixed"):
+            frags = split_fragment_ids(ids, sep)
+            ref = mask_local_ids(ids, sep, mask_id, random.Random(seed), frac=frac, mode=mode)
+            got = mask_local_frags(
+                frags, ids, sep, mask_id, random.Random(seed), frac=frac, mode=mode
+            )
+            assert got == ref, (ids, frac, mode)
+
+    # shuffle_frags reuses one split across two views without mutating it.
+    frags = split_fragment_ids(ids, sep)
+    ref = shuffle_fragment_ids(ids, sep, random.Random(seed))
+    got = shuffle_frags(frags, sep, random.Random(seed))
+    assert got == ref
+    # second call on the same frags is unaffected by the first (no in-place mutation)
+    assert shuffle_frags(frags, sep, random.Random(seed)) == ref
+
+    # mask_frags matches mask_fragment_ids and leaves the input list intact.
+    frags = split_fragment_ids(ids, sep)
+    snapshot = [list(f) for f in frags]
+    ref = mask_fragment_ids(ids, sep, mask_id, random.Random(seed), frac=0.5)
+    got = mask_frags(frags, sep, mask_id, random.Random(seed), frac=0.5)
+    assert got == ref
+    assert frags == snapshot  # not mutated
+    assert join_fragment_ids(split_fragment_ids(ids, sep), sep) == ids  # split/join inverse
+
+
 @pytest.mark.parametrize("view_col", ["fragment_view", "fragmol_view"])
 def test_fragment_view_dataset_reads_view_column(tmp_path: Path, view_col: str) -> None:
     rows = [
@@ -161,3 +211,20 @@ def test_fragment_view_dataset_reads_body_ids_column(tmp_path: Path) -> None:
     assert len(ds) == 2
     assert ds[0] == [ord("a")]
     assert ds[1] == [ord("c")]
+
+
+def test_fragment_view_dataset_reads_mixed_legacy_body_id_shards(tmp_path: Path) -> None:
+    old = tmp_path / "shard_0000.parquet"
+    new = tmp_path / "shard_0001.parquet"
+    pd.DataFrame(
+        [{"smiles": "CCO", "inchikey": "IK1", "view_idx": 0, "fragmol_view": "a b", "body_ids": [1, 2]}]
+    ).to_parquet(old, index=False)
+    pd.DataFrame(
+        [{"smiles": "CCC", "inchikey": "IK2", "view_idx": 0, "fragment_view": "c d", "body_ids": [3, 4]}]
+    ).to_parquet(new, index=False)
+
+    ds = FragmentViewDataset([old, new], split="train", val_ratio=0.0, test_ratio=0.0, return_smiles=True)
+
+    assert ds._use_body_ids
+    assert ds[0] == ([1, 2], "CCO")
+    assert ds[1] == ([3, 4], "CCC")

@@ -56,18 +56,19 @@ def load_fragment_split_df(
     columns: list[str] | None = None,
 ) -> pd.DataFrame:
     """Load deduplicated ``view_idx==0`` rows for a MOSES split."""
-    from lattice_lab.preprocessing.molecules import (
-        fragment_view_column,
-        fragment_view_column_for_parquet,
-    )
+    from lattice_lab.preprocessing.molecules import fragment_view_column_for_parquet
 
-    view_col = fragment_view_column_for_parquet(shards[0])
-    use_cols = columns or ["smiles", "inchikey", "view_idx", view_col]
-    if view_col not in use_cols:
-        use_cols = [*use_cols, view_col]
-    frames = [pd.read_parquet(s, columns=use_cols) for s in shards]
+    requested_cols = columns or ["smiles", "inchikey", "view_idx", "fragment_view"]
+    wants_view = "fragment_view" in requested_cols or "fragmol_view" in requested_cols
+    frames = []
+    for shard in shards:
+        view_col = fragment_view_column_for_parquet(shard) if wants_view else None
+        use_cols = [view_col if c in {"fragment_view", "fragmol_view"} else c for c in requested_cols]
+        df = pd.read_parquet(shard, columns=use_cols)
+        if view_col is not None and view_col != "fragment_view":
+            df = df.rename(columns={view_col: "fragment_view"})
+        frames.append(df)
     df = pd.concat(frames, ignore_index=True)
-    view_col = fragment_view_column(df)
     df = df[df["view_idx"] == 0].drop_duplicates("inchikey").reset_index(drop=True)
     mask = fragment_split_mask(
         df["inchikey"], split=split, val_ratio=val_ratio,
@@ -97,22 +98,32 @@ def join_fragment_ids(frags: list[list[int]], sep_id: int) -> list[int]:
     return out
 
 
+def shuffle_frags(frags: list[list[int]], sep_id: int, rng: random.Random) -> list[int]:
+    """Shuffle a pre-split fragment list and rejoin (no re-scan to split).
+
+    A single fragment is returned (joined) unchanged. The input list is not
+    mutated, so the same ``frags`` can be reused across multiple views.
+    """
+    if len(frags) <= 1:
+        return join_fragment_ids(frags, sep_id)
+    frags = list(frags)
+    rng.shuffle(frags)
+    return join_fragment_ids(frags, sep_id)
+
+
 def shuffle_fragment_ids(ids: list[int], sep_id: int, rng: random.Random) -> list[int]:
     """Split ``ids`` on ``sep_id``, shuffle the fragments, rejoin with ``sep_id``.
 
     A single-fragment sequence (no ``sep_id``) is returned unchanged. Leading /
     trailing separators yield empty fragments, which are preserved (so the op is
-    exactly invertible in fragment count).
+    exactly invertible in fragment count). Thin wrapper over :func:`shuffle_frags`
+    for callers that only have the flat token ids.
     """
-    frags = split_fragment_ids(ids, sep_id)
-    if len(frags) <= 1:
-        return list(ids)
-    rng.shuffle(frags)
-    return join_fragment_ids(frags, sep_id)
+    return shuffle_frags(split_fragment_ids(ids, sep_id), sep_id, rng)
 
 
-def mask_fragment_ids(
-    ids: list[int],
+def mask_frags(
+    frags: list[list[int]],
     sep_id: int,
     mask_id: int,
     rng: random.Random,
@@ -120,7 +131,7 @@ def mask_fragment_ids(
     frac: float = 0.5,
     frag_idx: int | None = None,
 ) -> list[int]:
-    """Replace ~``frac`` of the molecule with ``mask_id`` (local SSL view).
+    """Fragment-list form of :func:`mask_fragment_ids` (no re-scan to split).
 
     Masks ``max(1, round(frac * n))`` of the ``n`` non-empty fragments, always
     leaving >= 1 fragment intact so the context keeps real signal (masking one
@@ -132,14 +143,12 @@ def mask_fragment_ids(
     information-free all-``mask_id`` context. Uses ``mask_id`` (never PAD).
 
     ``frag_idx`` forces a single specific fragment to be fully masked (test hook;
-    ignores ``frac``).
+    ignores ``frac``). The input list is not mutated.
     """
-    if not ids:
-        return []
-    frags = split_fragment_ids(ids, sep_id)
+    frags = list(frags)
     non_empty = [i for i, frag in enumerate(frags) if frag]
     if not non_empty:
-        return [mask_id] * len(ids)
+        return [mask_id] * (sum(len(f) for f in frags) + max(len(frags) - 1, 0))
     if frag_idx is not None:
         idx = frag_idx if frag_idx in non_empty else rng.choice(non_empty)
         frags[idx] = [mask_id] * len(frags[idx])
@@ -156,6 +165,24 @@ def mask_fragment_ids(
     masked_pos = set(rng.sample(range(len(tok)), k))
     frags[only] = [mask_id if i in masked_pos else t for i, t in enumerate(tok)]
     return join_fragment_ids(frags, sep_id)
+
+
+def mask_fragment_ids(
+    ids: list[int],
+    sep_id: int,
+    mask_id: int,
+    rng: random.Random,
+    *,
+    frac: float = 0.5,
+    frag_idx: int | None = None,
+) -> list[int]:
+    """Flat-ids wrapper over :func:`mask_frags`."""
+    if not ids:
+        return []
+    return mask_frags(
+        split_fragment_ids(ids, sep_id), sep_id, mask_id, rng,
+        frac=frac, frag_idx=frag_idx,
+    )
 
 
 def mask_span_ids(
@@ -180,6 +207,31 @@ def mask_span_ids(
     return [mask_id if start <= i < start + k else t for i, t in enumerate(ids)]
 
 
+def mask_local_frags(
+    frags: list[list[int]],
+    ids: list[int],
+    sep_id: int,
+    mask_id: int,
+    rng: random.Random,
+    *,
+    frac: float = 0.5,
+    mode: str = "fragment",
+) -> list[int]:
+    """Local-view mask from a pre-split fragment list (no re-scan to split).
+
+    ``ids`` is the joined sequence of ``frags``; span masks need it because they
+    cross fragment boundaries (including ``sep_id`` tokens).
+    """
+    if mode == "fragment":
+        return mask_frags(frags, sep_id, mask_id, rng, frac=frac)
+    if mode == "span":
+        return mask_span_ids(ids, mask_id, rng, frac=frac)
+    if mode == "mixed":
+        pick = "span" if rng.random() < 0.5 else "fragment"
+        return mask_local_frags(frags, ids, sep_id, mask_id, rng, frac=frac, mode=pick)
+    raise ValueError(f"mask mode must be fragment, span, or mixed, got {mode!r}")
+
+
 def mask_local_ids(
     ids: list[int],
     sep_id: int,
@@ -189,15 +241,11 @@ def mask_local_ids(
     frac: float = 0.5,
     mode: str = "fragment",
 ) -> list[int]:
-    """Local-view mask: whole fragments, a contiguous span, or random choice."""
-    if mode == "fragment":
-        return mask_fragment_ids(ids, sep_id, mask_id, rng, frac=frac)
-    if mode == "span":
-        return mask_span_ids(ids, mask_id, rng, frac=frac)
-    if mode == "mixed":
-        pick = "span" if rng.random() < 0.5 else "fragment"
-        return mask_local_ids(ids, sep_id, mask_id, rng, frac=frac, mode=pick)
-    raise ValueError(f"mask mode must be fragment, span, or mixed, got {mode!r}")
+    """Flat-ids wrapper over :func:`mask_local_frags`."""
+    return mask_local_frags(
+        split_fragment_ids(ids, sep_id), ids, sep_id, mask_id, rng,
+        frac=frac, mode=mode,
+    )
 
 
 class FragmentViewDataset(Dataset):
