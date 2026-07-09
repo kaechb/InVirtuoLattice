@@ -2,21 +2,39 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 
 from lattice_lab.training.ssl_loss import (
+    DINOHead,
+    DINOLoss,
     IJEPALoss,
     LeJEPALoss,
     NTXentLoss,
+    PooledEmbeddingPredictor,
     SIGReg,
-    VICReg,
+    SigLIPLoss,
+    VISReg,
     gram_anchoring_loss,
     lejepa_retrieval_acc1,
     top1_paired_accuracy,
 )
-from lattice_lab.models.discrete_flow_ssl import DiscreteFlowSSLModule
+from lattice_lab.models.discrete_flow_ssl import DiscreteFlowSSLModule, _adamw_no_decay
 from lattice_lab.training.ssl_val_probes import embedding_covariance_rank
+
+
+def test_adamw_no_decay_skips_bias_norm_and_scalars() -> None:
+    w = torch.nn.Parameter(torch.randn(4, 8))
+    assert not _adamw_no_decay("adapter.input_proj.weight", w)
+    assert _adamw_no_decay("adapter.input_proj.bias", torch.nn.Parameter(torch.randn(8)))
+    assert _adamw_no_decay("adapter.norm.weight", torch.nn.Parameter(torch.ones(8)))
+    assert _adamw_no_decay("backbone.blocks.0.norm1.weight", torch.nn.Parameter(torch.ones(8)))
+    assert _adamw_no_decay("time_logit", torch.nn.Parameter(torch.tensor(0.5)))
+    assert not _adamw_no_decay(
+        "predictor.pos_embed.weight", torch.nn.Parameter(torch.randn(16, 32))
+    )
 
 
 def _ijepa_batch(*, b: int = 2, t: int = 4, d: int = 32):
@@ -131,24 +149,135 @@ def test_ijepa_total_matches_weighted_terms() -> None:
     assert abs(float(terms.total - expected)) < 1e-5
 
 
-def test_vicreg_penalizes_collapse() -> None:
-    """VICReg's variance hinge fires on collapsed rows, ~0 on unit-variance rows."""
+def test_visreg_penalizes_collapse() -> None:
+    """VISReg's scale term fires on collapsed rows, ~0 on unit-variance rows."""
     torch.manual_seed(0)
     collapsed = torch.zeros(64, 32) + 0.01 * torch.randn(1, 32)  # identical rows
     spread = torch.randn(64, 32)
-    # Isolate the variance hinge (cov_coeff=0): std≈0.01 -> ~0.99; std≈1 -> ~0.
-    var_only = VICReg(gamma=1.0, cov_coeff=0.0)
-    assert float(var_only(collapsed)) > 0.9
-    assert float(var_only(spread)) < 0.1
-    # Full reg (with the covariance penalty) still ranks collapse above spread.
-    full = VICReg(gamma=1.0, cov_coeff=1.0)
-    assert float(full(collapsed)) > float(full(spread))
+    reg = VISReg(gamma=1.0, num_projections=256)
+    # Scale term (gamma-std)^2: std≈0.01 -> ~0.98; std≈1 -> ~0.
+    scale_collapsed, _ = reg.components(collapsed)
+    scale_spread, _ = reg.components(spread)
+    assert float(scale_collapsed) > 0.9
+    assert float(scale_spread) < 0.1
+    # Full reg (scale + sketching) still ranks collapse above spread.
+    assert float(reg(collapsed)) > float(reg(spread))
 
 
-def test_ijepa_use_vicreg_swaps_regularizer() -> None:
+def test_visreg_shape_matches_gaussian() -> None:
+    """The sliced-Wasserstein shape term is small for a standard-normal batch and
+    large for a skewed (non-Gaussian) batch of the same variance.
+
+    Uses ``D=1`` so each projection *is* the marginal — with many dimensions the
+    CLT drives every random 1D projection toward Gaussian regardless of the input,
+    which is exactly why sliced methods need enough projections, not why they work.
+    """
+    torch.manual_seed(0)
+    gauss = torch.randn(1024, 1)
+    skewed = torch.empty(1024, 1).exponential_()  # skewed, clearly non-Gaussian
+    reg = VISReg(gamma=1.0, num_projections=64)
+    _, shape_gauss = reg.components(gauss)
+    _, shape_skew = reg.components(skewed)
+    assert float(shape_gauss) < float(shape_skew)
+    assert float(shape_gauss) < 0.05
+
+
+def test_visreg_scale_term_anchors_absolute_scale() -> None:
+    """The (gamma-std)^2 scale term is two-sided: it rises when the batch std is
+    pushed either below or above gamma, so it pins the absolute output scale."""
+    torch.manual_seed(0)
+    x = torch.randn(256, 16)
+    reg = VISReg(gamma=1.0, num_projections=256)
+    scale_unit, _ = reg.components(x)
+    scale_small, _ = reg.components(x * 0.1)
+    scale_big, _ = reg.components(x * 5.0)
+    assert float(scale_small) > float(scale_unit)
+    assert float(scale_big) > float(scale_unit)
+
+
+def test_visreg_shape_is_scale_invariant() -> None:
+    """The sketching term normalizes by std, so it is invariant to the batch scale
+    (only the shape of the distribution matters, not its magnitude)."""
+    torch.manual_seed(0)
+    x = torch.randn(256, 16)
+    x = x - x.mean(dim=0, keepdim=True)  # zero-mean so the center term stays 0
+    reg = VISReg(gamma=1.0, num_projections=512)
+    # Re-seed before each call so the random projections are identical and only
+    # the effect of rescaling the input on the shape term is measured.
+    # Scales stay well above eps=1e-4 so std normalization is exact (at tiny
+    # scales the variance floor eps would leak in and break invariance).
+    torch.manual_seed(1)
+    _, dist_base = reg.components(x)
+    for s in (2.0, 100.0):
+        torch.manual_seed(1)
+        _, dist_scaled = reg.components(x * s)
+        assert abs(float(dist_scaled) - float(dist_base)) < 1e-3
+
+
+def test_pooled_embedding_predictor_shape() -> None:
+    """Pool → MLP predictor maps [B, D] noised pool to [B, D] target embedding."""
+    pred = PooledEmbeddingPredictor(16)
+    z = torch.randn(6, 16)
+    assert pred(z).shape == (6, 16)
+
+
+def test_ijepa_predict_global_embedding_shape() -> None:
+    """Glob readout maps visible token context to a single [B, D] global vector."""
+    loss_fn = IJEPALoss(dim=16, lejepa_lambda=0.0, predict_weight=0.0, glob_weight=0.0)
+    tok = torch.randn(4, 8, 16)
+    hole = torch.tensor(
+        [[False, True, True, False, False, False, False, False],
+         [False, False, True, True, False, False, False, False],
+         [False, False, False, False, True, True, False, False],
+         [False, True, False, True, False, False, False, False]],
+    )
+    z_hat = loss_fn.predict_global_embedding(tok, hole)
+    assert z_hat.shape == (4, 16)
+
+
+def test_dino_head_shape_and_loss_behaviour() -> None:
+    """Head maps pooled → K prototype logits; DINO CE is lower when the student
+    matches the (centered, sharpened) teacher than when it is random, and the
+    center EMA moves toward the batch mean of teacher logits."""
+    torch.manual_seed(0)
+    head = DINOHead(dim=32, out_dim=64, hidden=48, bottleneck=16)
+    z = torch.randn(20, 32)
+    logits = head(z)
+    assert logits.shape == (20, 64)
+
+    loss_fn = DINOLoss(out_dim=64, teacher_temp=0.04, student_temp=0.1)
+    teacher = torch.randn(20, 64)
+    matched = float(loss_fn(teacher.clone(), teacher))
+    random = float(loss_fn(torch.randn(20, 64), teacher))
+    assert matched >= 0.0 and random >= 0.0
+    assert matched < random
+
+    assert torch.count_nonzero(loss_fn.center) == 0
+    loss_fn.update_center(teacher)
+    expected = (1.0 - 0.9) * teacher.mean(dim=0, keepdim=True)
+    assert torch.allclose(loss_fn.center, expected, atol=1e-6)
+
+
+def test_dino_utilization_uniform_vs_collapsed() -> None:
+    """Batch-mean teacher entropy: log(K) when uniform, ~0 when one prototype wins."""
+    k = 64
+    loss_fn = DINOLoss(out_dim=k, teacher_temp=0.04, student_temp=0.1)
+    uniform_logits = torch.zeros(32, k)
+    ent_u, active_u = loss_fn.utilization(uniform_logits)
+    assert abs(ent_u - math.log(k)) < 0.05
+    assert active_u == k
+
+    collapsed_logits = torch.zeros(32, k)
+    collapsed_logits[:, 0] = 10.0
+    ent_c, active_c = loss_fn.utilization(collapsed_logits)
+    assert ent_c < 0.1
+    assert active_c == 1.0
+
+
+def test_ijepa_use_visreg_swaps_regularizer() -> None:
     tok, hole, valid, target, z_pooled, z_teacher_rows, z_shuffle = _ijepa_batch(d=16)
-    loss_fn = IJEPALoss(dim=16, lejepa_lambda=0.5, use_vicreg=True, inv_weight=0.0)
-    assert loss_fn.sigreg is None and isinstance(loss_fn.vicreg, VICReg)
+    loss_fn = IJEPALoss(dim=16, lejepa_lambda=0.5, use_visreg=True, inv_weight=0.0)
+    assert loss_fn.sigreg is None and isinstance(loss_fn.visreg, VISReg)
     z_pooled = torch.randn(2, 16, requires_grad=True)
     terms = _ijepa_call(
         loss_fn, tok, hole, valid, target, z_pooled, z_teacher_rows, z_shuffle,
@@ -432,18 +561,36 @@ def test_body_ids_retokenizes_wrapped_fragment_view() -> None:
 
 def test_split_batch_unzips_view_smiles_rows() -> None:
     batch = [("[1*]a", "CCO"), ("[1*]b", "CCN")]
-    views, smiles = DiscreteFlowSSLModule._split_batch(batch)
+    views, smiles, net3d = DiscreteFlowSSLModule._split_batch(batch)
     assert views == ["[1*]a", "[1*]b"]
     assert smiles == ["CCO", "CCN"]
+    assert net3d is None
 
 
 def test_split_batch_accepts_list_of_view_smiles_lists() -> None:
     views_in = ["[1*]a", "[1*]b"]
     smiles_in = ["CCO", "CCN"]
     for batch in ((views_in, smiles_in), [views_in, smiles_in]):
-        views, smiles = DiscreteFlowSSLModule._split_batch(batch)
+        views, smiles, net3d = DiscreteFlowSSLModule._split_batch(batch)
         assert views == views_in
         assert smiles == smiles_in
+        assert net3d is None
+
+
+def test_split_batch_extracts_conformer_payload() -> None:
+    import torch
+
+    net3d = {"mol_src_tokens": torch.zeros(2, 3, dtype=torch.long)}
+    views, smiles, out3d = DiscreteFlowSSLModule._split_batch(
+        (["[1*]a", "[1*]b"], ["CCO", "CCN"], net3d)
+    )
+    assert views == ["[1*]a", "[1*]b"] and smiles == ["CCO", "CCN"]
+    assert out3d is net3d
+    # smiles may be None (return_smiles=False) but the 3D dict is still carried.
+    _, smiles2, out3d2 = DiscreteFlowSSLModule._split_batch(
+        ([[1, 2], [3, 4]], None, net3d)
+    )
+    assert smiles2 is None and out3d2 is net3d
 
 
 def test_subsample_rows() -> None:
@@ -500,6 +647,41 @@ def test_ntxent_perfect_pairs_lower_than_shuffled() -> None:
     perfect = loss_fn(z, z)
     shuffled = loss_fn(z, z.roll(1, dims=0))
     assert perfect.item() < shuffled.item()
+
+
+def test_siglip_perfect_pairs_lower_and_params_learn() -> None:
+    torch.manual_seed(0)
+    z = torch.nn.functional.normalize(torch.randn(8, 32), dim=-1)
+    loss_fn = SigLIPLoss()
+    perfect = loss_fn(z, z)
+    shuffled = loss_fn(z, z.roll(1, dims=0))
+    assert perfect.item() < shuffled.item()
+    # Learnable temperature + bias receive gradient.
+    perfect.backward()
+    assert loss_fn.logit_scale.grad is not None
+    assert loss_fn.logit_bias.grad is not None
+
+
+def test_siglip_diagnostics_margin_and_scalars() -> None:
+    import math
+
+    torch.manual_seed(0)
+    z = torch.nn.functional.normalize(torch.randn(8, 32), dim=-1)
+    loss_fn = SigLIPLoss()
+    d = loss_fn.diagnostics(z, z)
+    # z vs z: matched cosine is exactly 1 and above the off-diagonal → positive margin.
+    assert math.isclose(d["siglip/diagnostics_cos_pos_mean"], 1.0, rel_tol=1e-5)
+    assert d["siglip/diagnostics_cos_pos_mean"] > d["siglip/diagnostics_cos_neg_mean"]
+    assert math.isclose(
+        d["siglip/diagnostics_cos_margin"],
+        d["siglip/diagnostics_cos_pos_mean"] - d["siglip/diagnostics_cos_neg_mean"],
+        rel_tol=1e-5,
+    )
+    # Scalars mirror the learnable parameters (temperature = exp(logit_scale)).
+    assert math.isclose(d["siglip/diagnostics_temperature"], math.exp(loss_fn.logit_scale.item()), rel_tol=1e-5)
+    assert math.isclose(d["siglip/diagnostics_logit_bias"], loss_fn.logit_bias.item(), rel_tol=1e-5)
+    # Predicted match probabilities are valid and rank positives above negatives.
+    assert 0.0 <= d["siglip/diagnostics_neg_prob_mean"] <= d["siglip/diagnostics_pos_prob_mean"] <= 1.0
 
 
 def test_top1_paired_accuracy() -> None:
@@ -567,6 +749,59 @@ def test_ijepa_inv_target_is_stopgrad() -> None:
     ).inv.backward()
     assert z_pooled.grad is not None
     assert z_inv_target.grad is None
+
+
+def test_ijepa_noise_inv_enters_total_and_is_stopgrad() -> None:
+    """noise_inv: whole-molecule pool of the corrupted view vs stop-grad EMA global."""
+    loss_fn = IJEPALoss(
+        dim=16, lejepa_lambda=0.0, glob_weight=0.0, inv_weight=0.0,
+        noise_inv_weight=1.0, sigreg_num_projections=8, sigreg_knots=9,
+    )
+    tok, hole, valid, target, z_pooled, _, _ = _ijepa_batch(d=16)
+    z_noised = torch.randn(2, 16, requires_grad=True)
+    z_teacher_rows = torch.randn(2, 16, requires_grad=True)
+    terms = loss_fn(
+        tok, hole, target, z_pooled, valid=valid,
+        z_teacher_rows=z_teacher_rows, z_noised_pooled=z_noised,
+    )
+    assert terms.noise_inv.item() > 0.0
+    # lejepa_lambda=0 → total = predict + noise_inv_weight * noise_inv (other weights 0)
+    assert torch.allclose(terms.total, terms.predict + terms.noise_inv, atol=1e-5)
+    terms.noise_inv.backward()
+    assert z_noised.grad is not None
+    assert z_teacher_rows.grad is None  # teacher is the stop-grad target
+
+
+def test_ijepa_noise_inv_zero_when_matching_teacher() -> None:
+    loss_fn = IJEPALoss(
+        dim=16, lejepa_lambda=0.0, glob_weight=0.0, inv_weight=0.0,
+        noise_inv_weight=1.0, sigreg_num_projections=8, sigreg_knots=9,
+    )
+    tok, hole, valid, target, z_pooled, _, _ = _ijepa_batch(d=16)
+    z = torch.randn(2, 16)
+    terms = loss_fn(
+        tok, hole, target, z_pooled, valid=valid,
+        z_teacher_rows=z, z_noised_pooled=z.clone(),
+    )
+    assert terms.noise_inv.item() == 0.0
+
+
+def test_ijepa_predict_weight_zero_drops_predict() -> None:
+    """predict_weight=0 removes the token-level objective (pooled-only mode)."""
+    loss_fn = IJEPALoss(
+        dim=16, lejepa_lambda=0.0, predict_weight=0.0, glob_weight=0.0,
+        inv_weight=0.0, noise_inv_weight=1.0,
+        sigreg_num_projections=8, sigreg_knots=9,
+    )
+    tok, hole, valid, target, z_pooled, _, _ = _ijepa_batch(d=16)
+    z_noised = torch.randn(2, 16)
+    z_teacher_rows = torch.randn(2, 16)
+    terms = loss_fn(
+        tok, hole, target, z_pooled, valid=valid,
+        z_teacher_rows=z_teacher_rows, z_noised_pooled=z_noised,
+    )
+    assert terms.predict.item() == 0.0
+    assert torch.allclose(terms.total, terms.noise_inv, atol=1e-5)  # only noise_inv left
 
 
 def test_ijepa_glob_grad_flows_to_tok() -> None:

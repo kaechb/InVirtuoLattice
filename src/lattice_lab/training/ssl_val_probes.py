@@ -1,20 +1,20 @@
 """Validation probes for Stage-2 SSL (t-SNE + linear R² on chemistry props).
 
 Samples molecules from the MOSES val split, encodes to ``z_m``, fits Ridge
-probes for :data:`PROBE_DESCRIPTOR_NAMES`, and logs PCA→t-SNE colored by each
-descriptor. NT-Xent probes use L2-normalized ``z_m``; other losses use raw ``z_m``.
+probes for :data:`PROBE_DESCRIPTOR_NAMES`, and logs t-SNE (on the full ``z_m``,
+no PCA pre-reduction) colored by each descriptor. The Ridge probes fit the full
+``z_m`` too. NT-Xent probes use L2-normalized ``z_m``; other losses use raw ``z_m``.
 Rank diagnostics are logged for both raw and normalized ``z_m``.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.manifold import TSNE
 from sklearn.metrics import r2_score
@@ -110,6 +110,10 @@ class SslValProbeResult:
     n_train: int
     n_test: int
     r2_molwt_sum: float
+    # Drift of the kept representation z_m on the fixed probe set vs the previous
+    # logged epoch. None on the first run (no prior z_m to compare against).
+    zm_drift_l2: float | None = None
+    zm_drift_cos: float | None = None
 
     def as_metrics(self) -> dict[str, float | int]:
         out: dict[str, float | int] = {f"r2/{name}": v for name, v in self.r2.items()}
@@ -119,6 +123,9 @@ class SslValProbeResult:
         out["val/probe_n"] = self.n_probe
         out["val/probe_n_train"] = self.n_train
         out["val/probe_n_test"] = self.n_test
+        if self.zm_drift_l2 is not None:
+            out["val/zm_drift_l2"] = self.zm_drift_l2
+            out["val/zm_drift_cos"] = self.zm_drift_cos
         return out
 
 
@@ -135,24 +142,6 @@ def _tsne_2d(x: np.ndarray, *, seed: int, perplexity: float | None) -> np.ndarra
         learning_rate="auto",
         random_state=seed,
     ).fit_transform(x)
-
-
-def _pca_tsne_2d(
-    x: np.ndarray,
-    *,
-    seed: int,
-    perplexity: float | None,
-    pca_components: int = 50,
-) -> np.ndarray:
-    """Reduce to top PCA components, then run 2D t-SNE."""
-    arr = np.asarray(x, dtype=np.float64)
-    n_pca = min(int(pca_components), arr.shape[1], arr.shape[0] - 1)
-    if n_pca < 2:
-        raise ValueError(
-            f"PCA→t-SNE needs at least 2 PCA components; got {n_pca} for shape {arr.shape}"
-        )
-    reduced = PCA(n_components=n_pca, random_state=seed).fit_transform(arr)
-    return _tsne_2d(reduced, seed=seed, perplexity=perplexity)
 
 
 def _ridge_r2(
@@ -213,12 +202,12 @@ _PROBE_LABELS: dict[str, str] = {
 def _descriptor_tsne_figures(
     emb: np.ndarray, props: np.ndarray, *, space: str
 ) -> dict[str, Any]:
-    """One PCA→t-SNE embedding (``emb``) recolored by each probe descriptor."""
+    """One t-SNE embedding (``emb``) recolored by each probe descriptor."""
     return {
         f"t-sne/{name}": _tsne_figure(
             emb,
             props[:, i],
-            title=f"Val ${space}$ PCA(50)→t-SNE ({_PROBE_LABELS[name]})",
+            title=f"Val ${space}$ t-SNE ({_PROBE_LABELS[name]})",
             cbar_label=_PROBE_LABELS[name],
         )
         for i, name in enumerate(PROBE_DESCRIPTOR_NAMES)
@@ -266,6 +255,7 @@ class SSLValProbes:
         self.ridge_alpha = float(ridge_alpha)
         self.probe_test_size = float(probe_test_size)
         self.tsne_perplexity = tsne_perplexity
+        self._prev_z: np.ndarray | None = None  # last epoch's z_m on the probe set
         self._views: list[str] | None = None
         self._props: np.ndarray | None = None  # [N, len(PROBE_DESCRIPTOR_NAMES)]
 
@@ -321,6 +311,23 @@ class SSLValProbes:
     def ready(self) -> bool:
         return self._views is not None and self._props is not None
 
+    def _zm_drift(self, z: np.ndarray) -> tuple[float | None, float | None]:
+        """Per-row drift of z_m vs the previous logged epoch on the fixed probe set.
+
+        Returns ``(mean_l2, mean_cos)`` where ``mean_cos`` ~1.0 means the kept
+        representation is not moving (heads/EMA absorb the objective while z_m
+        stays put). ``None`` on the first call. Stores ``z`` for the next epoch.
+        """
+        prev = self._prev_z
+        self._prev_z = z.copy()
+        if prev is None or prev.shape != z.shape:
+            return None, None
+        l2 = float(np.linalg.norm(z - prev, axis=1).mean())
+        zn = z / (np.linalg.norm(z, axis=1, keepdims=True) + 1e-12)
+        pn = prev / (np.linalg.norm(prev, axis=1, keepdims=True) + 1e-12)
+        cos = float((zn * pn).sum(axis=1).mean())
+        return l2, cos
+
     @torch.no_grad()
     def run(self, module: DiscreteFlowSSLModule) -> SslValProbeResult | None:
         if not self.ready:
@@ -342,6 +349,8 @@ class SSLValProbes:
         ).numpy()
         z_norm = _l2_normalize_rows(z_raw)
         z = z_norm if normalize_probe else z_raw
+        # Drift of the exact representation the t-SNE plots, on the fixed probe set.
+        drift_l2, drift_cos = self._zm_drift(z)
         z_sum = encode_views_sum_pooled_batched(
             module.encoder,
             self._views,
@@ -375,19 +384,17 @@ class SSLValProbes:
             r2_molwt_sum=r2_mw_sum["molwt"],
         )
 
-        emb = _pca_tsne_2d(z, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50)
+        emb = _tsne_2d(z, seed=self.seed, perplexity=self.tsne_perplexity)
         figures = _descriptor_tsne_figures(emb, self._props, space="z_m")
-        emb_sum = _pca_tsne_2d(
-            z_sum, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50,
-        )
+        emb_sum = _tsne_2d(z_sum, seed=self.seed, perplexity=self.tsne_perplexity)
         figures["t-sne/molwt_sum"] = _tsne_figure(
             emb_sum,
             self._props[:, mw_col],
-            title="Val sum-pool $z_m$ PCA(50)→t-SNE (molWt)",
+            title="Val sum-pool $z_m$ t-SNE (molWt)",
             cbar_label="molWt",
         )
         _log_wandb_figures(module, figures)
-        return result
+        return replace(result, zm_drift_l2=drift_l2, zm_drift_cos=drift_cos)
 
     def maybe_run(self, module: DiscreteFlowSSLModule) -> dict[str, float | int]:
         if not self.ready:
@@ -465,7 +472,7 @@ class JepaValProbes(SSLValProbes):
             r2_molwt_sum=float("nan"),  # sum-pool probe is discrete-flow adapter only
         )
 
-        emb = _pca_tsne_2d(z, seed=self.seed, perplexity=self.tsne_perplexity, pca_components=50)
+        emb = _tsne_2d(z, seed=self.seed, perplexity=self.tsne_perplexity)
         figures = _descriptor_tsne_figures(emb, self._props, space="z_s")
         _log_wandb_figures(module, figures)
         return result

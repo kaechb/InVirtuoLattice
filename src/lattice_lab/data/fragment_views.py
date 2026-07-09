@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import random
 from pathlib import Path
+from typing import Sequence
 
 import lightning as L
 import pandas as pd
@@ -248,6 +249,115 @@ def mask_local_ids(
     )
 
 
+def _join_fragment_holes(
+    frags: list[list[int]],
+    hole_frags: list[list[bool]],
+    sep_id: int,
+) -> tuple[list[int], list[bool]]:
+    ids: list[int] = []
+    holes: list[bool] = []
+    for i, (frag, hfrag) in enumerate(zip(frags, hole_frags)):
+        if i:
+            ids.append(sep_id)
+            holes.append(False)
+        ids.extend(frag)
+        holes.extend(hfrag)
+    return ids, holes
+
+
+def _noise_fill(n: int, pool: Sequence[int], rng: random.Random) -> list[int]:
+    return [int(rng.choice(pool)) for _ in range(n)]
+
+
+def noise_frags(
+    frags: list[list[int]],
+    sep_id: int,
+    noise_pool: Sequence[int],
+    rng: random.Random,
+    *,
+    frac: float = 0.5,
+    frag_idx: int | None = None,
+) -> tuple[list[int], list[bool]]:
+    """Like :func:`mask_frags`, but corrupts with i.i.d. uniform ``noise_pool`` tokens.
+
+    Returns ``(body_ids, hole_flags)`` with one bool per body token (``True`` =
+    corrupted). Fragment separators are never holes.
+    """
+    frags = [list(f) for f in frags]
+    hole_frags = [[False] * len(f) for f in frags]
+    non_empty = [i for i, frag in enumerate(frags) if frag]
+    if not non_empty:
+        n = sum(len(f) for f in frags) + max(len(frags) - 1, 0)
+        return _noise_fill(n, noise_pool, rng), [True] * n
+    if frag_idx is not None:
+        idx = frag_idx if frag_idx in non_empty else rng.choice(non_empty)
+        frags[idx] = _noise_fill(len(frags[idx]), noise_pool, rng)
+        hole_frags[idx] = [True] * len(frags[idx])
+        return _join_fragment_holes(frags, hole_frags, sep_id)
+    if len(non_empty) >= 2:
+        k = min(len(non_empty) - 1, max(1, round(frac * len(non_empty))))
+        for idx in rng.sample(non_empty, k):
+            frags[idx] = _noise_fill(len(frags[idx]), noise_pool, rng)
+            hole_frags[idx] = [True] * len(frags[idx])
+        return _join_fragment_holes(frags, hole_frags, sep_id)
+    only = non_empty[0]
+    tok = frags[only]
+    k = min(len(tok) - 1, max(1, round(frac * len(tok)))) if len(tok) > 1 else 1
+    masked_pos = set(rng.sample(range(len(tok)), k))
+    frags[only] = [
+        int(rng.choice(noise_pool)) if i in masked_pos else t
+        for i, t in enumerate(tok)
+    ]
+    hole_frags[only] = [i in masked_pos for i in range(len(tok))]
+    return _join_fragment_holes(frags, hole_frags, sep_id)
+
+
+def noise_span_ids(
+    ids: list[int],
+    noise_pool: Sequence[int],
+    rng: random.Random,
+    *,
+    frac: float = 0.5,
+) -> tuple[list[int], list[bool]]:
+    """Like :func:`mask_span_ids`, but fills the span with uniform noise tokens."""
+    if not ids:
+        return [], []
+    n = len(ids)
+    if n <= 1:
+        return list(ids), [False] * n
+    k = min(n - 1, max(1, round(frac * n)))
+    start = rng.randrange(0, n - k + 1)
+    out = list(ids)
+    holes = [False] * n
+    for i in range(start, start + k):
+        out[i] = int(rng.choice(noise_pool))
+        holes[i] = True
+    return out, holes
+
+
+def noise_local_frags(
+    frags: list[list[int]],
+    ids: list[int],
+    sep_id: int,
+    noise_pool: Sequence[int],
+    rng: random.Random,
+    *,
+    frac: float = 0.5,
+    mode: str = "fragment",
+) -> tuple[list[int], list[bool]]:
+    """I-JEPA local-view corruption with explicit hole flags (see :func:`noise_frags`)."""
+    if mode == "fragment":
+        return noise_frags(frags, sep_id, noise_pool, rng, frac=frac)
+    if mode == "span":
+        return noise_span_ids(ids, noise_pool, rng, frac=frac)
+    if mode == "mixed":
+        pick = "span" if rng.random() < 0.5 else "fragment"
+        return noise_local_frags(
+            frags, ids, sep_id, noise_pool, rng, frac=frac, mode=pick,
+        )
+    raise ValueError(f"mask mode must be fragment, span, or mixed, got {mode!r}")
+
+
 class FragmentViewDataset(Dataset):
     """Yields fragmented-SMILES views or pretokenized ``body_ids`` from MOSES shards."""
 
@@ -261,6 +371,9 @@ class FragmentViewDataset(Dataset):
         split_seed: int = 0,
         return_smiles: bool = False,
         tokenizer_path: str | Path | None = None,
+        conformer_cache: dict | None = None,
+        atom_dict=None,
+        max_atoms: int = 256,
     ) -> None:
         from lattice_lab.preprocessing.molecules import (
             fragment_view_column,
@@ -270,6 +383,12 @@ class FragmentViewDataset(Dataset):
         )
 
         self._return_smiles = return_smiles
+        self._use_conformers = conformer_cache is not None
+        self._conformer_cache = conformer_cache
+        self._atom_dict = atom_dict
+        self._max_atoms = int(max_atoms)
+        if self._use_conformers and atom_dict is None:
+            raise ValueError("atom_dict is required when conformer_cache is provided")
         self._use_body_ids = shards_have_body_ids(shards)
         self._tokenizer = None
         if not self._use_body_ids and tokenizer_path is not None:
@@ -286,6 +405,15 @@ class FragmentViewDataset(Dataset):
             test_ratio=test_ratio, split_seed=split_seed,
             columns=cols,
         )
+        if self._use_conformers:
+            # Keep only molecules with a cached conformer; all per-row lists below
+            # (bodies/views/smiles/inchikeys) then derive from the same filtered df.
+            before = len(df)
+            df = df[df["inchikey"].astype(str).isin(self._conformer_cache)].reset_index(drop=True)
+            logger.info(
+                "fragment-view dataset split=%s: %d/%d molecules have a cached conformer",
+                split, len(df), before,
+            )
         if self._use_body_ids:
             self._bodies = [list(map(int, row)) for row in df["body_ids"].tolist()]
             self._views: list[str] = []
@@ -301,6 +429,14 @@ class FragmentViewDataset(Dataset):
         self._smiles: list[str] = (
             df["smiles"].astype(str).tolist() if return_smiles else []
         )
+        self._inchikeys: list[str] = (
+            df["inchikey"].astype(str).tolist() if self._use_conformers else []
+        )
+        if self._use_conformers and not self._inchikeys:
+            raise ValueError(
+                f"no molecules with cached conformers in split={split!r} "
+                f"from {len(shards)} shard(s)"
+            )
         if not self._use_body_ids and not self._views:
             raise ValueError(f"no molecules in split={split!r} from {len(shards)} shard(s)")
         if self._use_body_ids and not self._bodies:
@@ -309,7 +445,7 @@ class FragmentViewDataset(Dataset):
     def __len__(self) -> int:
         return len(self._bodies) if self._use_body_ids else len(self._views)
 
-    def __getitem__(self, idx: int) -> str | list[int] | tuple[str | list[int], str]:
+    def __getitem__(self, idx: int):
         if self._use_body_ids:
             item: str | list[int] = self._bodies[idx]
         else:
@@ -317,6 +453,13 @@ class FragmentViewDataset(Dataset):
             item = view
             if self._tokenizer is not None:
                 item = self._tokenizer.encode(view, add_special_tokens=False)
+        if self._use_conformers:
+            from lattice_lab.data.conformers import featurize_conformer
+
+            atoms, coords = self._conformer_cache[self._inchikeys[idx]]
+            feat = featurize_conformer(atoms, coords, self._atom_dict, self._max_atoms)
+            smi = self._smiles[idx] if self._return_smiles else None
+            return item, smi, feat
         if self._return_smiles:
             return item, self._smiles[idx]
         return item
@@ -345,6 +488,21 @@ def collate_bodies_with_smiles(
     return list(views), list(smiles)
 
 
+def collate_with_conformers(batch: list[tuple]):
+    """3D-enabled collate: ``(items, smiles|None, net_input_3d)``.
+
+    Items may be fragment-view strings or ``body_ids`` (both just listed); the
+    per-molecule featurized conformers are right-padded into the ``mol_src_*``
+    batch dict read by :class:`PointCloudEncoder`. ``smiles`` is ``None`` when the
+    dataset was built with ``return_smiles=False``.
+    """
+    from lattice_lab.data.conformers import collate_conformers
+
+    items, smiles, feats = zip(*batch)
+    smiles_list = None if smiles[0] is None else list(smiles)
+    return list(items), smiles_list, collate_conformers(list(feats))
+
+
 class FragmentViewDataModule(L.LightningDataModule):
     def __init__(
         self,
@@ -358,6 +516,9 @@ class FragmentViewDataModule(L.LightningDataModule):
         num_workers: int = 0,
         return_smiles: bool = False,
         tokenizer_path: str | Path | None = None,
+        conformer_cache: str | Path | None = None,
+        atom_dict_path: str | Path | None = None,
+        max_atoms: int = 256,
     ) -> None:
         super().__init__()
         self.shard_dir = Path(shard_dir)
@@ -369,6 +530,11 @@ class FragmentViewDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.return_smiles = return_smiles
         self.tokenizer_path = tokenizer_path
+        self.conformer_cache = conformer_cache
+        self.atom_dict_path = atom_dict_path
+        self.max_atoms = int(max_atoms)
+        self._conformer_cache: dict | None = None
+        self._atom_dict = None
         self._shards: list[Path] = []
         self._train: FragmentViewDataset | None = None
         self._val: FragmentViewDataset | None = None
@@ -379,12 +545,27 @@ class FragmentViewDataModule(L.LightningDataModule):
         self._shards = sorted(self.shard_dir.glob("shard_*.parquet"))
         if not self._shards:
             raise FileNotFoundError(f"no parquet shards in {self.shard_dir}")
+        if self.conformer_cache is not None:
+            from lattice_lab.data.conformers import (
+                DEFAULT_DICT_PATH,
+                Dictionary,
+                load_conformer_cache,
+            )
+
+            self._conformer_cache = load_conformer_cache(str(self.conformer_cache))
+            self._atom_dict = Dictionary.load(
+                str(self.atom_dict_path or DEFAULT_DICT_PATH)
+            )
+            logger.info("loaded %d cached conformers", len(self._conformer_cache))
         ds_kw = dict(
             val_ratio=self.val_ratio,
             test_ratio=self.test_ratio,
             split_seed=self.split_seed,
             return_smiles=self.return_smiles,
             tokenizer_path=self.tokenizer_path,
+            conformer_cache=self._conformer_cache,
+            atom_dict=self._atom_dict,
+            max_atoms=self.max_atoms,
         )
         self._train = FragmentViewDataset(self._shards, split="train", **ds_kw)
         if self.run_validation:
@@ -399,6 +580,10 @@ class FragmentViewDataModule(L.LightningDataModule):
 
     @property
     def _collate(self):
+        if self.conformer_cache is not None:
+            # 3D-enabled batches always carry the (items, smiles|None, net_input_3d)
+            # triple; item type (str vs body_ids) is handled inside the collate.
+            return collate_with_conformers
         pretokenized = self._pretokenized_batches() or self.tokenizer_path is not None
         if pretokenized and self.return_smiles:
             return collate_bodies_with_smiles

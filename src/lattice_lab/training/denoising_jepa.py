@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from lattice_lab.backbone.adapter import Adapter
 from lattice_lab.backbone.discrete_flow import (
     DiscreteFlowBundle,
     _sample_timesteps,
@@ -18,7 +19,6 @@ from lattice_lab.backbone.discrete_flow import (
 
 __all__ = [
     "AttentionPool",
-    "VAEHead",
     "JEPAEncoder",
     "DenoisingJEPAModel",
     "masked_mean",
@@ -78,33 +78,6 @@ class AttentionPool(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# New component 2: VAE reparameterization head (optional latent regularizer)
-# --------------------------------------------------------------------------- #
-class VAEHead(nn.Module):
-    """``z_s [B, D] → mu, log_var``; sample when ``training=True``, else ``mu``."""
-
-    def __init__(self, dim: int, *, free_bits: float = 0.0) -> None:
-        super().__init__()
-        self.mu = nn.Linear(dim, dim)
-        self.log_var = nn.Linear(dim, dim)
-        self.free_bits = float(free_bits)
-
-    def reparameterize(self, z: Tensor, *, training: bool) -> tuple[Tensor, Tensor, Tensor]:
-        """Return ``(z_out, kl, log_var)``; ``log_var`` is ``[B, D]``."""
-        mu = self.mu(z)
-        log_var = self.log_var(z).clamp(-10.0, 10.0)
-        if training:
-            z_out = mu + torch.randn_like(mu) * (0.5 * log_var).exp()
-        else:
-            z_out = mu
-        kl_dim = -0.5 * (1.0 + log_var - mu.pow(2) - log_var.exp())  # [B, D]
-        kl_dim = kl_dim.mean(dim=0)  # [D] expected KL per latent dimension
-        if self.free_bits > 0.0:
-            kl_dim = kl_dim.clamp_min(self.free_bits)
-        return z_out, kl_dim.mean(), log_var
-
-
-# --------------------------------------------------------------------------- #
 # Shared low-level helpers (reuse backbone conventions)
 # --------------------------------------------------------------------------- #
 def _additive_key_mask(mask_bool: Tensor) -> Tensor:
@@ -140,10 +113,12 @@ class JEPAEncoder(nn.Module):
         backbone: nn.Module,
         pool: AttentionPool,
         *,
+        adapter: nn.Module | None = None,
         encode_time: float = 1.0,
     ) -> None:
         super().__init__()
         self.backbone = backbone
+        self.adapter = adapter
         self.pool = pool
         self.register_buffer("encode_time", torch.tensor(float(encode_time)))
 
@@ -162,7 +137,12 @@ class JEPAEncoder(nn.Module):
         t_vec = self._time_vec(ids.size(0), ids.device, t)
         out = self.backbone(ids, t_vec, attn_mask=attn, conds=None, return_hidden=True)
         # return_hidden=True → (logits, hidden_states[B, L, D]).
-        return out[1] if isinstance(out, tuple) else out
+        h = out[1] if isinstance(out, tuple) else out
+        if self.adapter is not None:
+            # Adapter refines the frozen backbone hiddens (return_tokens → per-token
+            # reps [B, L, D]); the encoder's own AttentionPool then pools them.
+            _, h = self.adapter(h, mask_bool.to(h.dtype), return_tokens=True)
+        return h
 
     def forward(self, ids: Tensor, mask: Tensor, t=None) -> Tensor:
         """Pooled molecule latent ``z_s`` ``[B, D]``."""
@@ -176,7 +156,6 @@ class _DenoisingCore(Protocol):
     pad_id: int
     vocab_size: int
     token_id_min: int
-    vae_head: VAEHead | None
     training: bool
 
 
@@ -187,40 +166,9 @@ def encode_pooled_latent(
     *,
     training: bool | None = None,
 ) -> Tensor:
-    """Encoder pool output, then VAE μ (+ noise when ``training``)."""
-    z = model.encoder(ids, mask)
-    if model.vae_head is not None:
-        if training is None:
-            training = model.training
-        z, _, _ = model.vae_head.reparameterize(z, training=training)
-    return z
-
-
-def _encode_z_with_vae(
-    model: _DenoisingCore,
-    ids: Tensor,
-    mask: Tensor,
-    *,
-    training: bool | None = None,
-) -> tuple[Tensor, Tensor | None, Tensor | None]:
-    """Pooled latent plus optional ``(kl, log_var)`` when a VAE head is attached."""
-    z = model.encoder(ids, mask)
-    kl: Tensor | None = None
-    log_var: Tensor | None = None
-    if model.vae_head is not None:
-        if training is None:
-            training = model.training
-        z, kl, log_var = model.vae_head.reparameterize(z, training=training)
-    return z, kl, log_var
-
-
-def _logvar_metrics(log_var: Tensor) -> dict[str, float]:
-    with torch.no_grad():
-        return {
-            "logvar_mean": float(log_var.mean()),
-            "logvar_std": float(log_var.std(unbiased=False)),
-            "logvar_exp_mean": float(log_var.exp().mean()),
-        }
+    """Pooled molecule latent ``z_s`` from the encoder."""
+    del training  # kept for call-site compatibility
+    return model.encoder(ids, mask)
 
 
 def denoise_forward(
@@ -273,7 +221,6 @@ class DenoisingJEPAModel(nn.Module):
         self.token_id_min = int(token_id_min)
         self.bundle = bundle
         self.build_config: dict | None = None
-        self.vae_head: VAEHead | None = None
 
     def denoise_logits(
         self, x_t: Tensor, mask: Tensor, t: Tensor, conds: Tensor
@@ -345,7 +292,7 @@ def corrupt_tokens(
     ids = ids.long()
     x0 = torch.randint(int(token_id_min), int(vocab_size), ids.shape, device=device)
     # Bernoulli(sigma_t) draw of which positions take the source token.
-    sigma_t = 1.0 - t#.pow(float(path_power))
+    sigma_t = 1.0 - t.pow(float(path_power))
     src = torch.rand(ids.shape, device=device) < sigma_t.unsqueeze(-1)
     src = src & valid
     x_t = torch.where(src, x0, ids).masked_fill(~valid, int(pad_id))
@@ -359,11 +306,21 @@ def reconstruction_loss(
     logits: Tensor,
     clean_ids: Tensor,
     noised_mask: Tensor,
+    *,
+    token_weight: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Token CE at noised positions only; ``0`` when nothing was noised."""
+    """Token CE at noised positions only; ``0`` when nothing was noised.
+
+    ``token_weight`` (``[vocab]``) optionally reweights each noised position by
+    its *target* token — e.g. inverse-frequency to stop the loss being dominated
+    by abundant carbons. It only changes the *relative* weighting (the weighted
+    mean divides by the summed weights), so the loss scale stays comparable.
+    """
     targets = clean_ids.long()
     ce = F.cross_entropy(logits.transpose(1, 2), targets, reduction="none")  # [B, L]
     w = noised_mask.to(ce.dtype)
+    if token_weight is not None:
+        w = w * token_weight.to(ce.dtype)[targets]
     denom = w.sum().clamp_min(1.0)
     loss = (ce * w).sum() / denom
     return loss, ce
@@ -386,11 +343,11 @@ def denoising_loss(
     cond_noise_scale: float = 0.0,
     latent_consistency_lambda: float = 0.0,
 ):
-    """Return ``(loss, metrics)``; optional ``(z_s, logits, noised, ids, kl), terms``."""
+    """Return ``(loss, metrics)``; optional ``(z_s, logits, noised, ids), terms``."""
     ids, mask = batch
     ids = ids.long()
 
-    z_s, kl, log_var = _encode_z_with_vae(model, ids, mask)
+    z_s = model.encoder(ids, mask)
 
     x_corrupt, t, noised = corrupt_tokens(
         ids,
@@ -415,14 +372,16 @@ def denoising_loss(
     else:
         logits = denoise_forward(model, x_corrupt, mask, t, z_s_cond)
 
-    recon, _ = reconstruction_loss(logits, ids, noised)
+    recon, _ = reconstruction_loss(
+        logits, ids, noised, token_weight=getattr(model, "recon_token_weight", None)
+    )
     loss = recon
 
     align: Optional[Tensor] = None
     if batch_b is not None and align_lambda > 0.0:
         ids_b, mask_b = batch_b
         ids_b = ids_b.long()
-        z_b, _, _ = _encode_z_with_vae(model, ids_b, mask_b)
+        z_b = model.encoder(ids_b, mask_b)
         align = (1.0 - F.cosine_similarity(z_s, z_b, dim=-1)).mean()
         loss = recon + float(align_lambda) * align
 
@@ -452,15 +411,13 @@ def denoising_loss(
     if latent is not None:
         metrics["latent"] = float(latent.detach())
         metrics["latent_cos"] = float(1.0 - latent.detach())
-    if log_var is not None:
-        metrics.update(_logvar_metrics(log_var))
     if return_outputs:
         terms: dict[str, Tensor] = {"recon": recon}
         if align is not None:
             terms["align"] = float(align_lambda) * align
         if latent is not None:
             terms["latent"] = float(latent_consistency_lambda) * latent
-        return loss, metrics, (z_s, logits, noised, ids, kl), terms
+        return loss, metrics, (z_s, logits, noised, ids), terms
     return loss, metrics
 
 
@@ -568,8 +525,6 @@ def _wire_denoising_jepa(
     parent.token_id_min = int(token_id_min)
     parent.bundle = bundle
     parent.build_config = dict(build_config)
-    if not hasattr(parent, "vae_head"):
-        parent.vae_head = None
 
 
 # --------------------------------------------------------------------------- #
@@ -635,6 +590,7 @@ def build_denoising_jepa(
     n_head: int = 12,
     n_embd: int = 768,
     dropout: float = 0.1,
+    adapter_n_layers: int = 2,
     device: str | torch.device = "cpu",
     parent: nn.Module | None = None,
 ) -> DenoisingJEPAModel | None:
@@ -663,7 +619,20 @@ def build_denoising_jepa(
     )
     denoiser.to(device)
     pool = AttentionPool(hidden, num_heads=pool_heads, dropout=pool_dropout)
-    encoder = JEPAEncoder(bundle.model, pool, encode_time=encode_time)
+    adapter = (
+        Adapter(
+            d_backbone=hidden,
+            n_backbone_layers=1,
+            d_adapter=hidden,
+            n_heads=n_head,
+            n_layers=int(adapter_n_layers),
+            dropout=dropout,
+            pool="mean",
+        )
+        if int(adapter_n_layers) > 0
+        else None
+    )
+    encoder = JEPAEncoder(bundle.model, pool, adapter=adapter, encode_time=encode_time)
     build_config = {
         "tokenizer_path": tokenizer_path,
         "pool_heads": int(pool_heads),
@@ -673,6 +642,7 @@ def build_denoising_jepa(
         "n_head": int(n_head),
         "n_embd": hidden,
         "dropout": float(dropout),
+        "adapter_n_layers": int(adapter_n_layers),
         "freeze_backbone": bool(freeze_backbone),
     }
     if parent is not None:

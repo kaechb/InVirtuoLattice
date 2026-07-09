@@ -10,6 +10,8 @@ The adapter, the encode-time parameter (when learnable), and the DDiT backbone
 
 Losses (``ssl_loss``):
   * ``ntxent`` (default) — symmetric NT-Xent / InfoNCE on projection head outputs.
+  * ``siglip`` — same two-view setup as ntxent, but a sigmoid pairwise loss
+    (SigLIP) with a learnable temperature + bias instead of softmax InfoNCE.
   * ``lejepa`` — invariance loss + SIGReg on unnormalized pooled latents: every
     view (intact shuffles + masked) is pulled directly toward the molecule's
     intact center (no predictor), while SIGReg keeps the target batch isotropic.
@@ -17,8 +19,9 @@ Losses (``ssl_loss``):
   * ``hybrid`` — NT-Xent on the first two global views' projections, linearly
     annealed (1.0 -> 0.0 over ``hybrid_anneal_steps``) in favor of the LeJEPA
     loss.
-  * ``ijepa`` — I-JEPA: one masked encoder pass (``<UNK>`` holes), visible adapter
-    reps + learnable mask-token predictor vs EMA intact targets at hole indices.
+  * ``ijepa`` — I-JEPA: one corrupted encoder pass (selected positions replaced
+    with uniform random body tokens), visible adapter reps + learnable mask-token
+    predictor vs EMA intact targets at hole indices.
     One intact view per molecule plus ``lejepa_n_local_views`` masked locals.
     Masking is fragment-, span-, or mixed-mode (``ijepa_mask_mode``). With
     ``ijepa_gram_weight > 0``, adds DINOv3 Gram anchoring: the online intact
@@ -37,20 +40,26 @@ import lightning as L
 import numpy as np
 import torch
 
-from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder, pad_batch
+from lattice_lab.backbone.discrete_flow import DiscreteFlowEncoder, ijepa_noise_token_pool, pad_batch
 from lattice_lab.backbone.discrete_flow import resolve_mask_token_id
 from lattice_lab.data.fragment_views import (
     join_fragment_ids,
     mask_frags,
     mask_local_frags,
+    noise_local_frags,
     shuffle_frags,
     split_fragment_ids,
 )
 from lattice_lab.models.schedules import cosine_ema_decay, cosine_with_warmup
 from lattice_lab.training.ssl_loss import (
+    DINOHead,
+    DINOLoss,
     IJEPALoss,
     LeJEPALoss,
     NTXentLoss,
+    PooledEmbeddingPredictor,
+    SigLIPLoss,
+    VISReg,
     _FingerprintCache,
     lejepa_retrieval_acc1,
     similarity_distillation_loss,
@@ -64,6 +73,16 @@ from lattice_lab.training.ssl_val_probes import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _adamw_no_decay(name: str, p: torch.nn.Parameter) -> bool:
+    """AdamW convention: decay weight matrices only, not bias/norm/scalars."""
+    return (
+        p.ndim < 2
+        or name.endswith(".bias")
+        or "norm" in name.lower()
+        or name == "time_logit"
+    )
 
 
 class DiscreteFlowSSLModule(L.LightningModule):
@@ -96,16 +115,37 @@ class DiscreteFlowSSLModule(L.LightningModule):
         ijepa_predictor_layers: int = 1,
         ijepa_predictor_heads: int = 2,
         ijepa_predictor_ff_mult: int = 2,
+        # Token-level masked prediction (the core I-JEPA objective). Set 0 to drop it
+        # — with glob/gram also off, locals become independent fragment shuffles and
+        # match the teacher purely via the pooled noise-invariance term.
+        ijepa_predict_weight: float = 1.0,
         ijepa_glob_weight: float = 1.0,
         ijepa_inv_weight: float = 0.1,
+        # Noise invariance: whole-molecule mean-pool of the uniform-noise-corrupted
+        # view pulled toward the stop-grad EMA-teacher clean global. 0 disables.
+        ijepa_noise_inv_weight: float = 0.0,
         # DINOv3 Gram anchoring: match online intact patch-Gram to the EMA teacher's
         # (stop-grad). 0 disables. Stabilizes dense features over long schedules.
         ijepa_gram_weight: float = 0.0,
-        # Replace SIGReg with VICReg (variance hinge + covariance penalty) as the
-        # I-JEPA pooled-z_m anti-collapse regularizer.
-        ijepa_use_vicreg: bool = False,
-        ijepa_vicreg_gamma: float = 1.0,
-        ijepa_vicreg_cov_coeff: float = 1.0,
+        # DINO prototype head: student (online noised locals) matches a centered,
+        # sharpened stop-grad EMA-teacher prototype distribution of the clean global.
+        # Coexists additively with the other terms. 0 disables (no head is built).
+        ijepa_dino_weight: float = 0.0,
+        ijepa_dino_out_dim: int = 4096,
+        ijepa_dino_hidden: int = 2048,
+        ijepa_dino_bottleneck: int = 256,
+        ijepa_dino_teacher_temp: float = 0.04,
+        ijepa_dino_student_temp: float = 0.1,
+        ijepa_dino_center_momentum: float = 0.9,
+        # DINO student input: ``pool`` = noised mean-pool → prototypes directly;
+        # ``predict`` = mean-pool → MLP predictor → prototypes (asymmetric views).
+        ijepa_dino_student: str = "predict",
+        # Replace SIGReg with VISReg (variance + sliced-Wasserstein sketching) as
+        # the I-JEPA pooled-z_m anti-collapse regularizer (arXiv:2606.02572).
+        ijepa_use_visreg: bool = False,
+        ijepa_visreg_gamma: float = 1.0,
+        ijepa_visreg_shape_coeff: float = 1.0,
+        ijepa_visreg_num_projections: int = 4096,
         ijepa_collapse_diag_every_n_steps: int = 50,
         rank_subsample: int = 256,
         sigreg_num_projections: int = 256,
@@ -131,18 +171,38 @@ class DiscreteFlowSSLModule(L.LightningModule):
         val_probe_ridge_alpha: float = 1.0,
         val_probe_test_size: float = 0.2,
         val_probe_tsne_perplexity: float | None = None,
+        # Cross-modal 3D view: a Uni-Mol point-cloud co-encoder whose pooled
+        # embedding a predictor regresses from the 2D pooled z_m. LeJEPA-style —
+        # symmetric alignment (no EMA/stop-grad), collapse prevented by VISReg on
+        # each modality. 0 disables. ``encoder_3d`` is Hydra-instantiated.
+        encoder_3d: torch.nn.Module | None = None,
+        view3d_weight: float = 0.0,
+        # Cross-modal alignment metric: "l2" (LeJEPA MSE on raw embeddings; scale
+        # kept safe by VISReg on each modality) or "cosine".
+        view3d_loss: str = "l2",
+        # Also apply VISReg to the 1D (2D adapter) pooled z_m in the cross-modal
+        # term, not just the 3D modality. The intended pairing is
+        # ``ssl_loss=ntxent`` (NT-Xent as the within-1D-modality objective) with
+        # the LeJEPA cross-modal predictor (1D -> 3D): NT-Xent stops 1D collapse,
+        # VISReg on 1D *and* 3D keeps both encoders isotropic under the symmetric
+        # (no stop-grad) alignment. Redundant for ssl_loss=lejepa/ijepa, which
+        # already regularize the 1D z_m.
+        view3d_visreg_1d: bool = False,
         seed: int = 0,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(ignore=["encoder"])
+        self.save_hyperparameters(ignore=["encoder", "encoder_3d"])
         self.encoder = encoder
         ssl_loss = ssl_loss.lower()
-        if ssl_loss not in {"ntxent", "lejepa", "hybrid", "ijepa"}:
+        if ssl_loss not in {"ntxent", "siglip", "lejepa", "hybrid", "ijepa"}:
             raise ValueError(
-                f"ssl_loss must be 'ntxent', 'lejepa', 'hybrid', or 'ijepa', "
-                f"got {ssl_loss!r}"
+                f"ssl_loss must be 'ntxent', 'siglip', 'lejepa', 'hybrid', or "
+                f"'ijepa', got {ssl_loss!r}"
             )
         self.ssl_loss = ssl_loss
+        # ntxent and siglip share the same two-view (projection) contrastive path;
+        # they differ only in the loss applied to the paired projections.
+        self._contrastive = ssl_loss in ("ntxent", "siglip")
         # "hybrid" reuses lejepa's global+local view construction (it needs the
         # masked local views for SIGReg too), just also takes a projection for
         # the annealed ntxent term.
@@ -164,6 +224,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
         self.ntxent_loss_fn = (
             NTXentLoss(temperature=temperature) if ssl_loss in ("ntxent", "hybrid") else None
         )
+        self.siglip_loss_fn = SigLIPLoss() if ssl_loss == "siglip" else None
         self.lejepa_loss_fn = (
             LeJEPALoss(
                 lejepa_lambda=lejepa_lambda,
@@ -171,6 +232,10 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 sigreg_knots=sigreg_knots,
                 sigreg_t_max=sigreg_t_max,
                 sigreg_eps=sigreg_eps,
+                use_visreg=ijepa_use_visreg,
+                visreg_gamma=ijepa_visreg_gamma,
+                visreg_shape_coeff=ijepa_visreg_shape_coeff,
+                visreg_num_projections=ijepa_visreg_num_projections,
             )
             if uses_lejepa_views
             else None
@@ -183,14 +248,17 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 sigreg_knots=sigreg_knots,
                 sigreg_t_max=sigreg_t_max,
                 sigreg_eps=sigreg_eps,
-                use_vicreg=ijepa_use_vicreg,
-                vicreg_gamma=ijepa_vicreg_gamma,
-                vicreg_cov_coeff=ijepa_vicreg_cov_coeff,
+                use_visreg=ijepa_use_visreg,
+                visreg_gamma=ijepa_visreg_gamma,
+                visreg_shape_coeff=ijepa_visreg_shape_coeff,
+                visreg_num_projections=ijepa_visreg_num_projections,
                 ijepa_predictor_layers=ijepa_predictor_layers,
                 ijepa_predictor_heads=ijepa_predictor_heads,
                 ijepa_predictor_ff_mult=ijepa_predictor_ff_mult,
+                predict_weight=ijepa_predict_weight,
                 glob_weight=ijepa_glob_weight,
                 inv_weight=ijepa_inv_weight,
+                noise_inv_weight=ijepa_noise_inv_weight,
                 gram_weight=ijepa_gram_weight,
             )
             if ssl_loss == "ijepa"
@@ -206,6 +274,77 @@ class DiscreteFlowSSLModule(L.LightningModule):
             self.encoder_ema.eval()
             for p in self.encoder_ema.parameters():
                 p.requires_grad = False
+        # Cross-modal 3D co-encoder + pooled predictor. LeJEPA-style: symmetric
+        # alignment (z_2d -> pred_3d -> cos to the *online* z_3d, no EMA/stop-grad),
+        # collapse prevented by VISReg on each modality. Mode-agnostic (any ssl_loss).
+        self.encoder_3d = encoder_3d
+        self.pred_3d: PooledEmbeddingPredictor | None = None
+        self.visreg_3d: VISReg | None = None
+        self.visreg_2d: VISReg | None = None
+        self.view3d_weight = float(view3d_weight)
+        self.view3d_loss = str(view3d_loss).lower()
+        self.view3d_visreg_1d = bool(view3d_visreg_1d)
+        if self.view3d_loss not in ("l2", "cosine"):
+            raise ValueError(f"view3d_loss must be 'l2' or 'cosine', got {view3d_loss!r}")
+        # With dual attention pooling the contrastive (siglip/ntxent) objective owns
+        # the projection pool half; the cross-modal LeJEPA prediction (and its 1D
+        # VISReg anchor) then reads *only* the main (regression) pool half so the two
+        # 1D objectives stay decoupled. z_m stays the full concat for downstream use.
+        self._view3d_main_half = self._contrastive and encoder.adapter.dual_attn_pool
+        self._d_pool = int(encoder.adapter.d_pool)
+        if encoder_3d is not None and self.view3d_weight > 0.0:
+            d_3d = int(getattr(encoder_3d, "output_dim", encoder.adapter.d_adapter))
+            if d_3d != encoder.adapter.d_adapter:
+                raise ValueError(
+                    f"3D encoder output_dim ({d_3d}) must match d_adapter "
+                    f"({encoder.adapter.d_adapter}); add a projection otherwise"
+                )
+            pred_in = self._d_pool if self._view3d_main_half else encoder.adapter.d_adapter
+            self.pred_3d = PooledEmbeddingPredictor(
+                pred_in, out_dim=encoder.adapter.d_adapter
+            )
+            visreg_kwargs = dict(
+                gamma=ijepa_visreg_gamma,
+                shape_coeff=ijepa_visreg_shape_coeff,
+                num_projections=ijepa_visreg_num_projections,
+            )
+            self.visreg_3d = VISReg(**visreg_kwargs)
+            # Optional anti-collapse on the 1D modality (unnormalized pooled z_m),
+            # for the ntxent + cross-modal-LeJEPA pairing (see __init__ docstring).
+            if self.view3d_visreg_1d:
+                self.visreg_2d = VISReg(**visreg_kwargs)
+        self.dino_head: DINOHead | None = None
+        self.dino_head_ema: DINOHead | None = None
+        self.dino_pool_predictor: PooledEmbeddingPredictor | None = None
+        self.dino_loss_fn: DINOLoss | None = None
+        if ssl_loss == "ijepa" and float(ijepa_dino_weight) > 0.0:
+            dino_student = str(ijepa_dino_student).lower()
+            if dino_student not in ("pool", "predict"):
+                raise ValueError(
+                    f"ijepa_dino_student must be 'pool' or 'predict', got {ijepa_dino_student!r}"
+                )
+            dino_head_kwargs = dict(
+                dim=encoder.adapter.d_adapter,
+                out_dim=int(ijepa_dino_out_dim),
+                hidden=int(ijepa_dino_hidden),
+                bottleneck=int(ijepa_dino_bottleneck),
+            )
+            self.dino_head = DINOHead(**dino_head_kwargs)
+            self.dino_head_ema = DINOHead(**dino_head_kwargs)
+            self.dino_head_ema.load_state_dict(self.dino_head.state_dict())
+            self.dino_head_ema.eval()
+            for p in self.dino_head_ema.parameters():
+                p.requires_grad = False
+            if dino_student == "predict":
+                self.dino_pool_predictor = PooledEmbeddingPredictor(
+                    encoder.adapter.d_adapter,
+                )
+            self.dino_loss_fn = DINOLoss(
+                int(ijepa_dino_out_dim),
+                teacher_temp=float(ijepa_dino_teacher_temp),
+                student_temp=float(ijepa_dino_student_temp),
+                center_momentum=float(ijepa_dino_center_momentum),
+            )
         self._rng = random.Random(seed)
         self._val_probes = SSLValProbes(
             n_molecules=val_probe_n_molecules,
@@ -217,8 +356,11 @@ class DiscreteFlowSSLModule(L.LightningModule):
             tsne_perplexity=val_probe_tsne_perplexity,
         )
         self._val: dict[str, list[float]] = {
-            "loss": [], "acc": [], "inv": [], "sigreg": [],
-            "predict": [], "glob": [], "gram": [], "view_diversity": [], "fp": [], "ntxent": [],
+            "loss": [], "loss_1d": [], "acc": [], "inv": [], "noise_inv": [], "sigreg": [],
+            "predict": [], "glob": [], "gram": [], "dino": [],
+            "dino_teacher_entropy": [], "dino_active_prototypes": [],
+            "view_diversity": [], "fp": [], "ntxent": [],
+            "view3d": [], "view3d_reg": [], "view3d_reg_1d": [], "view3d_mix": [],
             "cond_true": [], "cond_shuf": [], "cond_zero": [],
             "cond_gap_zero": [], "cond_gap_shuf": [],
             "rank_effective": [], "rank_numerical": [],
@@ -230,6 +372,18 @@ class DiscreteFlowSSLModule(L.LightningModule):
             if uses_masking
             else None
         )
+        self._ijepa_noise_pool: tuple[int, ...] = ()
+        if ssl_loss == "ijepa":
+            b = encoder.bundle
+            assert self._mask_token_id is not None
+            self._ijepa_noise_pool = ijepa_noise_token_pool(
+                vocab_size=b.vocab_size,
+                token_id_min=encoder.token_id_min,
+                pad_id=b.pad_id,
+                bos_id=b.bos_id,
+                eos_id=b.eos_id,
+                unk_id=self._mask_token_id,
+            )
         if uses_lejepa_views and int(lejepa_n_global_views) < 1:
             raise ValueError(
                 f"lejepa_n_global_views must be >= 1, got {lejepa_n_global_views}"
@@ -268,7 +422,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
         logger.info(
             "discrete-flow SSL: ssl_loss=%s lejepa_global=%d lejepa_local=%d "
             "ijepa_mask=%s block_hole_attn=%s pred_layers=%s mask_id=%s "
-            "hybrid_anneal_steps=%s learnable_time=%s init_time=%.3f frag_sep_id=%d",
+            "ijepa_noise_pool=%d hybrid_anneal_steps=%s learnable_time=%s init_time=%.3f frag_sep_id=%d",
             ssl_loss,
             lejepa_n_global_views if uses_lejepa_views else 0,
             lejepa_n_local_views if uses_lejepa_views or ssl_loss == "ijepa" else 0,
@@ -276,6 +430,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
             ijepa_block_hole_attn if ssl_loss == "ijepa" else "n/a",
             ijepa_predictor_layers if ssl_loss == "ijepa" else "n/a",
             self._mask_token_id if uses_masking else "n/a",
+            len(self._ijepa_noise_pool) if ssl_loss == "ijepa" else 0,
             hybrid_anneal_steps if ssl_loss == "hybrid" else "n/a",
             encoder.learnable_time,
             self.encoder.encode_time_value,
@@ -332,8 +487,16 @@ class DiscreteFlowSSLModule(L.LightningModule):
         return (ids_a.to(dev), mask_a.to(dev)), (ids_b.to(dev), mask_b.to(dev))
 
     @staticmethod
-    def _split_batch(batch) -> tuple[list[str] | list[list[int]], list[str] | None]:
-        """Accept view strings, pretokenized body ids, or ``(views, smiles)``."""
+    def _split_batch(batch):
+        """Normalize to ``(views, smiles|None, net3d|None)``.
+
+        Accepts view strings, pretokenized body ids, ``(views, smiles)``, or the
+        3D-enabled ``(items, smiles|None, net_input_3d dict)`` triple.
+        """
+        # 3D-enabled collate: third element is the mol_src_* batch dict.
+        if isinstance(batch, (tuple, list)) and len(batch) == 3 and isinstance(batch[2], dict):
+            views, smiles, net3d = batch
+            return list(views), (list(smiles) if smiles is not None else None), net3d
         # collate_*_with_smiles returns (views, smiles); DataLoader may hand that
         # back as a list, not a tuple — do not treat [views, smiles] as two samples.
         if isinstance(batch, (tuple, list)) and len(batch) == 2:
@@ -343,22 +506,29 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 and isinstance(smiles, list)
                 and (not views or not isinstance(views[0], tuple))
             ):
-                return list(views), list(smiles)
+                return list(views), list(smiles), None
         if batch and isinstance(batch[0], tuple) and len(batch[0]) == 2:
             views, smiles = zip(*batch)
-            return list(views), list(smiles)
-        return list(batch), None
+            return list(views), list(smiles), None
+        return list(batch), None, None
 
     def _encode_ntxent_views(self, views):
         """Return ``(z_a_proj, z_b_proj, z_a_pooled)``.
 
-        ``z_*_proj`` are the SimCLR projection outputs (NT-Xent loss);
-        ``z_a_pooled`` is the L2-normalized z_m of view a, used by the optional
-        Tanimoto similarity-distillation loss.
+        ``z_*_proj`` are the L2-normalized SimCLR projection outputs (NT-Xent
+        loss); ``z_a_pooled`` is the *unnormalized* pooled z_m of view a. Kept raw
+        so the cross-modal VISReg-on-1D scale anchor is meaningful; the only other
+        consumer (Tanimoto distillation) L2-normalizes internally.
         """
         (ids_a, mask_a), (ids_b, mask_b) = self._two_views(views)
-        z_a_pooled, z_a = self.encoder.encode_token_ids(ids_a, mask_a, return_projection=True)
-        _, z_b = self.encoder.encode_token_ids(ids_b, mask_b, return_projection=True)
+        z_a_pooled, z_a = self.encoder.encode_token_ids(
+            ids_a, mask_a, return_projection=True, normalize=False
+        )
+        _, z_b = self.encoder.encode_token_ids(
+            ids_b, mask_b, return_projection=True, normalize=False
+        )
+        z_a = torch.nn.functional.normalize(z_a, dim=-1)
+        z_b = torch.nn.functional.normalize(z_b, dim=-1)
         return z_a, z_b, z_a_pooled
 
     def _fp_distillation(self, z_pooled, smiles):
@@ -447,11 +617,47 @@ class DiscreteFlowSSLModule(L.LightningModule):
         """Stack visible (non-hole) adapter reps: ``[B,T,D]`` → ``[N_vis,D]``."""
         return tok[(valid & ~hole).bool()]
 
+    def _pad_bool_batch(
+        self,
+        sequences: list[list[bool]],
+        *,
+        max_len: int,
+    ) -> torch.Tensor:
+        out = torch.zeros(len(sequences), max_len, dtype=torch.bool)
+        for i, seq in enumerate(sequences):
+            ln = min(len(seq), max_len)
+            if ln:
+                out[i, :ln] = torch.tensor(seq[:ln], dtype=torch.bool)
+        return out
+
+    def _ijepa_skip_online_intact(self) -> bool:
+        """Encode only noised locals on the online net (EMA still runs on clean intact).
+
+        Skip when nothing needs online clean pooled ``z_m``: VISReg (``lejepa_lambda``),
+        ``inv``, Gram anchoring, or fp distillation. Rank/collapse diagnostics then use
+        the EMA teacher global instead.
+        """
+        if self.ijepa_loss_fn is None:
+            return False
+        lf = self.ijepa_loss_fn
+        if self._view3d_enabled():
+            return False  # the 3D predictor needs the online 2D pooled z_m
+        if float(self.hparams.lejepa_lambda) > 0.0:
+            return False
+        if lf.inv_weight > 0.0 or lf.gram_weight > 0.0:
+            return False
+        if self._effective_fp_weight() > 0.0:
+            return False
+        return True
+
     def _encode_ijepa(self, batch):
         """I-JEPA views: one masked encode + intact targets at hole indices.
 
         Returns ``(tok_masked, hole, valid, target_ema, target_online, z_pooled,
-        z_teacher_global, z_teacher_shuffle, gram_inputs)``. ``gram_inputs`` is
+        z_teacher_global, z_teacher_shuffle, z_noised_pooled, gram_inputs)``.
+        ``z_noised_pooled`` ``[B_mol*n_local, D]`` is the whole-molecule mean-pool of
+        each noise-corrupted view (the noise-invariance term matches it to the clean
+        EMA global). ``gram_inputs`` is
         ``(tok_online_intact, tok_ema_intact, intact_valid)`` (all aligned, post-BOS
         frame) when Gram anchoring is on, else ``None``. ``z_teacher_shuffle`` is ``None`` when
         ``ijepa_inv_weight`` is 0; otherwise it is the EMA teacher's pooled embedding
@@ -468,19 +674,29 @@ class DiscreteFlowSSLModule(L.LightningModule):
         * ``z_pooled``: ``[B_mol, D]`` mean-pooled intact online ``z_m``.
         * ``z_teacher_global``: ``[B_mol, D]`` intact-view pooled latents from the EMA teacher.
 
-        ponytail: assumes ``<UNK>`` (mask_id) does not occur naturally in the body.
+        ponytail: corrupted positions use uniform noise over body vocab (not ``<UNK>``);
+        hole flags are tracked explicitly during corruption.
         """
         b = self.encoder.bundle
         sep = int(self.hparams.frag_sep_id)
-        mask_id = int(self._mask_token_id)
         n_local = int(self.hparams.lejepa_n_local_views)
         mask_mode = str(self.hparams.ijepa_mask_mode).lower()
-        need_inv = (
-            self.ijepa_loss_fn is not None and self.ijepa_loss_fn.inv_weight > 0.0
+        noise_pool = self._ijepa_noise_pool
+        loss_fn = self.ijepa_loss_fn
+        need_inv = loss_fn is not None and loss_fn.inv_weight > 0.0
+        # Token-level terms (predict/glob/gram) require each local to share the intact
+        # fragment order so EMA targets line up position-for-position. When they are
+        # all off, the only matching is the alignment-free pooled noise-invariance, so
+        # each local can be its own independent fragment shuffle (more augmentation).
+        need_aligned = loss_fn is not None and (
+            loss_fn.predict_weight > 0.0
+            or loss_fn.glob_weight > 0.0
+            or loss_fn.gram_weight > 0.0
         )
         intact_seqs: list[list[int]] = []
         intact_b: list[list[int]] = []
         masked_seqs: list[list[int]] = []
+        hole_seqs: list[list[bool]] = []
         for s in batch:
             frags = split_fragment_ids(self._body_ids(s, b.tokenizer), sep)
             # One shuffle order shared by the intact view and all n_local masks;
@@ -495,16 +711,26 @@ class DiscreteFlowSSLModule(L.LightningModule):
                     [b.bos_id, *shuffle_frags(frags, sep, self._rng), b.eos_id]
                 )
             for _ in range(n_local):
-                masked = mask_local_frags(
-                    ordered_frags,
-                    ordered,
+                if need_aligned:
+                    local_frags, local_ids = ordered_frags, ordered
+                else:
+                    # Independent fragment shuffle per local view (built from the
+                    # globals), then corrupted with uniform noise.
+                    local_frags = list(frags)
+                    if len(local_frags) > 1:
+                        self._rng.shuffle(local_frags)
+                    local_ids = join_fragment_ids(local_frags, sep)
+                masked, hole_body = noise_local_frags(
+                    local_frags,
+                    local_ids,
                     sep,
-                    mask_id,
+                    noise_pool,
                     self._rng,
                     frac=self._sample_mask_frac(),
                     mode=mask_mode,
                 )
                 masked_seqs.append([b.bos_id, *masked, b.eos_id])
+                hole_seqs.append([False, *hole_body, False])
         max_len = max(
             max(map(len, intact_seqs), default=0),
             max(map(len, masked_seqs), default=0),
@@ -512,6 +738,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
         )
         intact_ids, intact_mask = pad_batch(intact_seqs, pad_id=b.pad_id, max_len=max_len)
         masked_ids, masked_mask = pad_batch(masked_seqs, pad_id=b.pad_id, max_len=max_len)
+        hole_full = self._pad_bool_batch(hole_seqs, max_len=max_len)
         n_mol = len(intact_seqs)
         n_masked = len(masked_seqs)
         dev = self.device
@@ -524,25 +751,11 @@ class DiscreteFlowSSLModule(L.LightningModule):
         masked_mask = _dev(masked_mask)
         intact_ids = _dev(intact_ids)
         intact_mask = _dev(intact_mask)
-        hole = (masked_ids == mask_id)[:, 1:]
+        hole = hole_full[:, 1:].to(dev)
         valid = masked_mask[:, 1:].bool()
         hole_attn = hole if bool(self.hparams.ijepa_block_hole_attn) else None
+        skip_online_intact = self._ijepa_skip_online_intact()
 
-        online_ids = torch.cat([masked_ids, intact_ids], dim=0)
-        online_mask = torch.cat([masked_mask, intact_mask], dim=0)
-
-        hole_attn_full = None
-        if hole_attn is not None:
-            hole_attn_full = torch.zeros(
-                online_ids.size(0), hole.size(1), dtype=torch.bool, device=dev,
-            )
-            hole_attn_full[:n_masked] = hole_attn
-
-        # Asymmetric invariance: the shuffled view (intact_b) goes through the EMA
-        # teacher under stop-grad, so inv pulls the online intact embedding toward a
-        # frozen, non-collapsed teacher of a *different* fragment order. This is what
-        # makes inv collapse-safe without VICReg/SIGReg — online-vs-online MSE has a
-        # trivial constant minimizer; matching distinct stop-grad targets does not.
         ema_ids, ema_mask = intact_ids, intact_mask
         if need_inv:
             ids_b, mask_b = pad_batch(intact_b, pad_id=b.pad_id, max_len=max_len)
@@ -557,29 +770,52 @@ class DiscreteFlowSSLModule(L.LightningModule):
         z_teacher_global = z_teacher_all[:n_mol]
         tok_ema_intact = tok_ema[:n_mol]
         z_teacher_shuffle = z_teacher_all[n_mol:] if need_inv else None
-
-        # ponytail: one online forward for masked + intact vs two separate
-        # encode_token_ids calls; EMA stays separate (different weights).
-        z_online, tok_online_all = self.encoder.encode_token_ids(
-            online_ids, online_mask,
-            normalize=False, return_tokens=True,
-            hole_mask=hole_attn_full,
-        )
-        tok_masked = tok_online_all[:n_masked]
-        z_pooled = z_online[n_masked:n_masked + n_mol]
-        tok_online_intact = tok_online_all[n_masked:n_masked + n_mol]
         tok_ema_rows = tok_ema_intact.repeat_interleave(n_local, dim=0)
-        tok_online_rows = tok_online_intact.repeat_interleave(n_local, dim=0)
-        target_ema = self._gather_hole_tokens(tok_ema_rows, hole)
-        target_online = self._gather_hole_tokens(tok_online_rows, hole)
+
+        if skip_online_intact:
+            z_online, tok_masked = self.encoder.encode_token_ids(
+                masked_ids, masked_mask,
+                normalize=False, return_tokens=True,
+                hole_mask=hole_attn,
+            )
+            z_noised_pooled = z_online
+            z_pooled = z_teacher_global
+            target_ema = self._gather_hole_tokens(tok_ema_rows, hole)
+            target_online = target_ema
+        else:
+            online_ids = torch.cat([masked_ids, intact_ids], dim=0)
+            online_mask = torch.cat([masked_mask, intact_mask], dim=0)
+            hole_attn_full = None
+            if hole_attn is not None:
+                hole_attn_full = torch.zeros(
+                    online_ids.size(0), hole.size(1), dtype=torch.bool, device=dev,
+                )
+                hole_attn_full[:n_masked] = hole_attn
+            z_online, tok_online_all = self.encoder.encode_token_ids(
+                online_ids, online_mask,
+                normalize=False, return_tokens=True,
+                hole_mask=hole_attn_full,
+            )
+            tok_masked = tok_online_all[:n_masked]
+            z_noised_pooled = z_online[:n_masked]
+            z_pooled = z_online[n_masked:n_masked + n_mol]
+            tok_online_intact = tok_online_all[n_masked:n_masked + n_mol]
+            tok_online_rows = tok_online_intact.repeat_interleave(n_local, dim=0)
+            target_ema = self._gather_hole_tokens(tok_ema_rows, hole)
+            target_online = self._gather_hole_tokens(tok_online_rows, hole)
+
         if target_ema.numel() == 0:
             raise RuntimeError("ijepa batch has no hole tokens — check masking")
         gram_inputs = None
         if self.ijepa_loss_fn is not None and self.ijepa_loss_fn.gram_weight > 0.0:
-            gram_inputs = (tok_online_intact, tok_ema_intact, intact_mask[:, 1:].bool())
+            gram_inputs = (
+                tok_online_intact,
+                tok_ema_intact,
+                intact_mask[:, 1:].bool(),
+            )
         return (
             tok_masked, hole, valid, target_ema, target_online,
-            z_pooled, z_teacher_global, z_teacher_shuffle, gram_inputs,
+            z_pooled, z_teacher_global, z_teacher_shuffle, z_noised_pooled, gram_inputs,
         )
 
     @staticmethod
@@ -597,7 +833,10 @@ class DiscreteFlowSSLModule(L.LightningModule):
 
     def _update_ijepa_ema(self) -> None:
         assert self.encoder_ema is not None
-        self._update_ema(self.encoder, self.encoder_ema, self._effective_ijepa_ema_decay())
+        decay = self._effective_ijepa_ema_decay()
+        self._update_ema(self.encoder, self.encoder_ema, decay)
+        if self.dino_head_ema is not None:
+            self._update_ema(self.dino_head, self.dino_head_ema, decay)
 
     @staticmethod
     def _gram_kwargs(gram_inputs) -> dict:
@@ -607,6 +846,46 @@ class DiscreteFlowSSLModule(L.LightningModule):
             return {}
         online, ema, valid = gram_inputs
         return {"gram_online": online, "gram_target": ema, "gram_valid": valid}
+
+    def _dino_student_z(self, z_noised_pooled: torch.Tensor) -> torch.Tensor:
+        """Student embedding fed to ``dino_head``: pool directly or pool → predictor."""
+        mode = str(self.hparams.ijepa_dino_student).lower()
+        if mode == "pool":
+            return z_noised_pooled
+        if mode == "predict":
+            assert self.dino_pool_predictor is not None
+            return self.dino_pool_predictor(z_noised_pooled)
+        raise ValueError(
+            f"ijepa_dino_student must be 'pool' or 'predict', got {self.hparams.ijepa_dino_student!r}"
+        )
+
+    def _dino_term(
+        self,
+        z_student: torch.Tensor,
+        z_teacher_rows: torch.Tensor,
+        *,
+        update_center: bool,
+    ) -> tuple[torch.Tensor | None, dict[str, float] | None]:
+        """DINO CE: student prototypes vs centered, sharpened stop-grad teacher.
+
+        ``z_student`` is the noised whole-molecule pool (``pool``) or the pool
+        passed through ``dino_pool_predictor`` (``predict``). Teacher rows are
+        EMA clean globals, one per local view.
+        """
+        if self.dino_loss_fn is None:
+            return None, None
+        student_logits = self.dino_head(z_student)
+        with torch.no_grad():
+            teacher_logits = self.dino_head_ema(z_teacher_rows)
+            entropy, active = self.dino_loss_fn.utilization(teacher_logits)
+        loss = self.dino_loss_fn(student_logits, teacher_logits)
+        if update_center:
+            self.dino_loss_fn.update_center(teacher_logits)
+        util = {
+            "diagnostics/dino_teacher_entropy": entropy,
+            "diagnostics/dino_active_prototypes": active,
+        }
+        return loss, util
 
     def _hybrid_alpha(self) -> float:
         """Linear anneal: 1.0 (pure ntxent) at step 0 -> 0.0 (pure lejepa) by
@@ -633,9 +912,10 @@ class DiscreteFlowSSLModule(L.LightningModule):
         z_all: torch.Tensor | None = None,
         proj_global: torch.Tensor | None = None,
     ):
-        if self.ssl_loss == "ntxent":
+        if self._contrastive:
             assert z_a is not None and z_b is not None
-            loss = self.ntxent_loss_fn(z_a, z_b)
+            fn = self.ntxent_loss_fn if self.ssl_loss == "ntxent" else self.siglip_loss_fn
+            loss = fn(z_a, z_b)
             return loss, {
                 "inv": None, "sigreg": None,
                 "ntxent": None, "alpha": None,
@@ -648,6 +928,8 @@ class DiscreteFlowSSLModule(L.LightningModule):
             return terms.total, {
                 "inv": terms.inv.detach(),
                 "sigreg": terms.sigreg.detach(), "ntxent": None, "alpha": None,
+                "reg_scale": None if terms.reg_scale is None else terms.reg_scale.detach(),
+                "reg_shape": None if terms.reg_shape is None else terms.reg_shape.detach(),
             }
         assert proj_global is not None
         ntxent_loss = self.ntxent_loss_fn(proj_global[:, 0], proj_global[:, 1])
@@ -660,6 +942,8 @@ class DiscreteFlowSSLModule(L.LightningModule):
             "sigreg": terms.sigreg.detach(),
             "ntxent": ntxent_loss.detach(),
             "alpha": alpha,
+            "reg_scale": None if terms.reg_scale is None else terms.reg_scale.detach(),
+            "reg_shape": None if terms.reg_shape is None else terms.reg_shape.detach(),
         }
 
     def _log_grad_norms(self, **terms: torch.Tensor) -> None:
@@ -688,7 +972,10 @@ class DiscreteFlowSSLModule(L.LightningModule):
         logs = {
             f"{prefix}/encode_time": self.encoder.encode_time_value,
         }
-        if z_b is not None:
+        # When the 3D view is on, _apply_view3d logs the cross-modal acc@1 instead.
+        if self._view3d_enabled():
+            pass
+        elif z_b is not None:
             logs[f"{prefix}/acc@1"] = top1_paired_accuracy(z_a.detach(), z_b.detach())
         elif z_all is not None and z_a is not None:
             acc = lejepa_retrieval_acc1(z_a.detach(), z_all.detach())
@@ -697,6 +984,9 @@ class DiscreteFlowSSLModule(L.LightningModule):
         if extras["inv"] is not None:
             logs[f"{prefix}/inv"] = extras["inv"]
             logs[f"{prefix}/sigreg"] = extras["sigreg"]
+        if extras.get("reg_scale") is not None:
+            logs[f"{prefix}/reg_scale"] = extras["reg_scale"]
+            logs[f"{prefix}/reg_shape"] = extras["reg_shape"]
         if extras["ntxent"] is not None:
             logs[f"{prefix}/ntxent"] = extras["ntxent"]
             logs[f"{prefix}/hybrid_alpha"] = extras["alpha"]
@@ -747,56 +1037,136 @@ class DiscreteFlowSSLModule(L.LightningModule):
         with torch.no_grad():
             return self.encoder.encode_token_ids(ids_a, mask_a, normalize=False)
 
-    def _log_ijepa_collapse_diag(
+    def _log_pooled_rep_diag(
         self,
-        tok_masked: torch.Tensor,
-        hole: torch.Tensor,
-        valid: torch.Tensor,
-        target_ema: torch.Tensor,
-        target_online: torch.Tensor,
+        z_online: torch.Tensor,
+        z_teacher: torch.Tensor,
         *,
         spectrum: bool,
         batch_size: int,
+        log_rank: bool = False,
     ) -> None:
-        """EMA-target collapse checks + visible-context / pred alignment."""
-        assert self.ijepa_loss_fn is not None
-        visible = self._gather_visible_tokens(tok_masked, hole, valid).detach().float()
-        ema = target_ema.detach().float()
-        online = target_online.detach().float()
-        ema_norm = torch.nn.functional.normalize(ema, dim=-1)
-        online_norm = torch.nn.functional.normalize(online, dim=-1)
-        pred = self.ijepa_loss_fn._predict(tok_masked, hole, valid=valid).detach().float()
-        pred_norm = torch.nn.functional.normalize(pred, dim=-1)
+        """Collapse checks on pooled ``z_m`` (online intact slice + EMA teacher).
+
+        Does not log online-vs-teacher cosine: the training student path is the
+        noised local views, not the clean intact online pool in this batch.
+        """
+        online = z_online.detach().float()
+        teacher = z_teacher.detach().float()
         logs: dict[str, float] = {
-            "diagnostics/target_std": float(ema.std(dim=0).mean()),
-            "diagnostics/target_online_std": float(online.std(dim=0).mean()),
-            "diagnostics/context_std": float(visible.std(dim=0).mean()),
-            "diagnostics/n_hole_tokens": float(ema.shape[0]),
-            "diagnostics/cos_online_ema": float((online_norm * ema_norm).sum(-1).mean()),
-            "diagnostics/cos_pred_ema": float((pred_norm * ema_norm).sum(-1).mean()),
+            "diagnostics/pooled_std": float(online.std(dim=0).mean()),
+            "diagnostics/teacher_std": float(teacher.std(dim=0).mean()),
+            "diagnostics/n_molecules": float(online.shape[0]),
         }
         if spectrum:
             k = int(self.hparams.rank_subsample)
-            ema_s = self._subsample_rows(ema, k).cpu().numpy()
-            _, top = embedding_batch_collapse_diag(ema_s, top_k=5)
+            online_s = self._subsample_rows(online, k).cpu().numpy()
+            _, top = embedding_batch_collapse_diag(online_s, top_k=5)
             for i, v in enumerate(top, start=1):
-                logs[f"diagnostics/target_eig_{i}"] = v
+                logs[f"diagnostics/pooled_eig_{i}"] = v
+            if log_rank:
+                eff, num = embedding_covariance_rank(online_s)
+                logs["train/rank_effective"] = eff
+                logs["train/rank_numerical"] = num
         self.log_dict(logs, on_step=True, batch_size=batch_size)
 
     # -- lifecycle ---------------------------------------------------------- #
+    def _view3d_enabled(self) -> bool:
+        return self.encoder_3d is not None and self.view3d_weight > 0.0
+
+    def _net3d_to_device(self, net3d: dict) -> dict:
+        return {k: v.to(self.device) for k, v in net3d.items()}
+
+    def _view3d_loss(self, z_2d_online, net3d):
+        """Cross-modal 3D term: ``(L_3d, L_reg_3d, L_reg_1d, acc)`` or all-``None``.
+
+        ``L_3d`` is a *symmetric* LeJEPA-style alignment (no stop-grad) between
+        ``pred_3d(z_2d)`` and the online ``z_3d`` — ``l2`` MSE (LeJEPA default; scale
+        made safe by VISReg on each modality) or ``cosine``. Gradient flows into both
+        the 2D encoder (via ``z_2d``/predictor) and the 3D co-encoder (via ``z_3d``),
+        so both learn to match. ``L_reg_3d = VISReg(z_3d)`` is mixed with ``L_3d`` via
+        ``lejepa_lambda`` in :meth:`_apply_view3d`. ``L_reg_1d = VISReg(z_2d)`` is
+        added to the reg only when ``view3d_visreg_1d`` is set (else ``None``);
+        ``z_2d_online`` is the unnormalized pooled 1D z_m so VISReg's scale anchor
+        is meaningful. Under dual-pool contrastive it is sliced to the main
+        (regression) half so the projection half is left to the contrastive loss.
+
+        ``acc`` is the cross-modal top-1 retrieval accuracy between the 1D-predicted
+        embedding ``pred_3d(z_2d)`` and the online ``z_3d`` (symmetric) — the 3D
+        analogue of the 1D-1D ``acc@1``, and the more meaningful sanity metric once
+        the 3D view is on.
+        """
+        if not self._view3d_enabled() or net3d is None:
+            return None, None, None, None
+        # Dual-pool contrastive: predict/anchor off the main (regression) half only,
+        # leaving the projection half to the contrastive loss (see __init__).
+        if self._view3d_main_half:
+            z_2d_online = z_2d_online[..., : self._d_pool]
+        net3d = self._net3d_to_device(net3d)
+        z_3d = self.encoder_3d(net3d)                      # online, trainable target
+        pred = self.pred_3d(z_2d_online)
+        if self.view3d_loss == "l2":
+            l_3d = torch.nn.functional.mse_loss(pred, z_3d)
+        else:
+            l_3d = (
+                1.0 - torch.nn.functional.cosine_similarity(pred, z_3d, dim=-1)
+            ).mean()
+        l_reg_3d = self.visreg_3d(z_3d)
+        l_reg_1d = self.visreg_2d(z_2d_online) if self.visreg_2d is not None else None
+        acc = top1_paired_accuracy(pred.detach(), z_3d.detach(), symmetric=True)
+        return l_3d, l_reg_3d, l_reg_1d, acc
+
+    def _apply_view3d(self, loss, z_2d_online, net3d, *, prefix: str, bs: int):
+        """Add the 3D terms to ``loss`` and log them; return the updated loss."""
+        l_3d, l_reg_3d, l_reg_1d, acc = self._view3d_loss(z_2d_online, net3d)
+        if l_3d is None:
+            return loss
+        lam = float(self.hparams.lejepa_lambda)
+        l_reg = l_reg_3d if l_reg_1d is None else l_reg_3d + l_reg_1d
+        view3d = (1.0 - lam) * l_3d + lam * l_reg
+        loss = loss + self.view3d_weight * view3d
+        if prefix == "train":
+            logs = {
+                "train/1Dto3Dpred": l_3d.detach(),
+                "train/3d_visreg": l_reg_3d.detach(),
+                "train/view3d_mix": view3d.detach(),
+                # 3D cross-modal retrieval replaces the 1D-1D acc@1 (see _log_step).
+                "train/acc@1": acc,
+            }
+            if l_reg_1d is not None:
+                logs["train/1d_visreg"] = l_reg_1d.detach()
+            self.log_dict(logs, on_step=True, batch_size=bs)
+        else:
+            self._val["view3d"].append(float(l_3d))
+            self._val["view3d_reg"].append(float(l_reg_3d))
+            self._val["view3d_mix"].append(float(view3d))
+            self._val["acc"].append(acc)
+            if l_reg_1d is not None:
+                self._val["view3d_reg_1d"].append(float(l_reg_1d))
+        return loss
+
     def training_step(self, batch, batch_idx):
-        views, smiles = self._split_batch(batch)
+        views, smiles, net3d = self._split_batch(batch)
         bs = len(views)
         log_rank = self._rank_due()
         log_collapse = self._collapse_diag_due()
         z_rank = None
-        if self.ssl_loss == "ntxent":
+        if self._contrastive:
             z_a, z_b, z_a_pooled = self._encode_ntxent_views(views)
             loss, extras = self._compute_loss(z_a=z_a, z_b=z_b)
+            # The 1D within-modality contrastive loss on its own (logged as
+            # train/siglip or train/ntxent), before the fp/3D terms are folded in below.
+            self.log(f"train/{self.ssl_loss}", loss.detach(), on_step=True, prog_bar=True, batch_size=bs)
+            if self.siglip_loss_fn is not None and log_rank:
+                self.log_dict(
+                    self.siglip_loss_fn.diagnostics(z_a, z_b),
+                    on_step=True, batch_size=bs,
+                )
             fp_loss = self._fp_distillation(z_a_pooled, smiles)
             if fp_loss is not None:
                 self.log("train/fp", fp_loss.detach(), on_step=True, batch_size=bs)
                 loss = loss + self._effective_fp_weight() * fp_loss
+            loss = self._apply_view3d(loss, z_a_pooled, net3d, prefix="train", bs=bs)
             self._log_step(
                 "train", loss=loss, z_a=z_a, z_b=z_b, extras=extras,
                 batch_size=bs, prog_bar=True,
@@ -806,7 +1176,7 @@ class DiscreteFlowSSLModule(L.LightningModule):
         elif self.ssl_loss == "ijepa":
             (
                 tok_masked, hole, valid, target_ema, target_online, z_pooled,
-                z_teacher_global, z_teacher_shuffle, gram_inputs,
+                z_teacher_global, z_teacher_shuffle, z_noised_pooled, gram_inputs,
             ) = self._encode_ijepa(views)
             n_local = int(self.hparams.lejepa_n_local_views)
             z_teacher_rows = z_teacher_global.repeat_interleave(n_local, dim=0)
@@ -815,13 +1185,28 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 tok_masked, hole, target_ema, z_pooled, valid=valid,
                 z_teacher_rows=z_teacher_rows,
                 z_inv_target=z_teacher_shuffle,
+                z_noised_pooled=z_noised_pooled,
                 **gram_kw,
             )
             loss = terms.total
+            # The 1D I-JEPA loss on its own (train/ijepa), before fp/dino/3D fold in.
+            self.log(f"train/{self.ssl_loss}", loss.detach(), on_step=True, batch_size=bs)
             fp_loss = self._fp_distillation(z_pooled, smiles)
             if fp_loss is not None:
                 self.log("train/fp", fp_loss.detach(), on_step=True, batch_size=bs)
                 loss = loss + self._effective_fp_weight() * fp_loss
+            if self.dino_loss_fn is not None:
+                z_dino_student = self._dino_student_z(z_noised_pooled)
+                dino_loss, dino_util = self._dino_term(
+                    z_dino_student, z_teacher_rows, update_center=True,
+                )
+            else:
+                dino_loss, dino_util = None, None
+            if dino_loss is not None:
+                loss = loss + float(self.hparams.ijepa_dino_weight) * dino_loss
+            if dino_util is not None and log_collapse:
+                self.log_dict(dino_util, on_step=True, batch_size=bs)
+            loss = self._apply_view3d(loss, z_pooled, net3d, prefix="train", bs=bs)
             if self.hparams.log_grad_norms and torch.is_grad_enabled():
                 self._log_grad_norms(
                     predict=terms.predict, glob=terms.glob,
@@ -835,16 +1220,24 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 "train/sigreg": terms.sigreg.detach(),
                 "train/encode_time": self.encoder.encode_time_value,
             }
+            if self.ijepa_loss_fn.noise_inv_weight > 0.0:
+                ijepa_logs["train/noise_inv"] = terms.noise_inv.detach()
             if self.ijepa_loss_fn.gram_weight > 0.0:
                 ijepa_logs["train/gram"] = terms.gram.detach()
+            if terms.reg_scale is not None:
+                ijepa_logs["train/reg_scale"] = terms.reg_scale.detach()
+                ijepa_logs["train/reg_shape"] = terms.reg_shape.detach()
+            if dino_loss is not None:
+                ijepa_logs["train/dino"] = dino_loss.detach()
             self.log_dict(ijepa_logs, on_step=True, batch_size=bs)
             if log_collapse:
-                self._log_ijepa_collapse_diag(
-                    tok_masked, hole, valid, target_ema, target_online,
-                    spectrum=True, batch_size=bs,
+                self._log_pooled_rep_diag(
+                    z_pooled, z_teacher_global,
+                    spectrum=True, batch_size=bs, log_rank=log_rank,
                 )
-            if log_rank:
-                z_rank = z_teacher_global
+            elif log_rank:
+                # When online intact is skipped, z_pooled is the EMA teacher global.
+                z_rank = z_pooled
         else:
             with_proj = self.ssl_loss == "hybrid"
             out = self._encode_lejepa_views(views, with_projection=with_proj)
@@ -853,10 +1246,14 @@ class DiscreteFlowSSLModule(L.LightningModule):
             loss, extras = self._compute_loss(
                 z_global=z_global, z_all=z_all, proj_global=proj_global,
             )
+            # The 1D LeJEPA/hybrid loss on its own (train/lejepa or train/hybrid),
+            # before the fp/3D terms are folded in below.
+            self.log(f"train/{self.ssl_loss}", loss.detach(), on_step=True, prog_bar=True, batch_size=bs)
             fp_loss = self._fp_distillation(z_global[:, 0], smiles)
             if fp_loss is not None:
                 self.log("train/fp", fp_loss.detach(), on_step=True, batch_size=bs)
                 loss = loss + self._effective_fp_weight() * fp_loss
+            loss = self._apply_view3d(loss, z_global[:, 0], net3d, prefix="train", bs=bs)
             self._log_step(
                 "train", loss=loss, z_a=z_global, z_b=None, extras=extras,
                 batch_size=bs, prog_bar=True, view_diversity=diversity, z_all=z_all,
@@ -868,23 +1265,33 @@ class DiscreteFlowSSLModule(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        views, smiles = self._split_batch(batch)
+        views, smiles, net3d = self._split_batch(batch)
         z_rank = None
         rank_on = int(self.hparams.train_rank_every_n_steps) > 0
-        if self.ssl_loss == "ntxent":
+        if self._contrastive:
             z_a, z_b, z_a_pooled = self._encode_ntxent_views(views)
             loss, extras = self._compute_loss(z_a=z_a, z_b=z_b)
-            self._val["acc"].append(top1_paired_accuracy(z_a, z_b))
+            self._val["loss_1d"].append(float(loss))
+            if self.siglip_loss_fn is not None:
+                # Same siglip/diagnostics_* keys as train; Lightning means over the val epoch.
+                self.log_dict(
+                    self.siglip_loss_fn.diagnostics(z_a, z_b),
+                    on_step=False, on_epoch=True, batch_size=len(views),
+                )
+            # With 3D on, _apply_view3d appends the cross-modal acc@1 instead.
+            if not self._view3d_enabled():
+                self._val["acc"].append(top1_paired_accuracy(z_a, z_b))
             fp_loss = self._fp_distillation(z_a_pooled, smiles)
             if fp_loss is not None:
                 self._val["fp"].append(float(fp_loss))
                 loss = loss + self._effective_fp_weight() * fp_loss
+            loss = self._apply_view3d(loss, z_a_pooled, net3d, prefix="val", bs=len(views))
             if rank_on:
                 z_rank = self._ntxent_global_z(views)
         elif self.ssl_loss == "ijepa":
             (
                 tok_masked, hole, valid, target_ema, target_online, z_pooled,
-                z_teacher_global, z_teacher_shuffle, gram_inputs,
+                z_teacher_global, z_teacher_shuffle, z_noised_pooled, gram_inputs,
             ) = self._encode_ijepa(views)
             n_local = int(self.hparams.lejepa_n_local_views)
             z_teacher_rows = z_teacher_global.repeat_interleave(n_local, dim=0)
@@ -893,30 +1300,55 @@ class DiscreteFlowSSLModule(L.LightningModule):
                 tok_masked, hole, target_ema, z_pooled, valid=valid,
                 z_teacher_rows=z_teacher_rows,
                 z_inv_target=z_teacher_shuffle,
+                z_noised_pooled=z_noised_pooled,
                 **gram_kw,
             )
             loss = terms.total
+            self._val["loss_1d"].append(float(loss))
             fp_loss = self._fp_distillation(z_pooled, smiles)
             if fp_loss is not None:
                 self._val["fp"].append(float(fp_loss))
                 loss = loss + self._effective_fp_weight() * fp_loss
+            if self.dino_loss_fn is not None:
+                z_dino_student = self._dino_student_z(z_noised_pooled)
+                dino_loss, dino_util = self._dino_term(
+                    z_dino_student, z_teacher_rows, update_center=False,
+                )
+            else:
+                dino_loss, dino_util = None, None
+            if dino_loss is not None:
+                loss = loss + float(self.hparams.ijepa_dino_weight) * dino_loss
+                self._val["dino"].append(float(dino_loss))
+                if dino_util is not None:
+                    self._val["dino_teacher_entropy"].append(
+                        dino_util["diagnostics/dino_teacher_entropy"]
+                    )
+                    self._val["dino_active_prototypes"].append(
+                        dino_util["diagnostics/dino_active_prototypes"]
+                    )
+            loss = self._apply_view3d(loss, z_pooled, net3d, prefix="val", bs=len(views))
             extras = {"inv": None, "ntxent": None}
             self._val["predict"].append(float(terms.predict))
             self._val["glob"].append(float(terms.glob))
             self._val["inv"].append(float(terms.inv))
             self._val["sigreg"].append(float(terms.sigreg))
+            if self.ijepa_loss_fn.noise_inv_weight > 0.0:
+                self._val["noise_inv"].append(float(terms.noise_inv))
             if self.ijepa_loss_fn.gram_weight > 0.0:
                 self._val["gram"].append(float(terms.gram))
-            gap = self.ijepa_loss_fn.condition_bypass_gap(
-                tok_masked, hole, target_ema, valid=valid,
-            )
-            self._val["cond_true"].append(gap["predict_true"])
-            self._val["cond_shuf"].append(gap["predict_shuf"])
-            self._val["cond_zero"].append(gap["predict_zero"])
-            self._val["cond_gap_zero"].append(gap["gap_zero"])
-            self._val["cond_gap_shuf"].append(gap["gap_shuf"])
+            # condition_bypass_gap probes the token-level predictor; only meaningful
+            # when predict is active (locals share the intact frame).
+            if self.ijepa_loss_fn.predict_weight > 0.0:
+                gap = self.ijepa_loss_fn.condition_bypass_gap(
+                    tok_masked, hole, target_ema, valid=valid,
+                )
+                self._val["cond_true"].append(gap["predict_true"])
+                self._val["cond_shuf"].append(gap["predict_shuf"])
+                self._val["cond_zero"].append(gap["predict_zero"])
+                self._val["cond_gap_zero"].append(gap["gap_zero"])
+                self._val["cond_gap_shuf"].append(gap["gap_shuf"])
             if rank_on:
-                z_rank = z_teacher_global
+                z_rank = z_pooled
         else:
             with_proj = self.ssl_loss == "hybrid"
             out = self._encode_lejepa_views(views, with_projection=with_proj)
@@ -925,14 +1357,18 @@ class DiscreteFlowSSLModule(L.LightningModule):
             loss, extras = self._compute_loss(
                 z_global=z_global, z_all=z_all, proj_global=proj_global,
             )
-            acc = lejepa_retrieval_acc1(z_global, z_all)
-            if acc is not None:
-                self._val["acc"].append(acc)
+            self._val["loss_1d"].append(float(loss))
+            # With 3D on, _apply_view3d appends the cross-modal acc@1 instead.
+            if not self._view3d_enabled():
+                acc = lejepa_retrieval_acc1(z_global, z_all)
+                if acc is not None:
+                    self._val["acc"].append(acc)
             self._val["view_diversity"].append(diversity)
             fp_loss = self._fp_distillation(z_global[:, 0], smiles)
             if fp_loss is not None:
                 self._val["fp"].append(float(fp_loss))
                 loss = loss + self._effective_fp_weight() * fp_loss
+            loss = self._apply_view3d(loss, z_global[:, 0], net3d, prefix="val", bs=len(views))
             if rank_on:
                 z_rank = self._online_global_z(z_global)
         if rank_on and z_rank is not None:
@@ -959,30 +1395,56 @@ class DiscreteFlowSSLModule(L.LightningModule):
         cfg = getattr(self.encoder, "build_config", None)
         if cfg is not None:
             checkpoint["encoder_config"] = dict(cfg)
+        cfg_3d = getattr(self.encoder_3d, "build_config", None)
+        if cfg_3d is not None:
+            checkpoint["encoder_3d_config"] = dict(cfg_3d)
         # Record the fragment-view variant the adapter was trained on so every
         # downstream stage (decoy/binder precompute, EBM, eval) reads the matching
         # _merge stores without having to be told — mismatch becomes impossible.
         checkpoint["fragment_merge"] = bool(getattr(self, "_fragment_merge", False))
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
-        """Backfill ``encoder_ema`` when loading a pre-EMA checkpoint."""
-        if self.encoder_ema is None:
-            return
+        """Backfill EMA twins when loading a checkpoint that predates them."""
         state = checkpoint.get("state_dict", {})
-        if any(k.startswith("encoder_ema.") for k in state):
-            return
-        self.encoder_ema.load_state_dict(self.encoder.state_dict())
+        if self.encoder_ema is not None and not any(
+            k.startswith("encoder_ema.") for k in state
+        ):
+            self.encoder_ema.load_state_dict(self.encoder.state_dict())
+        if self.dino_head_ema is not None and not any(
+            k.startswith("dino_head_ema.") for k in state
+        ):
+            self.dino_head_ema.load_state_dict(self.dino_head.state_dict())
 
     def on_fit_start(self) -> None:
         trainer = getattr(self, "trainer", None)
         dm = getattr(trainer, "datamodule", None) if trainer is not None else None
         if dm is None:
             return
+        # Fail fast on the silent no-op: 3D view enabled on the model but the data
+        # module isn't producing conformers -> encoder_3d/pred_3d would train on
+        # nothing and train/view3d* would never log.
+        if self._view3d_enabled() and getattr(dm, "conformer_cache", None) is None:
+            raise ValueError(
+                "view3d_weight>0 but data.conformer_cache is None: the 3D encoder "
+                "would never receive a batch. Set data.conformer_cache to a "
+                "precomputed conformers.parquet (lattice_lab.preprocessing."
+                "precompute_conformers), or disable the 3D view (view3d_weight=0)."
+            )
         self._fragment_merge = str(getattr(dm, "shard_dir", "")).rstrip("/").endswith("_merge")
         self._val_probes.val_ratio = float(dm.val_ratio)
         self._val_probes.test_ratio = float(dm.test_ratio)
         self._val_probes.split_seed = int(dm.split_seed)
         self._val_probes.prepare(dm.shard_dir)
+        if self.ssl_loss == "ijepa" and self.ijepa_loss_fn is not None:
+            skip = self._ijepa_skip_online_intact()
+            logger.info(
+                "ijepa online intact encode=%s (lejepa_lambda=%s fp_eff=%.4g inv=%s gram=%s)",
+                "skip" if skip else "on",
+                self.hparams.lejepa_lambda,
+                self._effective_fp_weight(),
+                self.ijepa_loss_fn.inv_weight,
+                self.ijepa_loss_fn.gram_weight,
+            )
 
     def on_validation_epoch_end(self) -> None:
         out = {
@@ -990,6 +1452,8 @@ class DiscreteFlowSSLModule(L.LightningModule):
             "val/acc@1": float(np.mean(self._val["acc"])) if self._val["acc"] else 0.0,
             "val/encode_time": self.encoder.encode_time_value,
         }
+        if self._val["loss_1d"]:
+            out[f"val/{self.ssl_loss}"] = float(np.mean(self._val["loss_1d"]))
         if self._val["inv"]:
             out["val/inv"] = float(np.mean(self._val["inv"]))
             out["val/sigreg"] = float(np.mean(self._val["sigreg"]))
@@ -998,8 +1462,19 @@ class DiscreteFlowSSLModule(L.LightningModule):
             out["val/glob"] = float(np.mean(self._val["glob"]))
             out["val/inv"] = float(np.mean(self._val["inv"]))
             out["val/sigreg"] = float(np.mean(self._val["sigreg"]))
+        if self._val["noise_inv"]:
+            out["val/noise_inv"] = float(np.mean(self._val["noise_inv"]))
         if self._val["gram"]:
             out["val/gram"] = float(np.mean(self._val["gram"]))
+        if self._val["dino"]:
+            out["val/dino"] = float(np.mean(self._val["dino"]))
+        if self._val["dino_teacher_entropy"]:
+            out["diagnostics/dino_teacher_entropy"] = float(
+                np.mean(self._val["dino_teacher_entropy"])
+            )
+            out["diagnostics/dino_active_prototypes"] = float(
+                np.mean(self._val["dino_active_prototypes"])
+            )
         if self._val["cond_true"]:
             out["val/cond_true"] = float(np.mean(self._val["cond_true"]))
             out["val/cond_shuf"] = float(np.mean(self._val["cond_shuf"]))
@@ -1016,6 +1491,12 @@ class DiscreteFlowSSLModule(L.LightningModule):
         if self._val["rank_effective"]:
             out["val/rank_effective"] = float(np.mean(self._val["rank_effective"]))
             out["val/rank_numerical"] = float(np.mean(self._val["rank_numerical"]))
+        if self._val["view3d"]:
+            out["val/1Dto3Dpred"] = float(np.mean(self._val["view3d"]))
+            out["val/3d_visreg"] = float(np.mean(self._val["view3d_reg"]))
+            out["val/view3d_mix"] = float(np.mean(self._val["view3d_mix"]))
+        if self._val["view3d_reg_1d"]:
+            out["val/1d_visreg"] = float(np.mean(self._val["view3d_reg_1d"]))
         out.update(self._val_probes.maybe_run(self))
         self.log_dict(out, prog_bar=True, sync_dist=True)
         if self._val["cond_gap_zero"]:
@@ -1052,23 +1533,45 @@ class DiscreteFlowSSLModule(L.LightningModule):
 
     def configure_optimizers(self):
         hp = self.hparams
-        # Trainable encoder params = adapter, the DDiT backbone (when
-        # encoder.freeze_backbone is false), and the encode-time parameter (when
-        # learnable). Whatever has requires_grad goes in. time_logit is a scalar
-        # gate — no weight decay.
         decay: list[torch.nn.Parameter] = []
         no_decay: list[torch.nn.Parameter] = []
         for name, p in self.encoder.named_parameters():
             if not p.requires_grad:
                 continue
-            if name == "time_logit":
-                no_decay.append(p)
-            else:
-                decay.append(p)
+            (no_decay if _adamw_no_decay(name, p) else decay).append(p)
         # ijepa's flow head lives on the loss module (not the encoder); it must
         # train too. (lejepa/ntxent loss modules have no trainable params.)
         if self.ijepa_loss_fn is not None:
-            decay.extend(p for p in self.ijepa_loss_fn.parameters() if p.requires_grad)
+            for name, p in self.ijepa_loss_fn.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (no_decay if _adamw_no_decay(name, p) else decay).append(p)
+        # SigLIP's learnable temperature + bias live on the loss module (scalars →
+        # no weight decay via _adamw_no_decay's p.ndim < 2 rule).
+        if self.siglip_loss_fn is not None:
+            for name, p in self.siglip_loss_fn.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (no_decay if _adamw_no_decay(name, p) else decay).append(p)
+        # DINO head (online only; EMA twin is not optimized) also lives off the encoder.
+        if self.dino_head is not None:
+            for name, p in self.dino_head.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (no_decay if _adamw_no_decay(name, p) else decay).append(p)
+        if self.dino_pool_predictor is not None:
+            for name, p in self.dino_pool_predictor.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (no_decay if _adamw_no_decay(name, p) else decay).append(p)
+        # 3D co-encoder + cross-modal predictor (EMA twin excluded via requires_grad).
+        for mod in (self.encoder_3d, self.pred_3d):
+            if mod is None:
+                continue
+            for name, p in mod.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (no_decay if _adamw_no_decay(name, p) else decay).append(p)
         groups: list[dict] = []
         if decay:
             groups.append({"params": decay, "weight_decay": hp.weight_decay})

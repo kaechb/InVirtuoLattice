@@ -76,11 +76,10 @@ def test_checkpoint_state_dict_strips_student_prefix() -> None:
 def test_denoising_jepa_init_kwargs_fills_required_defaults() -> None:
     kwargs = _denoising_jepa_init_kwargs(
         {
-            "hyper_parameters": {"kl_beta": 0.5, "fp_weight": 10.0},
+            "hyper_parameters": {"fp_weight": 10.0},
             "encoder_config": {"tokenizer_path": "artifacts/tokenizer/smiles_new.json"},
         }
     )
     assert kwargs["ckpt_path"] is None
     assert kwargs["tokenizer_path"] == "artifacts/tokenizer/smiles_new.json"
-    assert kwargs["kl_beta"] == 0.5
     assert kwargs["fp_weight"] == 10.0

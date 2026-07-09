@@ -20,6 +20,14 @@ class Adapter(nn.Module):
 
     The projection head (``proj_head``) is exposed separately so callers can
     forward through it during SSL but ignore it after training is frozen.
+
+    With ``dual_attn_pool`` (requires ``pool='attn'``) there are two independent
+    attention pools, each of half width (``d_adapter // 2``). The kept representation
+    ``z_m`` is their concatenation (back to ``d_adapter``), so t-SNE / linear probes
+    see both. The contrastive projection head reads *only* the second (projection)
+    half, so its invariance gradient never touches the first (regression) half —
+    decoupling the contrastive invariance pressure from the latent-regression
+    detail pressure while the shared backbone/token features serve both.
     """
 
     def __init__(
@@ -34,11 +42,41 @@ class Adapter(nn.Module):
         dropout: float = 0.1,
         proj_dim: int = 128,
         proj_hidden: int = 512,
+        pool: str = "mean",
+        dual_attn_pool: bool = False,
     ) -> None:
         super().__init__()
+        if pool not in ("mean", "attn"):
+            raise ValueError(f"pool must be 'mean' or 'attn', got {pool!r}")
+        if dual_attn_pool and pool != "attn":
+            raise ValueError(
+                f"dual_attn_pool requires pool='attn' (mean pooling is "
+                f"parameter-free, so a second mean pool is identical), got pool={pool!r}"
+            )
         self.d_backbone = d_backbone
         self.n_backbone_layers = n_backbone_layers
         self.d_adapter = d_adapter
+        self.pool = pool
+        # When set, two independent half-width attention pools; ``z_m`` is their
+        # concatenation (still ``d_adapter``), and the contrastive projection head
+        # reads only the second (projection) half so its invariance gradient never
+        # touches the first (regression) half. Decouples the contrastive invariance
+        # pressure from the latent-regression detail pressure while both share the
+        # backbone/token features.
+        self.dual_attn_pool = bool(dual_attn_pool)
+        # Per-pool width: halved when dual so the concatenation stays ``d_adapter``.
+        self.d_pool = d_adapter // 2 if self.dual_attn_pool else d_adapter
+        if self.dual_attn_pool:
+            if d_adapter % 2 != 0:
+                raise ValueError(
+                    f"dual_attn_pool concatenates two half-width pools, so d_adapter "
+                    f"must be even, got {d_adapter}"
+                )
+            if self.d_pool % n_heads != 0:
+                raise ValueError(
+                    f"dual_attn_pool: per-pool width d_adapter//2 ({self.d_pool}) must "
+                    f"be divisible by n_heads ({n_heads})"
+                )
         in_dim = d_backbone * n_backbone_layers
 
         self.input_proj = nn.Linear(in_dim, d_adapter)
@@ -60,8 +98,32 @@ class Adapter(nn.Module):
             self.encoder = None
         self.norm = nn.LayerNorm(d_adapter)
 
+        # Attention pooling: a single learnable query attends over the valid
+        # tokens to produce z_m, replacing the parameter-free masked mean. Left
+        # unbuilt in "mean" mode so existing checkpoints keep their exact keys.
+        if pool == "attn":
+            # Queries live in the (possibly halved) pool width; keys/values are the
+            # full-width token features, so kdim/vdim are set explicitly when dual.
+            kv = (
+                dict(kdim=d_adapter, vdim=d_adapter) if self.dual_attn_pool else {}
+            )
+            self.pool_query = nn.Parameter(torch.zeros(1, 1, self.d_pool))
+            nn.init.trunc_normal_(self.pool_query, std=0.02)
+            self.pool_attn = nn.MultiheadAttention(
+                self.d_pool, num_heads=n_heads, dropout=dropout, batch_first=True, **kv
+            )
+            # Second, independent half-width pool feeding the projection head. Left
+            # unbuilt unless requested so existing checkpoints keep their keys.
+            if self.dual_attn_pool:
+                self.proj_pool_query = nn.Parameter(torch.zeros(1, 1, self.d_pool))
+                nn.init.trunc_normal_(self.proj_pool_query, std=0.02)
+                self.proj_pool_attn = nn.MultiheadAttention(
+                    self.d_pool, num_heads=n_heads, dropout=dropout, batch_first=True,
+                    kdim=d_adapter, vdim=d_adapter,
+                )
+
         self.proj_head = nn.Sequential(
-            nn.Linear(d_adapter, proj_hidden),
+            nn.Linear(self.d_pool, proj_hidden),
             nn.GELU(),
             nn.Linear(proj_hidden, proj_dim),
         )
@@ -88,6 +150,29 @@ class Adapter(nn.Module):
         s = (x * m).sum(dim=1)
         denom = m.sum(dim=1).clamp_min(1e-6)
         return s / denom
+
+    def _attn_pool(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        query: torch.Tensor,
+        attn: nn.MultiheadAttention,
+    ) -> torch.Tensor:
+        b = x.size(0)
+        q = query.expand(b, -1, -1)            # [B, 1, D]
+        key_padding_mask = mask <= 0           # True = ignore (pad/BOS/EOS)
+        pooled, _ = attn(q, x, x, key_padding_mask=key_padding_mask, need_weights=False)
+        return pooled.squeeze(1)               # [B, D]
+
+    def masked_attn_pool(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Learned-query attention pool over valid tokens.
+
+        ``x``: ``[B, T, D]``. ``mask``: ``[B, T]`` in {0, 1} (1 = attend). A single
+        learnable query attends over the valid (mask==1) tokens; returns ``[B, D]``.
+        Like :meth:`masked_mean` this assumes each row has >= 1 valid token (real
+        molecules always do — BOS/EOS are masked out but body tokens remain).
+        """
+        return self._attn_pool(x, mask, self.pool_query, self.pool_attn)
 
     def forward(
         self,
@@ -131,7 +216,18 @@ class Adapter(nn.Module):
         # "Mean pooling over token positions (excluding special tokens)". We assume
         # callers pass a mask where BOS and EOS positions are already zeroed; the
         # ``stack_views`` helper does that. If they aren't, masked_mean still works.
-        pooled = self.masked_mean(x, attention_mask)
+        proj_pooled = None
+        if self.pool == "attn":
+            pooled = self.masked_attn_pool(x, attention_mask)  # [B, d_pool]
+            if self.dual_attn_pool:
+                proj_pooled = self._attn_pool(
+                    x, attention_mask, self.proj_pool_query, self.proj_pool_attn
+                )
+                # z_m concatenates the two half-width pools back to d_adapter, so
+                # t-SNE / linear probes see both the regression and projection halves.
+                pooled = torch.cat([pooled, proj_pooled], dim=-1)
+        else:
+            pooled = self.masked_mean(x, attention_mask)
         z_m = (
             torch.nn.functional.normalize(pooled, dim=-1)
             if normalize
@@ -141,7 +237,10 @@ class Adapter(nn.Module):
             return z_m, x
         if not return_projection:
             return z_m
-        z_p = self.proj_head(pooled)
+        # Contrastive head reads only the projection half when dual pooling is on,
+        # so its invariance gradient never touches z_m's regression half (see __init__).
+        proj_in = proj_pooled if self.dual_attn_pool else pooled
+        z_p = self.proj_head(proj_in)
         if normalize:
             z_p = torch.nn.functional.normalize(z_p, dim=-1)
         return z_m, z_p

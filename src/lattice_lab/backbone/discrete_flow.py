@@ -104,7 +104,7 @@ def load_ddit(
     unreliable). Fresh-build arch kwargs are ignored when ``ckpt_path`` is set,
     **except** ``n_conds`` when ``force_n_conds`` is set: the requested
     conditioning width is then used regardless of the checkpoint (the missing
-    ``conds.*`` weights stay freshly initialized via ``strict=False``). This
+    ``conds.*`` FiLM weights stay freshly initialized via ``strict=False``). This
     lets a conditional denoiser warm-start from an unconditional pretrained DDiT.
     """
 
@@ -202,6 +202,27 @@ def resolve_mask_token_id(
         except ValueError:
             continue
     return _special_id(tokenizer, "[UNK]")
+
+
+def ijepa_noise_token_pool(
+    *,
+    vocab_size: int,
+    token_id_min: int,
+    pad_id: int,
+    bos_id: int,
+    eos_id: int,
+    unk_id: int,
+) -> tuple[int, ...]:
+    """Uniform I-JEPA corruption pool: ``[token_id_min, vocab)`` minus specials."""
+    exclude = {int(pad_id), int(bos_id), int(eos_id), int(unk_id)}
+    pool = tuple(
+        i for i in range(int(token_id_min), int(vocab_size)) if i not in exclude
+    )
+    if not pool:
+        raise ValueError(
+            f"empty I-JEPA noise pool (vocab={vocab_size}, min={token_id_min})"
+        )
+    return pool
 
 
 def load_discrete_flow(
@@ -599,6 +620,9 @@ def build_discrete_flow_encoder(
     encode_time: float,
     learnable_time: bool,
     freeze_backbone: bool,
+    adapter_pool: str = "mean",
+    adapter_dual_pool: bool = False,
+    adapter_proj_dim: int = 128,
     token_id_min: int = 4,
     n_layer: int = 12,
     n_head: int = 12,
@@ -630,6 +654,9 @@ def build_discrete_flow_encoder(
         n_backbone_layers=n_backbone_layers,
         d_adapter=d_adapter,
         n_layers=adapter_n_layers,
+        pool=adapter_pool,
+        dual_attn_pool=adapter_dual_pool,
+        proj_dim=adapter_proj_dim,
     )
     enc = DiscreteFlowEncoder(
         bundle,
@@ -650,6 +677,9 @@ def build_discrete_flow_encoder(
         "backbone_layer_end": int(backbone_layer_end),
         "d_adapter": int(d_adapter),
         "adapter_n_layers": int(adapter_n_layers),
+        "adapter_pool": str(adapter_pool),
+        "adapter_dual_pool": bool(adapter_dual_pool),
+        "adapter_proj_dim": int(adapter_proj_dim),
         "token_id_min": int(token_id_min),
         "n_layer": int(bundle.n_layer),
         "n_head": int(n_head),

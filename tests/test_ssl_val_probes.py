@@ -10,7 +10,7 @@ import pytest
 
 from lattice_lab.data.fragment_views import load_fragment_split_df
 from lattice_lab.preprocessing.molecules import molecule_qed_molwt
-from lattice_lab.training.ssl_val_probes import _pca_tsne_2d, _ridge_r2, _tsne_2d
+from lattice_lab.training.ssl_val_probes import _ridge_r2, _tsne_2d
 from lattice_lab.training.ssl_val_probes import embedding_batch_collapse_diag
 
 
@@ -81,9 +81,9 @@ def test_embedding_batch_collapse_diag_spiky_when_collapsed() -> None:
     assert eig_col[0] / max(eig_col[4], 1e-12) > eig_full[0] / max(eig_full[4], 1e-12)
 
 
-def test_pca_tsne_2d_shape() -> None:
+def test_tsne_2d_shape() -> None:
     x = np.random.default_rng(2).normal(size=(40, 128))
-    emb = _pca_tsne_2d(x, seed=0, perplexity=10.0, pca_components=50)
+    emb = _tsne_2d(x, seed=0, perplexity=10.0)
     assert emb.shape == (40, 2)
 
 

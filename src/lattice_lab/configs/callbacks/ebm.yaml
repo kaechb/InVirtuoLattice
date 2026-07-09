@@ -2,7 +2,7 @@ model_checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: ebm-{epoch:03d}-{step:06d}
-  monitor: val/ef1
+  monitor: val/bedroc
   mode: max
   save_last: true
   save_top_k: 1

@@ -11,13 +11,12 @@ import torch
 from lattice_lab.training.denoising_jepa import (
     AttentionPool,
     DenoisingJEPAModel,
-    VAEHead,
     build_jepa,
     condition_bypass_gap,
     corrupt_tokens,
+    denoise_logits,
     denoising_loss,
     effective_rank,
-    encode_pooled_latent,
     reconstruction_loss,
     train_step,
 )
@@ -47,12 +46,6 @@ def _tiny_jepa() -> DenoisingJEPAModel:
         pad_id=PAD_ID,
         token_id_min=TOKEN_ID_MIN,
     )
-
-
-def _tiny_jepa_with_vae() -> DenoisingJEPAModel:
-    model = _tiny_jepa()
-    model.vae_head = VAEHead(D, free_bits=0.0)
-    return model
 
 
 def _tiny_batch(*, seed: int = 0, with_pad: bool = True):
@@ -169,10 +162,8 @@ def test_gradient_reaches_encoder_pool_and_denoiser() -> None:
     loss.backward()
     assert _has_grad(model.denoiser)
 
-    # DDiT's adaLN conditioning is zero-initialized, so the gradient w.r.t. the
-    # conditioning vector (hence z_s and the encoder pool) is exactly 0 on a
-    # fresh model — it only flows once adaLN moves off zero. A few steps warm it
-    # up; then z_s is trained through reconstruction.
+    # FiLM γ/β are zero-init, so the denoiser ignores z_s at first; a few steps
+    # warm the FiLM path, then z_s is trained through reconstruction.
     opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
     for _ in range(10):
         train_step(model, opt, _tiny_batch(), corrupt_t=0.1)
@@ -192,31 +183,6 @@ def test_alignment_zero_for_identical_views() -> None:
     assert m["align_cos"] == pytest.approx(1.0, abs=1e-5)
 
 
-def test_alignment_vae_both_views_post_vae() -> None:
-    """With VAE, z_b must go through the same head as z_s (μ at eval)."""
-    model = _tiny_jepa_with_vae()
-    model.eval()
-    b = _tiny_batch()
-    _, m = denoising_loss(model, b, batch_b=b, align_lambda=0.5, corrupt_t=0.1)
-    assert m["align"] == pytest.approx(0.0, abs=1e-5)
-
-
-def test_encode_pooled_latent_applies_vae_mu_at_eval() -> None:
-    model = _tiny_jepa_with_vae()
-    model.eval()
-    ids, mask = _tiny_batch()
-    z_raw = model.encoder(ids, mask)
-    z = encode_pooled_latent(model, ids, mask, training=False)
-    assert not torch.allclose(z_raw, z)
-    assert torch.allclose(z, model.vae_head.mu(z_raw))
-
-
-def test_denoising_loss_reports_logvar_when_vae() -> None:
-    model = _tiny_jepa_with_vae()
-    _, m = denoising_loss(model, _tiny_batch(), corrupt_t=0.2)
-    assert "logvar_mean" in m and "logvar_std" in m and "logvar_exp_mean" in m
-
-
 def test_latent_consistency_when_enabled() -> None:
     model = _tiny_jepa()
     _, metrics, _, terms = denoising_loss(
@@ -231,12 +197,63 @@ def test_latent_consistency_when_enabled() -> None:
     assert "latent" in terms
 
 
+def test_film_ignores_latent_at_init() -> None:
+    """Zero-init FiLM → denoiser logits do not depend on z_s yet."""
+    model = _tiny_jepa().eval()
+    ids, mask = _tiny_batch()
+    x_corrupt, t, _ = corrupt_tokens(
+        ids, mask, vocab_size=VOCAB, token_id_min=TOKEN_ID_MIN, pad_id=PAD_ID, t=0.2
+    )
+    z_zero = torch.zeros(B, D)
+    z_real = model.encoder(ids, mask)
+    with torch.no_grad():
+        logits_a = denoise_logits(model, x_corrupt, mask, t, conds=z_zero)
+        logits_b = denoise_logits(model, x_corrupt, mask, t, conds=z_real)
+    assert torch.allclose(logits_a, logits_b)
+
+
 def test_train_step_returns_finite_metrics() -> None:
     model = _tiny_jepa()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     metrics = train_step(model, opt, _tiny_batch(), corrupt_t=(0.1, 0.6))
     assert set(metrics) >= {"loss", "recon", "recon_acc", "rank_s", "noised_frac"}
     assert all(math.isfinite(v) for v in metrics.values())
+
+
+def test_visreg_on_pooled_latent() -> None:
+    """VISReg regularizes the encoder pool output directly."""
+    import lightning as L
+
+    from lattice_lab.models.denoising_jepa_ssl import DenoisingJEPAModule
+    from lattice_lab.training.ssl_loss import VISReg
+
+    model = _tiny_jepa()
+    harness = DenoisingJEPAModule.__new__(DenoisingJEPAModule)
+    L.LightningModule.__init__(harness)
+    harness._visreg = VISReg(gamma=1.0, num_projections=32)
+    harness._sigreg = None
+    z = model.encoder(*_tiny_batch())
+    loss = harness._reg_loss(z)
+    assert loss is not None and math.isfinite(float(loss))
+    loss.backward()
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in model.encoder.pool.parameters()
+    )
+
+
+def test_latent_l2_penalty() -> None:
+    from lattice_lab.models.denoising_jepa_ssl import DenoisingJEPAModule
+
+    model = _tiny_jepa()
+    z = model.encoder(*_tiny_batch())
+    l2 = DenoisingJEPAModule._latent_l2(z)
+    assert float(l2) == pytest.approx(float(z.pow(2).mean()), abs=1e-5)
+    l2.backward()
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in model.encoder.pool.parameters()
+    )
 
 
 def test_loss_is_zero_when_clean() -> None:
@@ -274,7 +291,6 @@ def test_log_grad_norms_logs_active_terms() -> None:
     harness.pad_id = model.pad_id
     harness.vocab_size = model.vocab_size
     harness.token_id_min = model.token_id_min
-    harness.vae_head = None
     _, _, _, terms = denoising_loss(
         model, _tiny_batch(), corrupt_t=0.3, return_outputs=True, align_lambda=0.0
     )

@@ -45,6 +45,20 @@ def train(cfg: DictConfig) -> dict[str, float]:
     logger.info("instantiating model <%s>", cfg.model._target_)
     model: L.LightningModule = hydra.utils.instantiate(cfg.model)
 
+    # Validate a saved checkpoint against the (deterministic) val split and exit.
+    # Stage 6 uses this to reproduce the stage-5 val metrics in the eval log. No
+    # loggers/callbacks, so it never touches W&B or writes checkpoints.
+    if cfg.get("validate_only"):
+        val_trainer: L.Trainer = hydra.utils.instantiate(
+            cfg.trainer, callbacks=[], logger=False
+        )
+        val_trainer.validate(
+            model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path")
+        )
+        metrics = {k: float(v) for k, v in val_trainer.callback_metrics.items()}
+        logger.info("VAL-REPRO metrics: %s", {k: round(v, 4) for k, v in metrics.items()})
+        return metrics
+
     callbacks = instantiate_callbacks(cfg.get("callbacks"))
     loggers = instantiate_loggers(cfg.get("logger"))
     wire_checkpoint_dirs_to_wandb(loggers, callbacks)

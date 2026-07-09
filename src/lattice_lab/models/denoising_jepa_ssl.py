@@ -14,14 +14,15 @@ from lattice_lab.backbone.discrete_flow import pad_batch
 from lattice_lab.data.fragment_views import shuffle_fragment_ids
 from lattice_lab.models.schedules import cosine_with_warmup
 from lattice_lab.training.denoising_jepa import (
-    VAEHead,
     build_denoising_jepa,
     condition_bypass_gap,
     denoise_logits,
     denoising_loss,
 )
 from lattice_lab.training.ssl_loss import (
+    NTXentLoss,
     SIGReg,
+    VISReg,
     _FingerprintCache,
     similarity_distillation_loss,
     tanimoto_target_matrix,
@@ -46,12 +47,15 @@ class DenoisingJEPAModule(L.LightningModule):
         n_head: int = 12,
         n_embd: int = 768,
         dropout: float = 0.1,
+        adapter_n_layers: int = 2,
         learning_rate: float = 1e-3,
         weight_decay: float = 0.01,
         warmup_steps: int = 500,
         frag_sep_id: int = 4,
         shuffle_fragments: bool = True,
         align_lambda: float = 0.0,
+        contrastive_lambda: float = 0.0,
+        contrastive_temperature: float = 0.1,
         fp_weight: float = 0.0,
         fp_radius: int = 2,
         fp_bits: int = 2048,
@@ -59,14 +63,17 @@ class DenoisingJEPAModule(L.LightningModule):
         sigreg_num_projections: int = 256,
         sigreg_knots: int = 17,
         sigreg_t_max: float = 3.0,
-        kl_beta: float = 0.0,
-        kl_free_bits: float = 0.0,
-        kl_warmup_steps: int = 0,
+        use_visreg: bool = True,
+        visreg_gamma: float = 1.0,
+        visreg_shape_coeff: float = 1.0,
+        visreg_num_projections: int = 4096,
+        latent_l2_weight: float = 1.0e-4,
         cond_noise_scale: float = 0.0,
         latent_consistency_lambda: float = 0.0,
         corrupt_t: list[float] | float | None = (0.1, 0.6),
         corrupt_t_cap: float = 1e-3,
         path_power: float = 1.0,
+        recon_token_weight: str = "none",
         condition_corrupt_t: float = 0.1,
         condition_margin: float = 0.1,
         condition_hard_fail: bool = False,
@@ -94,6 +101,7 @@ class DenoisingJEPAModule(L.LightningModule):
             n_head=n_head,
             n_embd=n_embd,
             dropout=dropout,
+            adapter_n_layers=adapter_n_layers,
             parent=self,
         )
         if self.bundle is None:
@@ -108,6 +116,15 @@ class DenoisingJEPAModule(L.LightningModule):
             tsne_perplexity=val_probe_tsne_perplexity,
         )
         self._rng = random.Random(seed)
+        if str(recon_token_weight) not in ("none", "inverse_freq"):
+            raise ValueError(
+                f"recon_token_weight must be 'none' or 'inverse_freq', got {recon_token_weight!r}"
+            )
+        # Per-token CE weight vector [vocab]; built at on_fit_start from the training
+        # unigram frequencies when recon_token_weight='inverse_freq'. None = uniform.
+        # Plain attribute (NOT a buffer) so it stays out of the state_dict — eval
+        # rebuilds skip on_fit_start and load strict with a uniform (None) weight.
+        self.recon_token_weight: torch.Tensor | None = None
         self.fp_weight = float(fp_weight)
         if self.fp_weight < 0:
             raise ValueError(f"fp_weight must be >= 0, got {fp_weight}")
@@ -116,24 +133,31 @@ class DenoisingJEPAModule(L.LightningModule):
             if self.fp_weight > 0
             else None
         )
-        self._sigreg = (
-            SIGReg(
-                num_projections=int(sigreg_num_projections),
-                knots=int(sigreg_knots),
-                t_max=float(sigreg_t_max),
-            )
-            if float(sigreg_lambda) > 0.0
+        self._ntxent = (
+            NTXentLoss(temperature=float(contrastive_temperature))
+            if float(contrastive_lambda) > 0.0
             else None
         )
-        if float(kl_beta) > 0.0:
-            self.vae_head = VAEHead(
-                self.encoder.pool.dim, free_bits=float(kl_free_bits)
-            )
+        self._visreg: VISReg | None = None
+        self._sigreg: SIGReg | None = None
+        if float(sigreg_lambda) > 0.0:
+            if bool(use_visreg):
+                self._visreg = VISReg(
+                    gamma=float(visreg_gamma),
+                    shape_coeff=float(visreg_shape_coeff),
+                    num_projections=int(visreg_num_projections),
+                )
+            else:
+                self._sigreg = SIGReg(
+                    num_projections=int(sigreg_num_projections),
+                    knots=int(sigreg_knots),
+                    t_max=float(sigreg_t_max),
+                )
         self._val: dict[str, list[float]] = {
             "loss": [], "recon": [], "recon_acc": [], "rank_s": [],
-            "noised_frac": [], "gap": [], "align_cos": [], "fp": [], "sigreg": [], "kl": [],
-            "latent": [], "latent_cos": [],
-            "logvar_mean": [], "logvar_std": [], "logvar_exp_mean": [],
+            "noised_frac": [], "gap": [], "align_cos": [], "fp": [], "sigreg": [],
+            "latent_l2": [],
+            "latent": [], "latent_cos": [], "contrastive": [],
         }
         if float(align_lambda) > 0.0 and not shuffle_fragments:
             logger.warning(
@@ -141,9 +165,11 @@ class DenoisingJEPAModule(L.LightningModule):
                 align_lambda,
             )
         logger.info(
-            "denoising-JEPA: corrupt_t=%s align_lambda=%.3f fp_weight=%.3f "
-            "latent_consistency_lambda=%.3f shuffle_fragments=%s freeze_backbone=%s frag_sep_id=%d",
-            corrupt_t, align_lambda, self.fp_weight, latent_consistency_lambda,
+            "denoising-JEPA: corrupt_t=%s align_lambda=%.3f contrastive_lambda=%.3f fp_weight=%.3f "
+            "sigreg_lambda=%.3f use_visreg=%s latent_l2_weight=%.2e latent_consistency_lambda=%.3f "
+            "shuffle_fragments=%s freeze_backbone=%s frag_sep_id=%d",
+            corrupt_t, align_lambda, contrastive_lambda, self.fp_weight, sigreg_lambda, use_visreg,
+            latent_l2_weight, latent_consistency_lambda,
             shuffle_fragments,
             (self.build_config or {}).get("freeze_backbone"), frag_sep_id,
         )
@@ -151,12 +177,26 @@ class DenoisingJEPAModule(L.LightningModule):
     def denoise_logits(self, x_t, mask, t, conds):
         return denoise_logits(self, x_t, mask, t, conds)
 
-    def _tokenize(self, views: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _body_ids(item: str | list[int] | tuple[object, ...], tokenizer) -> list[int]:
+        """Body token ids from a SMILES string OR precomputed ``body_ids`` list."""
+        if isinstance(item, tuple) and len(item) == 2:
+            item = item[0]
+        if isinstance(item, list):
+            if not item:
+                return []
+            if not isinstance(item[0], int):
+                text = item[0] if len(item) == 1 else " ".join(str(x) for x in item)
+                return tokenizer.encode(text, add_special_tokens=False)
+            return item
+        return tokenizer.encode(item, add_special_tokens=False)
+
+    def _tokenize(self, views: list[str] | list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
         b = self.bundle
         sep = int(self.hparams.frag_sep_id)
         seqs: list[list[int]] = []
         for s in views:
-            body = b.tokenizer.encode(s, add_special_tokens=False)
+            body = self._body_ids(s, b.tokenizer)
             if self.hparams.shuffle_fragments:
                 body = shuffle_fragment_ids(body, sep, self._rng)
             seqs.append([b.bos_id, *body, b.eos_id])
@@ -170,10 +210,17 @@ class DenoisingJEPAModule(L.LightningModule):
             return list(views), list(smiles)
         return list(batch), None
 
-    def _sigreg_loss(self, z_s: torch.Tensor) -> torch.Tensor | None:
-        if self._sigreg is None:
-            return None
-        return self._sigreg(z_s.unsqueeze(0)) / z_s.size(0)
+    def _reg_loss(self, z_s: torch.Tensor) -> torch.Tensor | None:
+        """Anti-collapse regularizer on pooled ``z_s`` ``[B, D]`` (VISReg or SIGReg)."""
+        if self._visreg is not None:
+            return self._visreg(z_s)
+        if self._sigreg is not None:
+            return self._sigreg(z_s.unsqueeze(0)) / z_s.size(0)
+        return None
+
+    @staticmethod
+    def _latent_l2(z_s: torch.Tensor) -> torch.Tensor:
+        return z_s.pow(2).mean()
 
     def _fp_distillation(self, z_s: torch.Tensor, smiles: list[str] | None):
         if self.fp_weight <= 0 or self._fp_cache is None:
@@ -192,17 +239,30 @@ class DenoisingJEPAModule(L.LightningModule):
         every = int(self.hparams.train_rank_every_n_steps)
         return every > 0 and self.global_step % every == 0
 
-    def _kl_warmup_factor(self) -> float:
-        steps = int(self.hparams.kl_warmup_steps)
-        if steps <= 0:
-            return 1.0
-        return min(1.0, (self.global_step + 1) / steps)
-
     def _align_on(self) -> bool:
         return (
             float(self.hparams.align_lambda) > 0.0
             and bool(self.hparams.shuffle_fragments)
         )
+
+    def _contrastive_on(self) -> bool:
+        # Needs two *different* fragment shufflings; without shuffle both views are
+        # identical and every "positive" is also its own row → degenerate.
+        return (
+            self._ntxent is not None
+            and bool(self.hparams.shuffle_fragments)
+        )
+
+    def _contrastive(self, z_s: torch.Tensor, views: list[str]) -> torch.Tensor | None:
+        """Symmetric NT-Xent between ``z_s`` (view a) and a fresh fragment-shuffle
+        (view b), with in-batch negatives. ``None`` when disabled."""
+        if not self._contrastive_on():
+            return None
+        ids_b, mask_b = self._second_view(views)
+        z_b = self.encoder(ids_b.long(), mask_b)
+        za = torch.nn.functional.normalize(z_s, dim=-1)
+        zb = torch.nn.functional.normalize(z_b, dim=-1)
+        return self._ntxent(za, zb)
 
     def _second_view(self, views: list[str]):
         return self._tokenize(views)
@@ -232,7 +292,7 @@ class DenoisingJEPAModule(L.LightningModule):
         views, smiles = self._split_batch(batch)
         ids, mask = self._tokenize(views)
         batch_b = self._second_view(views) if self._align_on() else None
-        loss, metrics, (z_s, _logits, _noised, _ids, kl), terms = denoising_loss(
+        loss, metrics, (z_s, _logits, _noised, _ids), terms = denoising_loss(
             self,
             (ids, mask),
             batch_b=batch_b,
@@ -246,22 +306,27 @@ class DenoisingJEPAModule(L.LightningModule):
             latent_consistency_lambda=float(self.hparams.latent_consistency_lambda),
         )
         bs = len(views)
-        if kl is not None:
-            beta = float(self.hparams.kl_beta) * self._kl_warmup_factor()
-            loss = loss + beta * kl
-            terms["kl"] = beta * kl
-            self.log("train/kl", kl.detach(), on_step=True, batch_size=bs)
-            self.log("train/kl_beta", beta, on_step=True, batch_size=bs)
         fp_loss = self._fp_distillation(z_s, smiles)
         if fp_loss is not None:
             loss = loss + self.fp_weight * fp_loss
             terms["fp"] = self.fp_weight * fp_loss
             self.log("train/fp", fp_loss.detach(), on_step=True, prog_bar=True, batch_size=bs)
-        sigreg_loss = self._sigreg_loss(z_s)
-        if sigreg_loss is not None:
-            loss = loss + float(self.hparams.sigreg_lambda) * sigreg_loss
-            terms["sigreg"] = float(self.hparams.sigreg_lambda) * sigreg_loss
-            self.log("train/sigreg", sigreg_loss.detach(), on_step=True, batch_size=bs)
+        con_loss = self._contrastive(z_s, views)
+        if con_loss is not None:
+            loss = loss + float(self.hparams.contrastive_lambda) * con_loss
+            terms["contrastive"] = float(self.hparams.contrastive_lambda) * con_loss
+            self.log("train/contrastive", con_loss.detach(), on_step=True, prog_bar=True, batch_size=bs)
+        reg_loss = self._reg_loss(z_s)
+        if reg_loss is not None:
+            loss = loss + float(self.hparams.sigreg_lambda) * reg_loss
+            terms["sigreg"] = float(self.hparams.sigreg_lambda) * reg_loss
+            self.log("train/sigreg", reg_loss.detach(), on_step=True, batch_size=bs)
+        l2_w = float(self.hparams.latent_l2_weight)
+        if l2_w > 0.0:
+            l2 = self._latent_l2(z_s)
+            loss = loss + l2_w * l2
+            terms["latent_l2"] = l2_w * l2
+            self.log("train/latent_l2", l2.detach(), on_step=True, batch_size=bs)
         if self.hparams.log_grad_norms and torch.is_grad_enabled():
             self._log_grad_norms(**terms)
         self.log("train/loss", loss.detach(), on_step=True, prog_bar=True, batch_size=bs)
@@ -276,9 +341,6 @@ class DenoisingJEPAModule(L.LightningModule):
             self.log("train/latent", metrics["latent"], on_step=True, batch_size=bs)
         if self._rank_due():
             self.log("train/rank_s", metrics["rank_s"], on_step=True, prog_bar=True, batch_size=bs)
-        for k in ("logvar_mean", "logvar_std", "logvar_exp_mean"):
-            if k in metrics:
-                self.log(f"diagnostics/{k}", metrics[k], on_step=True, batch_size=bs)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -286,7 +348,7 @@ class DenoisingJEPAModule(L.LightningModule):
         ids, mask = self._tokenize(views)
         batch_b = self._second_view(views) if self._align_on() else None
         with torch.no_grad():
-            _, metrics, (z_s, _logits, _noised, _ids, kl), _ = denoising_loss(
+            _, metrics, (z_s, _logits, _noised, _ids), _ = denoising_loss(
                 self,
                 (ids, mask),
                 batch_b=batch_b,
@@ -300,7 +362,9 @@ class DenoisingJEPAModule(L.LightningModule):
                 latent_consistency_lambda=float(self.hparams.latent_consistency_lambda),
             )
             fp_loss = self._fp_distillation(z_s, smiles)
-            sigreg_loss = self._sigreg_loss(z_s)
+            con_loss = self._contrastive(z_s, views)
+            reg_loss = self._reg_loss(z_s)
+            l2 = self._latent_l2(z_s) if float(self.hparams.latent_l2_weight) > 0.0 else None
             gap = condition_bypass_gap(
                 self,
                 (ids, mask),
@@ -322,13 +386,12 @@ class DenoisingJEPAModule(L.LightningModule):
             self._val["latent_cos"].append(metrics["latent_cos"])
         if fp_loss is not None:
             self._val["fp"].append(float(fp_loss))
-        if sigreg_loss is not None:
-            self._val["sigreg"].append(float(sigreg_loss.detach()))
-        if kl is not None:
-            self._val["kl"].append(float(kl.detach()))
-        for k in ("logvar_mean", "logvar_std", "logvar_exp_mean"):
-            if k in metrics:
-                self._val[k].append(metrics[k])
+        if con_loss is not None:
+            self._val["contrastive"].append(float(con_loss.detach()))
+        if reg_loss is not None:
+            self._val["sigreg"].append(float(reg_loss.detach()))
+        if l2 is not None:
+            self._val["latent_l2"].append(float(l2.detach()))
 
     def on_validation_epoch_end(self) -> None:
         def _m(key: str, default: float = float("nan")) -> float:
@@ -352,13 +415,12 @@ class DenoisingJEPAModule(L.LightningModule):
             out["val/latent_cos"] = _m("latent_cos")
         if self._val["fp"]:
             out["val/fp"] = _m("fp")
+        if self._val["contrastive"]:
+            out["val/contrastive"] = _m("contrastive")
         if self._val["sigreg"]:
             out["val/sigreg"] = _m("sigreg")
-        if self._val["kl"]:
-            out["val/kl"] = _m("kl")
-        for k in ("logvar_mean", "logvar_std", "logvar_exp_mean"):
-            if self._val[k]:
-                out[f"diagnostics/{k}"] = _m(k)
+        if self._val["latent_l2"]:
+            out["val/latent_l2"] = _m("latent_l2")
         out.update(self._val_probes.maybe_run(self))
         self.log_dict(out, prog_bar=True, sync_dist=True)
 

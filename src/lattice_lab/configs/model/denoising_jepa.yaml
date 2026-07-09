@@ -6,6 +6,7 @@ encode_time: 1.0
 freeze_backbone: true
 token_id_min: 4
 pool_heads: 8
+adapter_n_layers: 2   # trainable Adapter (token-mixing transformer) over the frozen backbone; 0 = pool only
 
 corrupt_t: [0., .3]
 corrupt_t_cap: 1.0e-3
@@ -16,18 +17,27 @@ frag_sep_id: 4
 
 align_lambda: 0
 
+# NT-Xent (SimCLR) on z_s between two fragment-shuffles of the same molecule, with
+# in-batch negatives — pulls positives together, pushes other molecules apart
+# (anti-collapse + molecule-discriminative). Needs shuffle_fragments=true. 0 = off.
+contrastive_lambda: 0.1
+contrastive_temperature: 0.1
+
 fp_weight: 0.0
 fp_radius: 2
 fp_bits: 2048
 
-sigreg_lambda: 0.
+sigreg_lambda: 0.05
 sigreg_num_projections: 256
 sigreg_knots: 17
 sigreg_t_max: 3.0
 
-kl_beta: 0.5
-kl_free_bits: 0.0
-kl_warmup_steps: 5000
+use_visreg: true
+visreg_gamma: 1.0
+visreg_shape_coeff: 1.0
+visreg_num_projections: 4096
+
+latent_l2_weight: 1.0e-4
 
 cond_noise_scale: 1
 

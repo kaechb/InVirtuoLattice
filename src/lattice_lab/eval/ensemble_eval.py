@@ -45,6 +45,15 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+_METRIC_COLS = ("auroc", "bedroc", "ef@0.5%", "ef@1.0%", "ef@5.0%")
+
+
+def _summary_from_df(res: pd.DataFrame) -> dict[str, float | int]:
+    summary = {f"mean/{k}": float(res[k].mean()) for k in _METRIC_COLS}
+    summary.update({f"median/{k}": float(res[k].median()) for k in _METRIC_COLS})
+    summary["n_targets"] = len(res)
+    return summary
+
 
 def _load_head(
     ckpt: Path,
@@ -55,19 +64,24 @@ def _load_head(
     return load_energy_head(ckpt, d_adapter=d_m, d_protein=d_p, device=device)
 
 
-def _mean_energy(heads, z_m: np.ndarray, z_p: np.ndarray, device: str,
-                 batch_size: int = 8192) -> np.ndarray:
-    """Mean energy E over heads for [L, d_m] z_m against one z_p. Lower = binder."""
+def _head_energies(
+    heads,
+    z_m: np.ndarray,
+    z_p: np.ndarray,
+    device: str,
+    batch_size: int = 8192,
+) -> np.ndarray:
+    """Per-head energies [n_heads, L] for [L, d_m] z_m against one z_p. Lower = binder."""
     z_p_t = torch.from_numpy(z_p.astype(np.float32)).to(device)
-    out = np.zeros(z_m.shape[0], dtype=np.float64)
+    out = np.zeros((len(heads), z_m.shape[0]), dtype=np.float64)
     for i in range(0, z_m.shape[0], batch_size):
         chunk = torch.from_numpy(z_m[i:i + batch_size].astype(np.float32)).to(device)
         z_p_b = z_p_t.unsqueeze(0).expand(chunk.shape[0], -1)
-        acc = np.zeros(chunk.shape[0], dtype=np.float64)
         with torch.no_grad():
-            for h in heads:
-                acc += h(chunk, z_p_b).cpu().numpy().astype(np.float64)
-        out[i:i + chunk.shape[0]] = acc / len(heads)
+            for hi, h in enumerate(heads):
+                out[hi, i:i + chunk.shape[0]] = (
+                    h(chunk, z_p_b).cpu().numpy().astype(np.float64)
+                )
     return out
 
 
@@ -143,7 +157,8 @@ def main() -> None:
         a.violin_dir.mkdir(parents=True, exist_ok=True)
         from lattice_lab.inference.predict import plot_violin
 
-    rows = []
+    rows: list[dict] = []
+    seed_rows: list[list[dict]] = [[] for _ in heads]
     for t in present:
         sub = work[work["target_name"] == t]
         if sub.empty:
@@ -153,8 +168,8 @@ def main() -> None:
         z_m = np.asarray(zm.mean_array[idx], dtype=np.float32)
         z_p = np.asarray(pstore.get_mean(t), dtype=np.float32)
         y_true = sub["is_active"].to_numpy(dtype=int)
-        energy = _mean_energy(heads, z_m, z_p, a.device)
-        y_score = -energy
+        energies = _head_energies(heads, z_m, z_p, a.device)
+        y_score = -energies.mean(axis=0)
         m = {
             "target": t, "n": int(y_true.size), "n_active": int(y_true.sum()),
             "auroc": auroc(y_true, y_score),
@@ -164,10 +179,22 @@ def main() -> None:
             "ef@5.0%": ef_at_k(y_true, y_score, 5.0),
         }
         rows.append(m)
-        logger.info("%-8s n=%d n_a=%d auc=%.3f bedroc=%.3f ef1=%.2f",
-                    t, m["n"], m["n_active"], m["auroc"], m["bedroc"], m["ef@1.0%"])
+        logger.info(
+            "%-8s [ensemble] n=%d n_a=%d auc=%.3f bedroc=%.3f ef1=%.2f",
+            t, m["n"], m["n_active"], m["auroc"], m["bedroc"], m["ef@1.0%"],
+        )
+        for hi in range(len(heads)):
+            y_seed = -energies[hi]
+            seed_rows[hi].append({
+                "target": t, "n": m["n"], "n_active": m["n_active"],
+                "auroc": auroc(y_true, y_seed),
+                "bedroc": bedroc(y_true, y_seed, alpha=a.bedroc_alpha),
+                "ef@0.5%": ef_at_k(y_true, y_seed, 0.5),
+                "ef@1.0%": ef_at_k(y_true, y_seed, 1.0),
+                "ef@5.0%": ef_at_k(y_true, y_seed, 5.0),
+            })
         if a.violin_dir is not None:
-            ea, ei = energy[y_true == 1], energy[y_true == 0]
+            ea, ei = energies.mean(axis=0)[y_true == 1], energies.mean(axis=0)[y_true == 0]
             if ea.size >= 2 and ei.size >= 2:
                 plot_violin(
                     target_name=t,
@@ -179,19 +206,40 @@ def main() -> None:
                 )
 
     res = pd.DataFrame(rows)
-    summary = {f"mean/{k}": float(res[k].mean()) for k in
-               ["auroc", "bedroc", "ef@0.5%", "ef@1.0%", "ef@5.0%"]}
-    summary.update({f"median/{k}": float(res[k].median()) for k in
-                    ["auroc", "bedroc", "ef@0.5%", "ef@1.0%", "ef@5.0%"]})
-    summary["n_targets"] = len(res)
+    summary = _summary_from_df(res)
+    per_seed: list[dict] = []
+    for hi, ckpt in enumerate(a.ckpts):
+        seed_res = pd.DataFrame(seed_rows[hi])
+        seed_summary = _summary_from_df(seed_res)
+        entry = {
+            "seed": hi,
+            "run_id": ckpt.parent.name,
+            "ckpt": str(ckpt),
+            **seed_summary,
+        }
+        per_seed.append(entry)
+        logger.info(
+            "SEED %d (%s) -> auroc=%.4f bedroc=%.4f ef1=%.2f (n=%d targets)",
+            hi, ckpt.parent.name, seed_summary["mean/auroc"],
+            seed_summary["mean/bedroc"], seed_summary["mean/ef@1.0%"],
+            seed_summary["n_targets"],
+        )
+
+    output = dict(summary)
+    output["per_seed"] = per_seed
     a.out.parent.mkdir(parents=True, exist_ok=True)
     res.to_csv(a.out.with_suffix(".csv"), index=False)
-    a.out.write_text(json.dumps(summary, indent=2))
-    logger.info("ENSEMBLE %d heads -> auroc=%.4f bedroc=%.4f ef1=%.2f (n=%d targets)",
-                len(heads), summary["mean/auroc"], summary["mean/bedroc"],
-                summary["mean/ef@1.0%"], summary["n_targets"])
-    print(json.dumps(summary, indent=2))
+    a.out.write_text(json.dumps(output, indent=2))
+    logger.info(
+        "ENSEMBLE %d heads -> auroc=%.4f bedroc=%.4f ef1=%.2f (n=%d targets)",
+        len(heads), summary["mean/auroc"], summary["mean/bedroc"],
+        summary["mean/ef@1.0%"], summary["n_targets"],
+    )
+    print(json.dumps(output, indent=2))
 
 
 if __name__ == "__main__":
+    # ponytail: one-liner guard on summary aggregation
+    _toy = pd.DataFrame({k: [1.0, 3.0] for k in _METRIC_COLS})
+    assert _summary_from_df(_toy)["mean/auroc"] == 2.0
     main()

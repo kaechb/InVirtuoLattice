@@ -22,6 +22,8 @@ TRAIN_CASES = [
     ["experiment=ebm_hardneg"],
     ["experiment=adapter_discrete_flow"],
     ["experiment=adapter_discrete_flow", "model.ssl_loss=lejepa"],
+    ["experiment=adapter3d"],
+    ["experiment=adapter3d", "model.ssl_loss=lejepa"],
     ["experiment=adapter_discrete_flow", "model.ssl_loss=ijepa"],
     ["experiment=adapter_discrete_flow", "model.ssl_loss=hybrid", "model.hybrid_anneal_steps=2000"],
     ["experiment=denoising_jepa"],

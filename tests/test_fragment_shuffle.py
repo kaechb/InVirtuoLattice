@@ -16,6 +16,9 @@ from lattice_lab.data.fragment_views import (
     mask_local_frags,
     mask_local_ids,
     mask_span_ids,
+    noise_frags,
+    noise_local_frags,
+    noise_span_ids,
     shuffle_fragment_ids,
     shuffle_frags,
     split_fragment_ids,
@@ -160,6 +163,51 @@ def test_frag_list_path_matches_flat_ids_path(ids: list[int], seed: int) -> None
     assert got == ref
     assert frags == snapshot  # not mutated
     assert join_fragment_ids(split_fragment_ids(ids, sep), sep) == ids  # split/join inverse
+
+
+NOISE_POOL = (11, 12, 13, 14)
+
+
+def test_noise_frags_marks_holes_and_avoids_unk() -> None:
+    ids = [10, SEP, 20, 21, SEP, 30]
+    masked, holes = noise_frags(
+        split_fragment_ids(ids, SEP), SEP, NOISE_POOL, random.Random(0), frag_idx=1,
+    )
+    assert len(masked) == len(ids)
+    assert len(holes) == len(ids)
+    assert holes == [False, False, True, True, False, False]
+    assert all(t in NOISE_POOL for i, t in enumerate(masked) if holes[i])
+
+
+def test_noise_span_is_contiguous_and_leaves_context() -> None:
+    ids = [10, 11, 12, SEP, 20, 21, 22]
+    masked, holes = noise_span_ids(ids, NOISE_POOL, random.Random(0), frac=0.5)
+    assert len(masked) == len(ids) == len(holes)
+    assert 0 < sum(holes) < len(ids)
+    runs = []
+    run = 0
+    for h in holes:
+        if h:
+            run += 1
+        elif run:
+            runs.append(run)
+            run = 0
+    if run:
+        runs.append(run)
+    assert len(runs) == 1
+    assert all(masked[i] in NOISE_POOL for i, h in enumerate(holes) if h)
+
+
+def test_noise_local_matches_mask_coverage() -> None:
+    ids = [10, SEP, 20, SEP, 30, SEP, 40]
+    sep, mask_id = SEP, 99
+    frags = split_fragment_ids(ids, sep)
+    ref = mask_local_ids(ids, sep, mask_id, random.Random(0), frac=0.5, mode="fragment")
+    masked, holes = noise_local_frags(
+        frags, ids, sep, NOISE_POOL, random.Random(0), frac=0.5, mode="fragment",
+    )
+    assert holes == [t == mask_id for t in ref]
+    assert sum(holes) == ref.count(mask_id)
 
 
 @pytest.mark.parametrize("view_col", ["fragment_view", "fragmol_view"])

@@ -286,9 +286,14 @@ class DDiT(nn.Module):
         if n_conds > 0:
             self.conds = nn.Sequential(
                 nn.Linear(n_conds, hidden_size),
-                nn.SiLU(),
-                nn.Linear(hidden_size, t_emb_dim),
+                nn.GELU(),
+                nn.Linear(hidden_size, 2 * hidden_size),
             )
+            # FiLM γ/β start at 0 → h = h * 1 + 0; denoiser can ignore z_s at init.
+            last = self.conds[-1]
+            assert isinstance(last, nn.Linear)
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
         else:
             self.conds = None
 
@@ -313,12 +318,14 @@ class DDiT(nn.Module):
             x = inputs_embeds
         elif x is not None:
             x = self.vocab_embed(x)  # Shape: (batch_size, seq_len, hidden_size)
-        # Compute conditioning vector from the time embedding
         c = F.silu(self.time_embedding(time=t))
         if conds is not None:
-            if len(conds.shape) == 1:
-                conds = conds.unsqueeze(1)
-            c += self.conds(conds[: len(c)])
+            if self.conds is None:
+                raise ValueError("conds passed but model has n_conds=0")
+            if conds.ndim == 1:
+                conds = conds.unsqueeze(0)
+            gamma, beta = self.conds(conds[: x.size(0)]).chunk(2, dim=-1)
+            x = x * (1.0 + gamma[:, None, :]) + beta[:, None, :]
         else:
             assert self.conds is None
 

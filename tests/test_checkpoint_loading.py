@@ -22,7 +22,6 @@ from lattice_lab.models.builders import (
     parse_head_checkpoint,
     resolve_adapter_ckpt,
     resolve_ebm_ckpt,
-    resolve_ssl_best_ckpt,
     zm_store_path,
 )
 
@@ -104,12 +103,11 @@ def test_adapter_run_id_and_zm_store_path(tmp_path: Path) -> None:
     assert zm_store_path(ckpt, "binder_zm") == Path("artifacts/binders/xt4v2kk8/binder_zm")
 
 
-def test_adapter_run_id_from_best_r2mean(tmp_path: Path) -> None:
+def test_adapter_run_id_from_non_last_ckpt(tmp_path: Path) -> None:
     run_dir = tmp_path / "abc123"
     run_dir.mkdir()
-    best = _full_ckpt(run_dir, name="best-r2mean-epoch=01-step=1000.ckpt")
-    assert adapter_run_id(best) == "abc123"
-    assert resolve_ssl_best_ckpt(run_dir) == best
+    ckpt = _full_ckpt(run_dir, name="ssl-epoch=01-step=1000.ckpt")
+    assert adapter_run_id(ckpt) == "abc123"
 
 
 def test_resolve_ebm_ckpt_prefers_ebm_prefix(tmp_path: Path) -> None:
@@ -118,6 +116,7 @@ def test_resolve_ebm_ckpt_prefers_ebm_prefix(tmp_path: Path) -> None:
     _full_ckpt(run_dir, name="last.ckpt")
     best = _full_ckpt(run_dir, name="ebm-epoch=02-step=2000.ckpt")
     assert resolve_ebm_ckpt(run_dir) == best
+    assert resolve_ebm_ckpt(run_dir, prefer_last=True).name == "last.ckpt"
     assert ebm_run_id(best) == "ebmrun"
 
 

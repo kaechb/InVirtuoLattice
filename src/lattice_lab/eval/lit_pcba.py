@@ -128,8 +128,8 @@ def _build_encoder(
 def _build_head(
     head_ckpt: Path | str,
     *,
-    d_adapter: int = 512,
-    d_protein: int = 1280,
+    d_adapter: int | None = None,
+    d_protein: int | None = None,
     device: str = "cpu",
 ) -> EnergyHead:
     return load_energy_head(head_ckpt, d_adapter=d_adapter, d_protein=d_protein, device=device)
@@ -574,6 +574,12 @@ def main() -> None:
                              "head is ignoring the protein.")
     parser.add_argument("--limit-targets", type=int, default=-1,
                         help="score only the first N protein-store targets (smoke runs)")
+    parser.add_argument(
+        "--d-protein",
+        type=int,
+        default=None,
+        help="protein embedding dim (default: infer from head checkpoint)",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     logging.basicConfig(
@@ -593,7 +599,6 @@ def main() -> None:
                 ) from e
         args.zm_cache = eval_zm_cache_path(rid, f"lit_pcba_zm_mv{args.n_views}" if args.n_views > 1 else "lit_pcba_zm_sv")
     args.ef_percents = tuple(float(x) for x in args.ef_percents.split(","))
-    args.d_protein = 1280
     args.limit_targets = None if args.limit_targets < 0 else args.limit_targets
     evaluate(args)
 

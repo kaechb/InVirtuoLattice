@@ -6,10 +6,14 @@ only restructures them into the Lightning lifecycle:
 
 - ``training_step`` returns the scalar loss; ``self.log`` streams the train
   metrics (the native ``WandbLogger`` + tqdm bar handle the rest).
-- ``validation_step`` accumulates per-target ``(binder + N decoys)`` scores;
-  ``on_validation_epoch_end`` reduces them to ``val/{ef1,ef5,top1,bedroc}`` and
-  logs them so ``ModelCheckpoint(monitor="val/ef1", mode="max")`` can promote
-  the best checkpoint — replacing the old bespoke ``ebm_best_*.pt`` bookkeeping.
+- ``validation_step`` computes the training loss on the val batch and accumulates
+  per-target ``(binder + N decoys)`` scores; ``on_validation_epoch_end`` reduces
+  them to ``val/{loss,infonce,sinkhorn,ef1,ef5,top1,bedroc}`` and logs them so
+  ``ModelCheckpoint(monitor="val/bedroc", mode="max")`` can promote the best
+  checkpoint. NB: ``val/loss`` (temperature-scaled InfoNCE) is tail-dominated by
+  hard false-negatives and *rises* as ranking improves — it is anti-correlated
+  with retrieval and must NOT be used as the monitor. ``val/bedroc`` is the
+  scale-invariant early-enrichment signal, smoother than few-target ``val/ef1``.
 """
 
 from __future__ import annotations
@@ -188,6 +192,12 @@ class EBMLitModule(L.LightningModule):
                 total = total + hp.lambda_neg * l_ct
 
         bs = z_p.shape[0]
+        # FiLM gate magnitude: γ/β start at 0 (identity in z_m); if these stay
+        # ~0 the head is ignoring the protein. Cheap probe, but LayerNorm after
+        # FiLM can absorb part of it — diagnostics/e_protein_gap below is the
+        # decisive test of whether the *energy* actually depends on z_p.
+        with torch.no_grad():
+            gamma, beta = self.head.protein_proj(z_p).chunk(2, dim=-1)
         log = {
             "train/loss": total.detach(),
             "train/infonce": info_log["infonce/loss"],
@@ -196,10 +206,14 @@ class EBMLitModule(L.LightningModule):
             "train/top1": info_log["infonce/top1"],
             "train/binder_e_mean": e_pos.detach().mean(),
             "train/decoy_e_mean": e_dec.detach().mean(),
+            "diagnostics/film_gamma_absmean": gamma.abs().mean(),
+            "diagnostics/film_beta_absmean": beta.abs().mean(),
         }
         if ct_log is not None:
             log["train/cross_target"] = ct_log["cross_target/loss"]
             log["train/cross_target_viol"] = ct_log["cross_target/violation_rate"]
+            # |E(z_m+, z_p) − E(z_m+, z_p_wrong)|: energy-level protein sensitivity.
+            log["diagnostics/e_protein_gap"] = (e_wrong - e_pos).detach().abs().mean()
 
         self.log_dict(log, on_step=True, on_epoch=False, prog_bar=False, batch_size=bs)
         self.log("train/loss_bar", total.detach(), prog_bar=True, batch_size=bs)
@@ -213,11 +227,30 @@ class EBMLitModule(L.LightningModule):
         z_m_dec = batch["decoy_z_m"].to(self.device)
         n = z_m_dec.shape[1]
 
-        e_pos = self.head(z_m_pos, z_p).unsqueeze(1)
-        z_p_dec = z_p.unsqueeze(1).expand(-1, n, -1)
-        e_dec = self.head(z_m_dec, z_p_dec)
+        # fp32 head (matches training_step): bf16 InfoNCE+Sinkhorn over the decoy
+        # set underflows, and the frozen-encoder head is cheap in fp32. Compute
+        # the same loss as training so val/loss is a smooth checkpoint monitor.
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            e_pos = self.head(z_m_pos, z_p)
+            z_p_dec = z_p.unsqueeze(1).expand(-1, n, -1)
+            e_dec = self.head(z_m_dec, z_p_dec)
+            l_info, _ = self.info_loss(e_pos, e_dec)
+            l_sink, _ = self.sink_loss(e_pos, e_dec)
+            lam = lambda_sink_schedule(
+                self.global_step, hp.lambda_sink_warmup, hp.lambda_sink
+            )
+            # Same InfoNCE at T=1: undoes the ×10 logit scaling that makes the
+            # T=0.1 training loss tail-dominated and anti-correlated with ranking.
+            all_e = torch.cat([e_pos.unsqueeze(1), e_dec], dim=1)
+            l_info_t1 = torch.nn.functional.cross_entropy(
+                -all_e, torch.zeros(all_e.shape[0], dtype=torch.long, device=all_e.device)
+            )
+        self._val["loss"].append(float((l_info + lam * l_sink).detach()))
+        self._val["infonce"].append(float(l_info.detach()))
+        self._val["infonce_t1"].append(float(l_info_t1.detach()))
+        self._val["sinkhorn"].append(float(l_sink.detach()))
 
-        scores = -torch.cat([e_pos, e_dec], dim=1).float().cpu().numpy()
+        scores = -torch.cat([e_pos.unsqueeze(1), e_dec], dim=1).float().cpu().numpy()
         labels = np.zeros_like(scores)
         labels[:, 0] = 1
         for s_row, l_row in zip(scores, labels):
@@ -228,6 +261,16 @@ class EBMLitModule(L.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         out = {
+            "val/loss": float(np.mean(self._val["loss"])) if self._val["loss"] else 0.0,
+            "val/infonce": float(np.mean(self._val["infonce"]))
+            if self._val["infonce"]
+            else 0.0,
+            "val/infonce_t1": float(np.mean(self._val["infonce_t1"]))
+            if self._val["infonce_t1"]
+            else 0.0,
+            "val/sinkhorn": float(np.mean(self._val["sinkhorn"]))
+            if self._val["sinkhorn"]
+            else 0.0,
             "val/ef1": float(np.mean(self._val["ef1"])) if self._val["ef1"] else 0.0,
             "val/ef5": float(np.mean(self._val["ef5"])) if self._val["ef5"] else 0.0,
             "val/top1": float(np.mean(self._val["top1"])) if self._val["top1"] else 0.0,
@@ -244,8 +287,16 @@ class EBMLitModule(L.LightningModule):
         optim = torch.optim.AdamW(
             self.head.parameters(), lr=hp.learning_rate, weight_decay=hp.weight_decay
         )
+        # num_steps drives the cosine decay length. Epoch-based runs set
+        # trainer.max_steps=-1 (→ num_steps=-1); use Lightning's estimate of the
+        # total optimizer steps instead, else the cosine collapses to its 0.1x
+        # floor the instant warmup ends (progress = (step-warmup)/max(1,-1-warmup)).
+        total = int(hp.num_steps)
+        if total <= 0:
+            total = int(self.trainer.estimated_stepping_batches)
+        logger.info("LR cosine: warmup=%d total=%d", hp.warmup_steps, total)
         scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optim, lambda s: cosine_with_warmup(s, hp.warmup_steps, hp.num_steps)
+            optim, lambda s: cosine_with_warmup(s, hp.warmup_steps, total)
         )
         return {
             "optimizer": optim,

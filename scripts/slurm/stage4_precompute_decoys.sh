@@ -34,7 +34,11 @@ if [[ -z "${RUN_ID}" && -n "${PIPELINE_ENV:-}" && -f "${PIPELINE_ENV}" ]]; then
   RUN_ID="${ADAPTER_RUN_ID:?missing ADAPTER_RUN_ID in ${PIPELINE_ENV} — run stage2 first}"
 fi
 : "${RUN_ID:?set RUN_ID=<stage2_wandb_run_id> (or pass as \$1)}"
-SSL_CKPT="artifacts/adapter/checkpoints/${RUN_ID}/last.ckpt"
+if [[ -n "${PIPELINE_ENV:-}" && -f "${PIPELINE_ENV}" ]]; then
+  SSL_CKPT="$(lattice_pipeline_ssl_ckpt "${RUN_ID}")"
+else
+  SSL_CKPT="$(lattice_artifacts_root)/adapter/checkpoints/${RUN_ID}/last.ckpt"
+fi
 
 lattice_load_gpu_modules
 lattice_cd_repo
@@ -71,16 +75,62 @@ if lattice_smoke_enabled; then
   lattice_job_banner "SMOKE: precompute limit=${PRECOMPUTE_LIMIT[*]} parquets=${TRAIN_PARQUET}"
 fi
 
-srun python -m lattice_lab.ebm.precompute_decoys \
-  --shard-dir "${LATTICE_FLASH_PROCESSED}/moses${MERGE_SUFFIX}" \
-  --adapter-ckpt "${SSL_CKPT}" \
-  --batch-size 512 \
-  "${PRECOMPUTE_LIMIT[@]}" \
-  --force
+# ENCODER_3D=1: encode ligands with the Uni-Mol 3D encoder (encoder_3d.*) baked
+# into a VIEW3D Stage-2 ckpt instead of the 2D DDiT+adapter. Writes parallel
+# *_zm3d stores (same keys) that stage5 consumes via ENCODER_3D=1. Requires the
+# MOSES conformers.parquet (stage1b) for decoys; builds BDB/binder conformer
+# caches here.
+if [[ "${ENCODER_3D:-0}" == 1 ]]; then
+  lattice_job_banner "ENCODER_3D=1: precomputing z_m with the Uni-Mol 3D encoder"
+  MOSES_CONF="${REPO}/artifacts/preprocessing/processed/moses${MERGE_SUFFIX}/conformers.parquet"
+  lattice_require_file "${MOSES_CONF}" \
+    "missing ${MOSES_CONF} — run stage1b (VIEW3D conformers) first"
+
+  DECOY_STORE3D="$(lattice_zm_store_path decoy_zm3d "${RUN_ID}" "${MERGE_SUFFIX}")"
+  BDB_STORE3D="$(lattice_zm_store_path bdb_zm3d "${RUN_ID}" "${MERGE_SUFFIX}")"
+  BINDER_STORE3D="$(lattice_zm_store_path binder_zm3d "${RUN_ID}" "${MERGE_SUFFIX}")"
+  BDB_CONF="$(dirname "${BDB_STORE3D}")/bdb_conformers${MERGE_SUFFIX}.parquet"
+  BINDER_CONF="$(dirname "${BINDER_STORE3D}")/binder_conformers${MERGE_SUFFIX}.parquet"
+
+  srun python -m lattice_lab.preprocessing.precompute_conformers \
+    --parquet "${TRAIN_PARQUET}" --key-col inchikey \
+    --output "${BDB_CONF}" --n-jobs 6 --overwrite "${PRECOMPUTE_LIMIT[@]}"
+  srun python -m lattice_lab.preprocessing.precompute_conformers \
+    --parquet "${TRAIN_PARQUET}" --parquet "${VAL_PARQUET}" --key-col smiles \
+    --output "${BINDER_CONF}" --n-jobs 6 --overwrite "${PRECOMPUTE_LIMIT[@]}"
+
+  srun python -m lattice_lab.ebm.precompute_zm3d --pool decoy \
+    --adapter-ckpt "${SSL_CKPT}" --conformer-cache "${MOSES_CONF}" \
+    --store "${DECOY_STORE3D}" --batch-size 256 "${PRECOMPUTE_LIMIT[@]}" --force
+  srun python -m lattice_lab.ebm.precompute_zm3d --pool bdb \
+    --adapter-ckpt "${SSL_CKPT}" --conformer-cache "${BDB_CONF}" \
+    --bdb-parquet "${TRAIN_PARQUET}" \
+    --store "${BDB_STORE3D}" --batch-size 256 "${PRECOMPUTE_LIMIT[@]}" --force
+  srun python -m lattice_lab.ebm.precompute_zm3d --pool binder \
+    --adapter-ckpt "${SSL_CKPT}" --conformer-cache "${BINDER_CONF}" \
+    --train-parquet "${TRAIN_PARQUET}" --val-parquet "${VAL_PARQUET}" \
+    --store "${BINDER_STORE3D}" --batch-size 256 "${PRECOMPUTE_LIMIT[@]}" --force
+  lattice_job_banner "ENCODER_3D=1: done — stage5/stage6 must also run with ENCODER_3D=1"
+  exit 0
+fi
+
+DECOY_MANIFEST="${REPO}/$(lattice_zm_store_path decoy_zm "${RUN_ID}" "${MERGE_SUFFIX}")/manifest.json"
+if [[ "${STAGE4_RESUME:-0}" == 1 && -f "${DECOY_MANIFEST}" ]]; then
+  lattice_job_banner "STAGE4_RESUME: decoy_zm present, skipping precompute_decoys"
+else
+  srun python -m lattice_lab.ebm.precompute_decoys \
+    --shard-dir "${LATTICE_FLASH_PROCESSED}/moses${MERGE_SUFFIX}" \
+    --adapter-ckpt "${SSL_CKPT}" \
+    --store "$(lattice_zm_store_path decoy_zm "${RUN_ID}" "${MERGE_SUFFIX}")" \
+    --batch-size 512 \
+    "${PRECOMPUTE_LIMIT[@]}" \
+    --force
+fi
 
 srun python -m lattice_lab.ebm.precompute_bdb_zm \
   --bdb-parquet "${TRAIN_PARQUET}" \
   --adapter-ckpt "${SSL_CKPT}" \
+  --store "$(lattice_zm_store_path bdb_zm "${RUN_ID}" "${MERGE_SUFFIX}")" \
   --batch-size 512 \
   --n-jobs 6 \
   "${PRECOMPUTE_LIMIT[@]}" \
@@ -90,6 +140,7 @@ srun python -m lattice_lab.ebm.precompute_binders \
   --train-parquet "${TRAIN_PARQUET}" \
   --val-parquet "${VAL_PARQUET}" \
   --adapter-ckpt "${SSL_CKPT}" \
+  --store "$(lattice_zm_store_path binder_zm "${RUN_ID}" "${MERGE_SUFFIX}")" \
   --batch-size 512 \
   "${PRECOMPUTE_LIMIT[@]}" \
   --force

@@ -9,7 +9,7 @@ defaults:
 logger:
   wandb:
     group: ssl_denoising_jepa
-    name: djepa_t${model.corrupt_t}_fp${model.fp_weight}_sigreg${model.sigreg_lambda}_kl${model.kl_beta}
+    name: djepa_t${model.corrupt_t}_fp${model.fp_weight}_sigreg${model.sigreg_lambda}
 
 data:
   return_smiles: true

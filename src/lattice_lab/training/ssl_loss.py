@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -52,6 +53,77 @@ class NTXentLoss(nn.Module):
         targets = (targets + b) % (2 * b)
 
         return torch.nn.functional.cross_entropy(sim, targets)
+
+
+class SigLIPLoss(nn.Module):
+    """Sigmoid contrastive loss (SigLIP, arXiv:2303.15343).
+
+    Drop-in alternative to :class:`NTXentLoss` for a batch of paired views. Each
+    of the ``B*B`` view-a/view-b pairs becomes an independent binary decision on
+    the logit ``t * <z_a_i, z_b_j> + b``: matched views (the diagonal) are
+    positives (label ``+1``), all others negatives (``-1``). Because the loss is a
+    plain sum of per-pair sigmoids — no softmax over the batch — it does not lean
+    on large batches / many negatives the way NT-Xent does, and it learns its own
+    scale/threshold via a scalar temperature ``t = exp(logit_scale)`` and bias
+    ``logit_bias`` (paper inits ``logit_scale=log(10)``, ``logit_bias=-10``).
+
+    Inputs must be L2-normalized along the last dim.
+    """
+
+    def __init__(
+        self,
+        *,
+        init_logit_scale: float = math.log(10.0),
+        init_logit_bias: float = -10.0,
+    ) -> None:
+        super().__init__()
+        self.logit_scale = nn.Parameter(torch.tensor(float(init_logit_scale)))
+        self.logit_bias = nn.Parameter(torch.tensor(float(init_logit_bias)))
+
+    def forward(self, z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
+        if z_a.shape != z_b.shape:
+            raise ValueError(f"z_a/z_b shape mismatch: {z_a.shape} vs {z_b.shape}")
+        b = z_a.shape[0]
+        logits = z_a @ z_b.t() * self.logit_scale.exp() + self.logit_bias  # [B, B]
+        # +1 on the diagonal (matched views), -1 off-diagonal.
+        labels = 2.0 * torch.eye(b, device=z_a.device, dtype=logits.dtype) - 1.0
+        # SigLIP: -(1/B) * sum_i sum_j log sigmoid(label_ij * logit_ij).
+        return -torch.nn.functional.logsigmoid(labels * logits).sum(dim=1).mean()
+
+    @torch.no_grad()
+    def diagnostics(self, z_a: torch.Tensor, z_b: torch.Tensor) -> dict[str, float]:
+        """Alignment/calibration stats to tell margin-pushing from real gain.
+
+        Reported in interpretable units so the two effects are separable:
+
+        * ``cos_pos_mean`` / ``cos_neg_mean`` / ``cos_margin`` — cosine of matched
+          vs mismatched views. Pure *feature* geometry, independent of the
+          learnable scale/bias. A matched cosine that jumps to ~1 almost
+          immediately is the "encoders already contained the solution" shortcut
+          signature; ``cos_margin`` (pos − neg) is the real separation.
+        * ``temperature`` / ``logit_bias`` — the learnable calibration scalars. If
+          the loss is mostly calibrating a decision boundary rather than the
+          encoder learning, ``cos_*`` plateau early while these keep sliding.
+        * ``pos_prob_mean`` / ``neg_prob_mean`` — the model's own predicted match
+          probability ``sigmoid(t·cos + b)``. Folds in the scale/bias, so it shows
+          whether the classifier is actually calibrated (pos→1, neg→0) rather than
+          the raw cosine separation.
+        """
+        b = z_a.shape[0]
+        cos = z_a @ z_b.t()  # [B, B]; rows are L2-normalized so dot = cosine.
+        diag = torch.eye(b, device=z_a.device, dtype=torch.bool)
+        cos_pos, cos_neg = cos[diag], cos[~diag]
+        t = self.logit_scale.exp()
+        prob = torch.sigmoid(cos * t + self.logit_bias)
+        return {
+            "siglip/diagnostics_temperature": float(t),
+            "siglip/diagnostics_logit_bias": float(self.logit_bias),
+            "siglip/diagnostics_cos_pos_mean": float(cos_pos.mean()),
+            "siglip/diagnostics_cos_neg_mean": float(cos_neg.mean()),
+            "siglip/diagnostics_cos_margin": float(cos_pos.mean() - cos_neg.mean()),
+            "siglip/diagnostics_pos_prob_mean": float(prob[diag].mean()),
+            "siglip/diagnostics_neg_prob_mean": float(prob[~diag].mean()),
+        }
 
 
 class SIGReg(nn.Module):
@@ -97,44 +169,99 @@ class SIGReg(nn.Module):
         return statistic.mean()
 
 
-class VICReg(nn.Module):
-    """VICReg variance + covariance regularizer on ``[N, D]`` rows.
+class VISReg(nn.Module):
+    """VISReg: Variance-Invariance-Sketching regularizer (arXiv:2606.02572).
 
-    Drop-in anti-collapse alternative to :class:`SIGReg`: a per-dimension
-    variance hinge (push each std up toward ``gamma``) plus an off-diagonal
-    covariance penalty (decorrelate dims). Unlike SIGReg it makes no
-    Gaussianity assumption and both terms are plain means, so it stays
-    well-behaved when the regularized batch ``N`` is small.
+    Drop-in anti-collapse alternative to :class:`SIGReg` on
+    ``[N, D]`` rows. VISReg keeps VICReg's variance term but replaces the
+    off-diagonal *covariance* penalty with a **sliced-Wasserstein sketching**
+    term: every random 1D projection of the (centered, scale-normalized) batch
+    is matched to a standard-Gaussian reference by comparing sorted projected
+    values to Gaussian quantiles. This enforces the full marginal distributional
+    *shape* rather than just second-order decorrelation, so it keeps producing
+    useful gradients even under rank collapse (where a bare covariance penalty
+    goes flat once dims are already uncorrelated but low-rank).
 
-    Returns ``var_term + cov_coeff * cov_term`` as a single scalar; the caller
-    scales it the same way it scaled SIGReg.
+    Three sub-terms, all plain means so they stay ``O(1)`` at any batch size:
+
+    * **scale**  ``mean_j (gamma - std_j)^2`` — pull every per-dim std to ``gamma``
+      (a two-sided ``L2`` anchor on the *raw* std, so ``gamma=1`` pins the absolute
+      output scale; this is what stops MSE invariance terms collapsing by scale).
+    * **center** ``mean_j mu_j^2`` — pull the batch mean to 0 (Gaussian reference
+      is centered).
+    * **shape**  sliced-Wasserstein^2 to ``N(0,1)`` on the scale-normalized batch:
+      ``mean_k mean_n (sort_n(z_norm @ w_k) - q_n)^2`` with ``q`` the standard-normal
+      quantiles at ``n/(N+1)``. ``z_norm`` divides by ``std.detach()`` so the shape
+      gradient does not fight the scale term over the output magnitude.
+
+    :meth:`components` returns ``(scale, center + shape)`` — grouping ``center``
+    with the distributional term so the two match VICReg's ``(var, cov)`` split
+    for logging. :meth:`forward` returns ``scale + shape_coeff * (center + shape)``;
+    the paper weights all three equally (``shape_coeff=1``). The caller scales the
+    result the same way it scaled VICReg/SIGReg.
+
+    Note (deviation from the paper): the paper's ``L_shape`` and ``L_center`` sum
+    over dimensions/samples (``||.||_2^2``); we average instead, keeping every term
+    ``O(1)`` so ``lejepa_lambda`` stays batch-size- and dim-independent, matching
+    this file's convention for the other regularizers.
     """
 
     def __init__(
-        self, *, gamma: float = 1.0, cov_coeff: float = 1.0, eps: float = 1e-4
+        self,
+        *,
+        gamma: float = 1.0,
+        shape_coeff: float = 1.0,
+        num_projections: int = 4096,
+        eps: float = 1e-4,
     ) -> None:
         super().__init__()
         if gamma <= 0.0:
             raise ValueError(f"gamma must be > 0, got {gamma}")
-        if cov_coeff < 0.0:
-            raise ValueError(f"cov_coeff must be >= 0, got {cov_coeff}")
+        if shape_coeff < 0.0:
+            raise ValueError(f"shape_coeff must be >= 0, got {shape_coeff}")
+        if num_projections < 1:
+            raise ValueError(f"num_projections must be >= 1, got {num_projections}")
         self.gamma = float(gamma)
-        self.cov_coeff = float(cov_coeff)
+        self.shape_coeff = float(shape_coeff)
+        self.num_projections = int(num_projections)
         self.eps = float(eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _gaussian_quantiles(
+        n: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Standard-normal quantiles at plotting positions ``i/(N+1)``, ``i=1..N``."""
+        u = torch.arange(1, n + 1, device=device, dtype=torch.float32) / (n + 1)
+        q = torch.erfinv(2.0 * u - 1.0) * math.sqrt(2.0)  # N(0,1) inverse CDF
+        return q.to(dtype)
+
+    def components(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(scale_term, center + shape_term)`` for diagnostics/logging."""
         if x.dim() != 2:
-            raise ValueError(f"VICReg expects [N, D], got {tuple(x.shape)}")
+            raise ValueError(f"VISReg expects [N, D], got {tuple(x.shape)}")
         n, d = x.shape
         if n < 2:
-            return x.new_zeros(())
-        x = x - x.mean(dim=0, keepdim=True)
-        std = torch.sqrt(x.var(dim=0) + self.eps)  # unbiased (n-1), matches cov
-        var_term = torch.relu(self.gamma - std).mean()
-        cov = (x.T @ x) / (n - 1)
-        off_diag = cov - torch.diag(torch.diagonal(cov))
-        cov_term = off_diag.square().sum() / d
-        return var_term + self.cov_coeff * cov_term
+            return x.new_zeros(()), x.new_zeros(())
+        mu = x.mean(dim=0, keepdim=True)                        # [1, D]
+        x_cent = x - mu
+        std = torch.sqrt(x_cent.var(dim=0) + self.eps)          # [D], unbiased
+        scale = (self.gamma - std).square().mean()
+        center = mu.squeeze(0).square().mean()
+        # Sliced-Wasserstein "sketch": match each random 1D marginal to N(0,1).
+        # std is detached so the shape term shapes the distribution without
+        # tugging on the overall scale (that is the scale term's job).
+        z_norm = x_cent / std.detach().clamp_min(self.eps)      # [N, D]
+        w = torch.randn(d, self.num_projections, device=x.device, dtype=x.dtype)
+        w = w / w.norm(p=2, dim=0, keepdim=True).clamp_min(1e-12)
+        proj = z_norm @ w                                       # [N, K]
+        proj_sorted, _ = torch.sort(proj, dim=0)                # sort over samples
+        q = self._gaussian_quantiles(n, x.device, x.dtype).unsqueeze(1)  # [N, 1]
+        shape = (proj_sorted - q).square().mean()
+        return scale, center + shape
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale, dist = self.components(x)
+        return scale + self.shape_coeff * dist
 
 
 @dataclass
@@ -150,21 +277,29 @@ class LeJEPALossTerms:
     inv: torch.Tensor
     sigreg: torch.Tensor
     inv_rel: torch.Tensor
+    # VISReg split (None when SIGReg is used); ``sigreg == reg_scale + shape_coeff*reg_shape``.
+    reg_scale: torch.Tensor | None = None
+    reg_shape: torch.Tensor | None = None
 
 
 class LeJEPALoss(nn.Module):
-    """Minimal LeJEPA loss: invariance term + SIGReg isotropy regularizer.
+    """Minimal LeJEPA loss: invariance term + anti-collapse regularizer.
 
-    ``L = (1 - lambda) * L_inv + lambda * L_sigreg``
+    ``L = (1 - lambda) * L_inv + lambda * L_reg``
 
     * **Invariance**: ``mean ||z_all - center||^2`` where ``center`` is the mean
-      of intact (target) views per molecule.
-    * **SIGReg**: Epps-Pulley statistic on the batch of intact target embeddings.
+      of intact (target) views per molecule. The center is *not* detached — this
+      term is fully symmetric (no EMA/stop-grad teacher), so ``L_reg`` is the only
+      thing preventing collapse.
+    * **Regularizer** (``use_visreg``): SIGReg (Epps-Pulley Gaussianity CF test) by
+      default, or VISReg (variance + sliced-Wasserstein sketching) — both on the
+      batch of intact target embeddings. Reported as ``sigreg`` either way.
 
     Latents should be unnormalized pooled adapter outputs.
 
     SIGReg's raw statistic scales with batch size; divide by ``B`` here so
-    ``lejepa_lambda`` is batch-size-independent (see ``forward``).
+    ``lejepa_lambda`` is batch-size-independent (see ``forward``). VISReg is
+    already ``O(1)`` (all means) and needs no rescaling.
     """
 
     def __init__(
@@ -175,17 +310,36 @@ class LeJEPALoss(nn.Module):
         sigreg_knots: int = 17,
         sigreg_t_max: float = 3.0,
         sigreg_eps: float = 1e-8,
+        use_visreg: bool = False,
+        visreg_gamma: float = 1.0,
+        visreg_shape_coeff: float = 1.0,
+        visreg_num_projections: int = 4096,
     ) -> None:
         super().__init__()
         if not (0.0 <= lejepa_lambda <= 1.0):
             raise ValueError(f"lejepa_lambda must be in [0, 1], got {lejepa_lambda}")
         self.lejepa_lambda = float(lejepa_lambda)
-        self.sigreg = SIGReg(
-            num_projections=sigreg_num_projections,
-            knots=sigreg_knots,
-            t_max=sigreg_t_max,
-            eps=sigreg_eps,
-        )
+        # Anti-collapse regularizer on the intact target embeddings: SIGReg
+        # (Gaussianity CF test) or VISReg (variance + sliced-Wasserstein sketching).
+        # Either one is the *only* thing preventing collapse here — the invariance
+        # term is symmetric (no EMA/stop-grad teacher), so this is a clean test of
+        # whether the regularizer alone holds the representation up.
+        self.use_visreg = bool(use_visreg)
+        if self.use_visreg:
+            self.visreg = VISReg(
+                gamma=visreg_gamma,
+                shape_coeff=visreg_shape_coeff,
+                num_projections=visreg_num_projections,
+            )
+            self.sigreg = None
+        else:
+            self.visreg = None
+            self.sigreg = SIGReg(
+                num_projections=sigreg_num_projections,
+                knots=sigreg_knots,
+                t_max=sigreg_t_max,
+                eps=sigreg_eps,
+            )
 
     def forward(
         self,
@@ -208,10 +362,19 @@ class LeJEPALoss(nn.Module):
             raise ValueError("LeJEPALoss needs >= 1 global (target) view")
         center = z_global.mean(dim=1, keepdim=True)             # [B, 1, D]
         inv = (z_all - center).square().mean()
-        # Per-sample SIGReg: the raw statistic carries an explicit *B factor
-        # (Epps-Pulley N-scaling); divide it back out so the term is O(1) and
-        # lambda is a clean relative weight. See class docstring.
-        sigreg = self.sigreg(z_global.transpose(0, 1)) / z_global.size(0)  # [Vg, B, D]
+        reg_scale = reg_shape = None
+        if self.visreg is not None:
+            # VISReg regularizes the batch of intact target embeddings as [N, D]
+            # rows (all global views flattened together). Already O(1) (all means).
+            reg_scale, reg_shape = self.visreg.components(
+                z_global.reshape(-1, z_global.size(-1))
+            )
+            sigreg = reg_scale + self.visreg.shape_coeff * reg_shape
+        else:
+            # Per-sample SIGReg: the raw statistic carries an explicit *B factor
+            # (Epps-Pulley N-scaling); divide it back out so the term is O(1) and
+            # lambda is a clean relative weight. See class docstring.
+            sigreg = self.sigreg(z_global.transpose(0, 1)) / z_global.size(0)  # [Vg, B, D]
         lam = self.lejepa_lambda
         total = (1.0 - lam) * inv + lam * sigreg
         # Diagnostic: invariance MSE relative to the between-molecule spread of
@@ -220,7 +383,10 @@ class LeJEPALoss(nn.Module):
             c = center.squeeze(1)                                # [B, D]
             baseline = (c - c.mean(dim=0, keepdim=True)).square().mean()
             inv_rel = inv.detach() / baseline.clamp_min(1e-12)
-        return LeJEPALossTerms(total=total, inv=inv, sigreg=sigreg, inv_rel=inv_rel)
+        return LeJEPALossTerms(
+            total=total, inv=inv, sigreg=sigreg, inv_rel=inv_rel,
+            reg_scale=reg_scale, reg_shape=reg_shape,
+        )
 
 
 @dataclass
@@ -233,6 +399,12 @@ class IJEPALossTerms:
     inv: torch.Tensor
     sigreg: torch.Tensor
     gram: torch.Tensor
+    # Noise-invariance: whole-molecule mean-pool of the noise-corrupted view vs the
+    # stop-grad EMA-teacher clean global. Zero when ``noise_inv_weight == 0``.
+    noise_inv: torch.Tensor | None = None
+    # VISReg split (None when SIGReg is used); ``sigreg == reg_scale + shape_coeff*reg_shape``.
+    reg_scale: torch.Tensor | None = None
+    reg_shape: torch.Tensor | None = None
 
 
 def gram_anchoring_loss(
@@ -380,18 +552,27 @@ def _mean_visible_pool(
 
 
 class _GlobalReadout(nn.Module):
-    """Maps pooled visible context to a global embedding prediction."""
+    """Maps a pooled embedding to a predicted global target embedding.
 
-    def __init__(self, dim: int) -> None:
+    ``out_dim`` defaults to ``dim`` (square MLP); set it when the input pool width
+    differs from the target (e.g. cross-modal prediction off a half-width pool).
+    """
+
+    def __init__(self, dim: int, out_dim: int | None = None) -> None:
         super().__init__()
+        out_dim = dim if out_dim is None else out_dim
         self.net = nn.Sequential(
             nn.Linear(dim, dim),
             nn.GELU(),
-            nn.Linear(dim, dim),
+            nn.Linear(dim, out_dim),
         )
 
     def forward(self, ctx: torch.Tensor) -> torch.Tensor:
         return self.net(ctx)
+
+
+# Same MLP; public alias for DINO pool → predict → prototype path.
+PooledEmbeddingPredictor = _GlobalReadout
 
 
 def _zero_visible_tokens(
@@ -414,13 +595,19 @@ def _shuffle_visible_tokens(
 
 
 class IJEPALoss(nn.Module):
-    """Per-token I-JEPA plus optional global readout and shuffle-invariance terms.
+    """Per-token I-JEPA plus optional global readout, shuffle- and noise-invariance.
 
-    ``L = (1 - lambda) * (L_predict + w_glob * L_glob + w_inv * L_inv) + lambda * L_reg``
+    ``L = (1 - lambda) * (w_pred*L_predict + w_glob*L_glob + w_inv*L_inv
+                          + w_noise_inv*L_noise_inv + w_gram*L_gram) + lambda*L_reg``
 
     ``L_glob``: cosine(readout(mean_visible(tok)), stopgrad(z_teacher)). ``L_inv``:
     MSE between the online intact pooled embedding and the stop-grad EMA-teacher
     pooled embedding of a different fragment shuffle (asymmetric → collapse-safe).
+    ``L_noise_inv``: MSE between the whole-molecule mean-pool of a corrupted local
+    view and the stop-grad EMA-teacher clean global (alignment-free, so the local
+    may be an independent fragment shuffle). Setting ``predict_weight=0`` (with
+    ``glob``/``gram`` off) drops the token-level objective entirely — the locals
+    then match the teacher purely via the pooled ``L_noise_inv``.
     """
 
     def __init__(
@@ -428,16 +615,19 @@ class IJEPALoss(nn.Module):
         *,
         dim: int,
         lejepa_lambda: float = 0.05,
+        predict_weight: float = 1.0,
         glob_weight: float = 1.0,
         inv_weight: float = 0.1,
+        noise_inv_weight: float = 0.0,
         gram_weight: float = 0.0,
         sigreg_num_projections: int = 256,
         sigreg_knots: int = 17,
         sigreg_t_max: float = 3.0,
         sigreg_eps: float = 1e-8,
-        use_vicreg: bool = False,
-        vicreg_gamma: float = 1.0,
-        vicreg_cov_coeff: float = 1.0,
+        use_visreg: bool = False,
+        visreg_gamma: float = 1.0,
+        visreg_shape_coeff: float = 1.0,
+        visreg_num_projections: int = 4096,
         ijepa_max_positions: int = 512,
         ijepa_predictor_layers: int = 1,
         ijepa_predictor_heads: int = 2,
@@ -446,14 +636,16 @@ class IJEPALoss(nn.Module):
         super().__init__()
         if not (0.0 <= lejepa_lambda <= 1.0):
             raise ValueError(f"lejepa_lambda must be in [0, 1], got {lejepa_lambda}")
-        if glob_weight < 0.0 or inv_weight < 0.0 or gram_weight < 0.0:
+        if min(predict_weight, glob_weight, inv_weight, noise_inv_weight, gram_weight) < 0.0:
             raise ValueError(
-                f"glob_weight, inv_weight, gram_weight must be >= 0, "
-                f"got {glob_weight}, {inv_weight}, {gram_weight}"
+                f"predict/glob/inv/noise_inv/gram weights must be >= 0, got "
+                f"{predict_weight}, {glob_weight}, {inv_weight}, {noise_inv_weight}, {gram_weight}"
             )
         self.lejepa_lambda = float(lejepa_lambda)
+        self.predict_weight = float(predict_weight)
         self.glob_weight = float(glob_weight)
         self.inv_weight = float(inv_weight)
+        self.noise_inv_weight = float(noise_inv_weight)
         self.gram_weight = float(gram_weight)
         self.predictor = _IJEPAPredictor(
             dim,
@@ -463,12 +655,16 @@ class IJEPALoss(nn.Module):
             ff_mult=int(ijepa_predictor_ff_mult),
         )
         self.glob_readout = _GlobalReadout(dim)
-        self.use_vicreg = bool(use_vicreg)
-        if self.use_vicreg:
-            self.vicreg = VICReg(gamma=vicreg_gamma, cov_coeff=vicreg_cov_coeff)
+        self.use_visreg = bool(use_visreg)
+        if self.use_visreg:
+            self.visreg = VISReg(
+                gamma=visreg_gamma,
+                shape_coeff=visreg_shape_coeff,
+                num_projections=visreg_num_projections,
+            )
             self.sigreg = None
         else:
-            self.vicreg = None
+            self.visreg = None
             self.sigreg = SIGReg(
                 num_projections=sigreg_num_projections,
                 knots=sigreg_knots,
@@ -477,15 +673,15 @@ class IJEPALoss(nn.Module):
             )
 
     def _reg(self, rows: torch.Tensor) -> torch.Tensor:
-        """Anti-collapse regularizer on ``[N, D]`` rows (SIGReg or VICReg).
+        """Anti-collapse regularizer on ``[N, D]`` rows (SIGReg or VISReg).
 
         SIGReg's raw statistic carries an explicit ``*N`` batch factor (see
         :class:`SIGReg`), divided back out here so the term is ``O(1)`` and
-        ``lejepa_lambda`` stays batch-size-independent. VICReg is already a mean,
+        ``lejepa_lambda`` stays batch-size-independent. VISReg is already a mean,
         so it needs no rescaling.
         """
-        if self.vicreg is not None:
-            return self.vicreg(rows)
+        if self.visreg is not None:
+            return self.visreg(rows)
         return self.sigreg(rows.unsqueeze(0)) / rows.size(0)
 
     def _predict(
@@ -517,6 +713,21 @@ class IJEPALoss(nn.Module):
             1.0 - torch.nn.functional.cosine_similarity(pred, target.detach(), dim=-1)
         ).mean()
 
+    def predict_global_embedding(
+        self,
+        tok: torch.Tensor,
+        hole: torch.Tensor,
+        *,
+        valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict clean-global ``z_m`` from visible (non-hole) token reps.
+
+        ``glob_readout(mean_visible(tok))`` — used by ``glob_loss`` only.
+        """
+        if valid is None:
+            valid = torch.ones_like(hole, dtype=torch.bool)
+        return self.glob_readout(_mean_visible_pool(tok, hole, valid))
+
     def glob_loss(
         self,
         tok: torch.Tensor,
@@ -533,8 +744,7 @@ class IJEPALoss(nn.Module):
                 f"z_teacher must be [B,D] matching tok batch; "
                 f"got {tuple(z_teacher.shape)} vs tok {tuple(tok.shape)}"
             )
-        ctx = _mean_visible_pool(tok, hole, valid)
-        pred = self.glob_readout(ctx)
+        pred = self.predict_global_embedding(tok, hole, valid=valid)
         return (
             1.0 - torch.nn.functional.cosine_similarity(pred, z_teacher.detach(), dim=-1)
         ).mean()
@@ -592,6 +802,7 @@ class IJEPALoss(nn.Module):
         valid: torch.Tensor | None = None,
         z_teacher_rows: torch.Tensor | None = None,
         z_inv_target: torch.Tensor | None = None,
+        z_noised_pooled: torch.Tensor | None = None,
         gram_online: torch.Tensor | None = None,
         gram_target: torch.Tensor | None = None,
         gram_valid: torch.Tensor | None = None,
@@ -615,7 +826,10 @@ class IJEPALoss(nn.Module):
             valid = torch.ones_like(hole, dtype=torch.bool)
         if hole.sum() < 1:
             raise ValueError("IJEPALoss needs >= 1 hole token")
-        predict = self.predict_loss(tok, hole, target, valid=valid)
+        if self.predict_weight > 0.0:
+            predict = self.predict_loss(tok, hole, target, valid=valid)
+        else:
+            predict = tok.new_zeros(())
         if self.glob_weight > 0.0:
             if z_teacher_rows is None:
                 raise ValueError("z_teacher_rows required when glob_weight > 0")
@@ -628,6 +842,16 @@ class IJEPALoss(nn.Module):
             inv = self.inv_loss(z_pooled, z_inv_target.detach())
         else:
             inv = tok.new_zeros(())
+        if self.noise_inv_weight > 0.0:
+            if z_noised_pooled is None or z_teacher_rows is None:
+                raise ValueError(
+                    "z_noised_pooled and z_teacher_rows required when noise_inv_weight > 0"
+                )
+            # Whole-molecule pool of the noise-corrupted view pulled to the
+            # stop-grad EMA clean global — collapse-safe like inv (asymmetric target).
+            noise_inv = self.inv_loss(z_noised_pooled, z_teacher_rows.detach())
+        else:
+            noise_inv = tok.new_zeros(())
         if self.gram_weight > 0.0:
             if gram_online is None or gram_target is None or gram_valid is None:
                 raise ValueError(
@@ -636,17 +860,133 @@ class IJEPALoss(nn.Module):
             gram = gram_anchoring_loss(gram_online, gram_target, gram_valid)
         else:
             gram = tok.new_zeros(())
-        sigreg = self._reg(z_pooled)
         lam = self.lejepa_lambda
+        if lam > 0.0:
+            if self.visreg is not None:
+                reg_scale, reg_shape = self.visreg.components(z_pooled)
+                sigreg = reg_scale + self.visreg.shape_coeff * reg_shape
+            else:
+                reg_scale = reg_shape = None
+                sigreg = self._reg(z_pooled)
+        else:
+            reg_scale = reg_shape = None
+            sigreg = z_pooled.new_zeros(())
         main = (
-            predict
+            self.predict_weight * predict
             + self.glob_weight * glob
             + self.inv_weight * inv
+            + self.noise_inv_weight * noise_inv
             + self.gram_weight * gram
         )
         total = (1.0 - lam) * main + lam * sigreg
         return IJEPALossTerms(
             total=total, predict=predict, glob=glob, inv=inv, sigreg=sigreg, gram=gram,
+            noise_inv=noise_inv, reg_scale=reg_scale, reg_shape=reg_shape,
+        )
+
+
+class DINOHead(nn.Module):
+    """MLP → L2-normalized bottleneck → weight-normed prototype logits.
+
+    Maps pooled ``z_m`` ``[N, dim]`` to ``[N, out_dim]``. Nonlinearity before the
+    prototype layer matters: a bare linear map on L2-normalized 512-d inputs failed
+    to learn (CE stuck at log K, rank → 2). Head is loss-only; downstream keeps ``z_m``.
+    """
+
+    def __init__(
+        self, dim: int, out_dim: int, *, hidden: int = 2048, bottleneck: int = 256
+    ) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, bottleneck),
+        )
+        self.last = nn.utils.weight_norm(nn.Linear(bottleneck, out_dim, bias=False))
+        self.last.weight_g.data.fill_(1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.normalize(self.mlp(x), dim=-1)
+        return self.last(x)
+
+
+class DINOLoss(nn.Module):
+    """DINO cross-entropy: student matches a centered, sharpened stop-grad teacher.
+
+    ``student_logits``/``teacher_logits`` are paired rows ``[N, K]`` (student =
+    online crops, teacher = EMA global repeated to align). The teacher is centered
+    (running EMA mean subtracted) then sharpened (low temperature); together these
+    are DINO's collapse guard. Call :meth:`update_center` once per train step.
+    """
+
+    def __init__(
+        self,
+        out_dim: int,
+        *,
+        teacher_temp: float = 0.04,
+        student_temp: float = 0.1,
+        center_momentum: float = 0.9,
+    ) -> None:
+        super().__init__()
+        if not (teacher_temp > 0.0 and student_temp > 0.0):
+            raise ValueError(
+                f"temps must be > 0, got teacher={teacher_temp} student={student_temp}"
+            )
+        if not (0.0 <= center_momentum < 1.0):
+            raise ValueError(f"center_momentum must be in [0, 1), got {center_momentum}")
+        self.teacher_temp = float(teacher_temp)
+        self.student_temp = float(student_temp)
+        self.center_momentum = float(center_momentum)
+        self.register_buffer("center", torch.zeros(1, int(out_dim)))
+
+    def forward(
+        self, student_logits: torch.Tensor, teacher_logits: torch.Tensor
+    ) -> torch.Tensor:
+        if student_logits.shape != teacher_logits.shape:
+            raise ValueError(
+                f"dino student/teacher shape mismatch: "
+                f"{tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}"
+            )
+        student = torch.nn.functional.log_softmax(
+            student_logits / self.student_temp, dim=-1
+        )
+        teacher = torch.nn.functional.softmax(
+            (teacher_logits.detach() - self.center) / self.teacher_temp, dim=-1
+        )
+        return -(teacher * student).sum(dim=-1).mean()
+
+    @torch.no_grad()
+    def teacher_probs(self, teacher_logits: torch.Tensor) -> torch.Tensor:
+        """Centered, sharpened stop-grad teacher assignment ``[N, K]``."""
+        return torch.nn.functional.softmax(
+            (teacher_logits - self.center) / self.teacher_temp, dim=-1
+        )
+
+    @torch.no_grad()
+    def utilization(self, teacher_logits: torch.Tensor) -> tuple[float, float]:
+        """Prototype usage from the batch-mean teacher assignment.
+
+        Returns ``(entropy_nats, n_active)``. ``entropy_nats == log(K)`` when all
+        prototypes share mass evenly; ``~0`` when one prototype dominates. ``n_active``
+        counts prototypes with mean batch prob ``>= 1/K``.
+        """
+        mean_p = self.teacher_probs(teacher_logits).mean(dim=0)
+        k = int(mean_p.numel())
+        eps = 1e-12
+        entropy = float(-(mean_p * (mean_p + eps).log()).sum())
+        active = float((mean_p >= 1.0 / k).sum())
+        return entropy, active
+
+    @torch.no_grad()
+    def update_center(self, teacher_logits: torch.Tensor) -> None:
+        """EMA-update the center toward the batch mean of teacher logits.
+
+        ponytail: single-GPU batch mean (this pipeline runs 1 GPU/node). Multi-GPU
+        DINO all-reduces this mean — add a dist.all_reduce here if that changes.
+        """
+        batch_center = teacher_logits.mean(dim=0, keepdim=True)
+        self.center.mul_(self.center_momentum).add_(
+            batch_center, alpha=1.0 - self.center_momentum
         )
 
 

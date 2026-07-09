@@ -5,51 +5,83 @@ encoder:
   ckpt_path: artifacts/checkpoints/invirtuo_gen.ckpt
   tokenizer_path: artifacts/tokenizer/smiles_new.json
   # 0-indexed inclusive DDiT block indices whose hiddens are concatenated.
-  backbone_layer_start: 8
-  backbone_layer_end: 11
+  backbone_layer_start: 6
+  backbone_layer_end: 10
   d_adapter: ${d_adapter}
-  adapter_n_layers: 0
+  adapter_n_layers: 2
+  adapter_pool: attn   # z_m pooling: mean (masked mean over tokens) | attn (learned-query attention pool)
+  # Two independent half-width (d_adapter//2) attention pools (requires
+  # adapter_pool=attn; d_adapter must be even). z_m is their concatenation (back to
+  # d_adapter); the contrastive projection head reads only the projection half so its
+  # invariance gradient never touches the regression half — decoupling contrastive
+  # invariance pressure from latent-regression (cross-modal 3D) detail pressure.
+  # DANGER: only safe for a contrastive loss (ntxent/siglip) *together with* a second
+  # objective that trains the regression half (view3d_weight>0). Otherwise that half
+  # gets NO gradient (stays random init), so half of every downstream z_m is noise and
+  # Stage-4/5 EBM performance collapses. Off by default; stage2_ssl.sh flips it on only
+  # for METHOD=ntxent|siglip with VIEW3D=1.
+  adapter_dual_pool: false
+  # Contrastive (NT-Xent / SigLIP) projection-head output width. The head is
+  # Linear(d_pool)->GELU->Linear(proj_dim); its L2-normalized output is what the
+  # contrastive loss (+ SigLIP's learnable temperature/bias) operates on. Kept off
+  # z_m so the projection geometry does not constrain the downstream representation.
+  adapter_proj_dim: 256
   learnable_time: true
   encode_time: 0.98
-  freeze_backbone: false
+  freeze_backbone: true
   token_id_min: 4
 
 # Token id of the fragment separator (space) in the discrete-flow tokenizer.
 frag_sep_id: 4
 
-learning_rate: 1.0e-5
-weight_decay: 0.01
-warmup_steps: 500
+learning_rate: 1.0e-4
+weight_decay: 0.001
+warmup_steps: 5000
 
-# ssl_loss: ntxent (InfoNCE) | lejepa (invariance + SIGReg) | hybrid (ntxent
-# annealed in favor of lejepa over hybrid_anneal_steps) | ijepa (flow matching
-# at masked positions + SIGReg; reuses lejepa_mask_frac / lejepa_n_local_views)
-ssl_loss: null
+# ssl_loss: ntxent (InfoNCE) | siglip (sigmoid pairwise contrastive with learnable
+# temperature+bias; same two-view path as ntxent) | lejepa (invariance + SIGReg) |
+# hybrid (ntxent annealed in favor of lejepa over hybrid_anneal_steps) | ijepa
+# (flow matching at masked positions + SIGReg; reuses lejepa_mask_frac / lejepa_n_local_views)
+ssl_loss: lejepa
 temperature: 0.1          # ntxent/hybrid only
 # Morgan-fingerprint similarity distillation on L2-normalized z_m. Requires data.return_smiles=true.
 fp_weight: 0
-fp_anneal_steps: 5000  # linear decay to 0 over this many steps; 0 = constant fp_weight
+fp_anneal_steps: 10000  # linear decay to 0 over this many steps; 0 = constant fp_weight
 fp_radius: 2
 fp_bits: 2048
-lejepa_lambda: 0.01       # lejepa/hybrid/ijepa: (1-lambda)*main + lambda*reg (ijepa reg = pooled z_m)
+lejepa_lambda: 0.5      # lejepa/hybrid/ijepa: (1-lambda)*main + lambda*reg (ijepa reg = pooled z_m)
 lejepa_n_global_views: 2  # lejepa/hybrid only
-lejepa_n_local_views: 4    # lejepa/hybrid: masked locals; ijepa: K masked views per intact
+lejepa_n_local_views: 0   # lejepa/hybrid: masked locals; ijepa: K masked views per intact
 lejepa_mask_frac: 0.3     # min mask fraction (fixed when lejepa_mask_frac_max is null)
-lejepa_mask_frac_max: 0.6 # optional max; when set, each masked view samples uniform [min, max]
-ijepa_mask_mode: mixed  # ijepa only: fragment | span | mixed
-ijepa_ema_decay: 0.99      # ijepa only: initial EMA decay; cosine-scheduled to 1.0 over training
-ijepa_block_hole_attn: true  # ijepa: visible reps cannot attend to <UNK> keys in encoder
-ijepa_use_vicreg: false      # ijepa: pooled-z_m anti-collapse reg — false=SIGReg, true=VICReg (var hinge + cov penalty). SIGReg's rank signal is ~40x weaker than its scale signal (0.004→0.16 across the whole rank spectrum vs 0.004→0.39 for a 10x scale change), so it fails to oppose rank collapse; VICReg's cov term goes 1→249 over the same rank range.
-ijepa_vicreg_gamma: 1.0     # ijepa: target per-dim std for the VICReg variance hinge
-ijepa_vicreg_cov_coeff: 1.0  # ijepa: weight of the VICReg off-diagonal covariance penalty
-ijepa_collapse_diag_every_n_steps: 50  # 0 disables; avoids per-step CPU SVD sync
+lejepa_mask_frac_max: 0.4 # optional max; when set, each masked view samples uniform [min, max]
+ijepa_mask_mode: mixed  # ijepa only: fragment | span | mixed (corruption = uniform noise over body vocab)
+ijepa_ema_decay: 0.99      # ijepa: EMA decay for encoder + DINO head; cosine-scheduled to 1.0 over training
+ijepa_block_hole_attn: false  # ijepa: visible reps cannot attend to <UNK> keys in encoder
+ijepa_use_visreg: true      # ijepa: pooled-z_m anti-collapse reg — false=SIGReg, true=VISReg (variance + sliced-Wasserstein sketching, arXiv:2606.02572). VISReg replaces VICReg's covariance penalty with a sliced-Wasserstein term that matches each random 1D marginal to N(0,1), so it keeps opposing rank collapse where a covariance penalty goes flat once dims are decorrelated but low-rank.
+ijepa_visreg_gamma: 1.0     # ijepa: VISReg target per-dim std (two-sided (gamma-std)^2 anchor on the raw std; gamma=1 pins the absolute output scale)
+ijepa_visreg_shape_coeff: 1.0  # ijepa: weight of the VISReg sketching (sliced-Wasserstein) + center distributional term (paper weights it equally, 1.0)
+ijepa_visreg_num_projections: 4096  # ijepa: number of random 1D slices for the sliced-Wasserstein sketch (should exceed the adapter dim)
+ijepa_collapse_diag_every_n_steps: 50  # 0 disables; pooled z_m std/eig/rank (CPU SVD)
 rank_subsample: 256  # max rows for train/collapse rank SVD diagnostics
 ijepa_predictor_layers: 1
 ijepa_predictor_heads: 1
 ijepa_predictor_ff_mult: 2
-ijepa_glob_weight: 1.0
-ijepa_inv_weight: 0.1  # online intact pooled vs stop-grad EMA-teacher of a different shuffle (asymmetric, collapse-safe)
+ijepa_predict_weight: .0  # token-level masked prediction (core I-JEPA). 0 drops it; with glob/gram off, locals become independent fragment shuffles matched only via noise_inv
+ijepa_glob_weight: 0.0  # ABLATION: pooled JEPA-with-predictor — glob_readout(mean_visible(masked ctx)) → stop-grad EMA clean global (cosine). This is the LeJEPA-on-pooled invariance term.
+ijepa_inv_weight: 0.  # online intact pooled vs stop-grad EMA-teacher of a different shuffle (asymmetric, collapse-safe)
+ijepa_noise_inv_weight: 0.  # whole-molecule mean-pool of uniform-noise-corrupted view vs stop-grad EMA clean global (collapse-safe). 0 disables.
 ijepa_gram_weight: 0.0  # ijepa: DINOv3 Gram anchoring — match online intact patch-Gram to stop-grad EMA teacher's; stabilizes dense feats over long schedules. 0 disables.
+# ijepa: DINO prototype head. Student (online noised locals) matches a centered,
+# sharpened stop-grad EMA-teacher prototype distribution of the clean global.
+# Coexists additively with the other ijepa terms. 0 disables (no head is built).
+ijepa_dino_weight: 0.0  # ABLATION: DINO off — it was added outside the (1-λ)/λ mix at magnitude ~2-8 and drowned the reg (train/sigreg≈0). With it off, glob + VISReg are the whole objective.
+ijepa_dino_out_dim: 4096       # number of prototypes K
+ijepa_dino_hidden: 2048        # head MLP hidden (512-d z_m still benefits from nonlinearity before prototypes)
+ijepa_dino_bottleneck: 64     # L2-normalized bottleneck before prototype layer
+ijepa_dino_teacher_temp: 0.07  # teacher sharpening temperature (lower = sharper)
+ijepa_dino_student_temp: 0.1   # student temperature
+ijepa_dino_center_momentum: 0.9  # EMA momentum for the teacher-logit center
+ijepa_dino_student: predict  # pool=noised mean-pool → prototypes; predict=mean-pool → MLP → prototypes
 lejepa_mask_token_id: null  # default [UNK] (never PAD)
 sigreg_num_projections: 512
 sigreg_knots: 17
@@ -68,5 +100,18 @@ val_probe_encode_batch_size: 128
 val_probe_ridge_alpha: 1.0
 val_probe_test_size: 0.2
 val_probe_tsne_perplexity: null
+
+# Cross-modal 3D point-cloud view: off here (base = pure 2D adapter). To enable
+# the Uni-Mol co-encoder + predictor + conformer data, use experiment=adapter3d,
+# which fills in encoder_3d and data.conformer_cache.
+encoder_3d: null
+view3d_weight: 0.0
+view3d_loss: l2
+# Also VISReg the 1D (2D adapter) pooled z_m in the cross-modal term, not just the
+# 3D modality. Intended pairing: ssl_loss=ntxent (NT-Xent = within-1D-modality
+# objective) + this cross-modal LeJEPA predictor (1D->3D, symmetric, no stop-grad):
+# NT-Xent stops 1D collapse, VISReg on both 1D and 3D keeps both encoders isotropic.
+# Redundant for ssl_loss=lejepa/ijepa (they already regularize the 1D z_m).
+view3d_visreg_1d: true
 
 seed: ${seed}

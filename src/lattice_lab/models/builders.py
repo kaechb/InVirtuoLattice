@@ -39,6 +39,7 @@ _FALLBACK_ENCODER_CONFIG: dict[str, object] = {
     "backbone_layer_end": DEFAULT_BACKBONE_LAYER_END,
     "d_adapter": 512,
     "adapter_n_layers": 4,
+    "adapter_pool": "mean",
     "token_id_min": 4,
     "n_layer": 12,
     "n_head": 12,
@@ -252,35 +253,25 @@ def resolve_adapter_ckpt(adapter_ckpt: str | Path) -> Path:
     )
 
 
-def resolve_ssl_best_ckpt(adapter_ckpt: str | Path) -> Path:
-    """Best Stage-2 adapter by ``r2/mean`` (falls back to legacy structural / last)."""
-    path = Path(adapter_ckpt)
-    if path.is_file():
-        return path
-    if not path.is_dir():
-        raise FileNotFoundError(f"adapter checkpoint not found: {adapter_ckpt}")
-    for pat in ("best-r2mean-*.ckpt", "best-r2struct-*.ckpt"):
-        hits = sorted(path.glob(pat), key=lambda p: p.stat().st_mtime, reverse=True)
-        if hits:
-            chosen = hits[0]
-            logger.info("resolved ssl best ckpt %s → %s", path, chosen.name)
-            return chosen
-    return resolve_adapter_ckpt(path)
+def resolve_ebm_ckpt(run_dir: str | Path, *, prefer_last: bool = False) -> Path:
+    """Best Stage-5 EBM head by ``val/loss`` (``ebm-*.ckpt``), else ``last.ckpt``.
 
-
-def resolve_ebm_ckpt(run_dir: str | Path) -> Path:
-    """Best Stage-5 EBM head by ``val/ef1`` (``ebm-*.ckpt``), else ``last.ckpt``."""
+    ``prefer_last=True`` (stage-6 eval): use ``last.ckpt`` when present so a long
+    CPU cache-build phase does not outlive a rotated ``ebm-*.ckpt`` checkpoint.
+    """
     path = Path(run_dir)
     if path.is_file():
         return path
     if not path.is_dir():
         raise FileNotFoundError(f"EBM checkpoint not found: {run_dir}")
+    last = path / "last.ckpt"
+    if prefer_last and last.is_file():
+        return last
     hits = sorted(path.glob("ebm-*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
     if hits:
         chosen = hits[0]
         logger.info("resolved ebm best ckpt %s → %s", path, chosen.name)
         return chosen
-    last = path / "last.ckpt"
     if last.is_file():
         return last
     raise FileNotFoundError(f"no EBM checkpoint under {run_dir}")
@@ -294,7 +285,7 @@ def adapter_run_id(adapter_ckpt: str | Path) -> str:
     else:
         run_dir = path
     if run_dir.name == "checkpoints":
-        path = resolve_ssl_best_ckpt(run_dir)
+        path = resolve_adapter_ckpt(run_dir)
         run_dir = path.parent
     if run_dir.name == "checkpoints":
         raise ValueError(
@@ -418,6 +409,9 @@ def load_encoder_from_ckpt(
         backbone_layer_end=int(cfg["backbone_layer_end"]),
         d_adapter=int(cfg["d_adapter"]),
         adapter_n_layers=int(cfg["adapter_n_layers"]),
+        adapter_pool=str(cfg["adapter_pool"]),
+        adapter_dual_pool=bool(cfg.get("adapter_dual_pool", False)),
+        adapter_proj_dim=int(cfg.get("adapter_proj_dim", 128)),
         encode_time=0.99,
         learnable_time=has_time,
         freeze_backbone=True,
@@ -444,6 +438,68 @@ def load_encoder_from_ckpt(
         encoder.encode_time_value,
     )
     return encoder
+
+
+_ENCODER_3D_PREFIX = "encoder_3d."
+
+
+def load_encoder_3d_from_ckpt(
+    ckpt: str | Path | None = None,
+    *,
+    device: str | torch.device = "cpu",
+):
+    """Rebuild the frozen Uni-Mol 3D co-encoder baked into a VIEW3D Stage-2 ckpt.
+
+    Mirror of :func:`load_encoder_from_ckpt` for the 3D tower. An ``adapter3d``
+    checkpoint carries the point-cloud encoder under ``encoder_3d.*`` and its
+    skeleton in ``encoder_3d_config`` (both written by
+    :meth:`DiscreteFlowSSLModule.on_save_checkpoint`), so no separate export is
+    needed — the tower is already in ``last.ckpt``. Returns a
+    :class:`~lattice_lab.backbone.pointcloud.PointCloudEncoder` in eval mode with
+    grads off; its ``build_config`` keeps ``dict_path`` so callers featurize
+    conformers with the exact atom vocab the encoder was trained on.
+    """
+    from lattice_lab.backbone.pointcloud import PointCloudEncoder
+
+    if ckpt is None:
+        raise TypeError("load_encoder_3d_from_ckpt requires ckpt=")
+    path = resolve_adapter_ckpt(ckpt)
+    raw = safe_torch_load(path, weights_only=False)
+    state = _checkpoint_state_dict(raw)
+    enc_state = {
+        k[len(_ENCODER_3D_PREFIX):]: v
+        for k, v in state.items()
+        if k.startswith(_ENCODER_3D_PREFIX)
+    }
+    if not enc_state:
+        raise ValueError(
+            f"no 'encoder_3d.*' weights in checkpoint {path}; was Stage 2 trained "
+            "with VIEW3D=1 (experiment=adapter3d)?"
+        )
+    cfg = raw.get("encoder_3d_config") if isinstance(raw, dict) else None
+    if not cfg:
+        raise ValueError(
+            f"ckpt {path} has no 'encoder_3d_config'; cannot rebuild the 3D encoder"
+        )
+    enc = PointCloudEncoder(
+        vocab_size=int(cfg["vocab_size"]),
+        key_prefix=str(cfg.get("key_prefix", "mol")),
+        encoder_layers=int(cfg["encoder_layers"]),
+        encoder_embed_dim=int(cfg["encoder_embed_dim"]),
+        encoder_ffn_embed_dim=int(cfg["encoder_ffn_embed_dim"]),
+        encoder_attention_heads=int(cfg["encoder_attention_heads"]),
+        max_seq_len=int(cfg["max_seq_len"]),
+    )
+    enc.load_state_dict(enc_state, strict=True)
+    enc.to(device).eval()
+    for p in enc.parameters():
+        p.requires_grad_(False)
+    enc.build_config = dict(cfg)
+    logger.info(
+        "loaded encoder_3d from %s (dim=%d, layers=%d)",
+        path, int(cfg["encoder_embed_dim"]), int(cfg["encoder_layers"]),
+    )
+    return enc
 
 
 class DenoisingJepaViewEncoder:
@@ -572,10 +628,13 @@ def build_eval_encoder(
     path = resolve_adapter_ckpt(ckpt)
     raw = safe_torch_load(path, weights_only=False)
     state = _checkpoint_state_dict(raw)
-    if any(k.startswith(_ADAPTER_PREFIX) for k in state):
-        return load_encoder_from_ckpt(ckpt, device=device, **overrides)
+    # Denoising-JEPA carries a top-level encoder.pool.* (its AttentionPool) that the
+    # discrete-flow adapter never has; check it first so the adapter it now also
+    # carries (encoder.adapter.*) doesn't misroute it to the discrete-flow loader.
     if any(k.startswith("encoder.pool.") for k in state):
         return load_denoising_jepa_for_eval(ckpt, device=device)
+    if any(k.startswith(_ADAPTER_PREFIX) for k in state):
+        return load_encoder_from_ckpt(ckpt, device=device, **overrides)
     raise ValueError(
         f"unrecognized checkpoint layout at {path}; "
         "expected discrete-flow adapter (encoder.adapter.*) or denoising-JEPA (encoder.pool.*)"

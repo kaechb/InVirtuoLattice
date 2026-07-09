@@ -1,0 +1,34 @@
+# @package _global_
+# Stage-2 SSL + cross-modal 3D point-cloud view (Uni-Mol). Extends
+# adapter_discrete_flow: a trainable 3D co-encoder whose pooled embedding a
+# predictor regresses from the 2D pooled z_m (LeJEPA-style — symmetric, no
+# EMA/stop-grad; VISReg per modality). Prerequisites:
+#   1. precompute conformers -> conformers.parquet
+#      (python -m lattice_lab.preprocessing.precompute_conformers ...)
+#   2. the pretrained Uni-Mol mol tower (mol_pre_no_h_220816.pt) + dict_mol.txt
+#      (InVirtuoCLIP scripts/download_data.sh).
+#
+#   python -m lattice_lab.train experiment=adapter3d
+#   python -m lattice_lab.train experiment=adapter3d model.ssl_loss=lejepa
+defaults:
+  - override /data: fragment_views
+  - override /model: discrete_flow
+  - override /trainer: adapter
+  - override /callbacks: ssl_basic
+
+data:
+  return_smiles: true  # required when model.fp_weight > 0 (Morgan fp distillation)
+  conformer_cache: artifacts/preprocessing/processed/moses/conformers.parquet
+  atom_dict_path: artifacts/downloads/dict_mol.txt
+
+model:
+  encoder_3d:
+    _target_: lattice_lab.backbone.pointcloud.build_pointcloud_encoder
+    dict_path: ${data.atom_dict_path}
+    ckpt_path: artifacts/downloads/mol_pre_no_h_220816.pt  # standalone Uni-Mol mol tower (bare keys)
+    sd_prefix: ""  # this checkpoint has no tower prefix; "mol_model." is only for joint InVirtuoCLIP ckpts
+    encoder_embed_dim: ${d_adapter}  # must equal d_adapter
+  view3d_weight: 1.0            # scales (1-lejepa_lambda)*L_3d + lejepa_lambda*VISReg(z_3d)
+  view3d_loss: l2              # l2 (LeJEPA MSE; scale pinned by VISReg) | cosine
+
+tags: ["ssl", "discrete_flow", "view3d"]

@@ -42,3 +42,4 @@ artifacts/*
 !artifacts/sota/**/configs/
 !artifacts/sota/**/configs/**
 # zm_cache/ and *.ckpt live on disk only (large binaries)
+artifacts/sota/**/zm_cache/

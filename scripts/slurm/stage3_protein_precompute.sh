@@ -21,25 +21,9 @@ cd "${SLURM_SUBMIT_DIR:?submit from repo root: sbatch scripts/slurm/stage3_prote
 # shellcheck source=scripts/slurm/common.sh
 source "scripts/slurm/common.sh"
 
-PROTEIN="${PROTEIN:-esm2}"
-lattice_pipeline_source_env
+lattice_protein_resolve
 # ponytail: pipeline sets OVERWRITE=0; standalone default rebuilds the store.
 OVERWRITE="${OVERWRITE:-1}"
-
-case "${PROTEIN}" in
-  esm2|esm)
-    PROTEIN_STORE=artifacts/protein_store/embeddings/esm2_650M
-    PROTEIN_EXTRA=(--no-canonical-filter)
-    ;;
-  esmc)
-    PROTEIN_STORE=artifacts/protein_store/embeddings/esmc_600m
-    PROTEIN_EXTRA=(--backend esmc)
-    ;;
-  *)
-    echo "unknown PROTEIN=${PROTEIN} (want esm2 or esmc)" >&2
-    exit 1
-    ;;
-esac
 
 OVERWRITE_ARGS=()
 [[ "${OVERWRITE}" == 1 ]] && OVERWRITE_ARGS=(--overwrite)
