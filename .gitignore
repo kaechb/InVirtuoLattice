@@ -10,6 +10,11 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
+.deps_nesso/
+
+# Loose data outputs (parquet dumps from analysis/screening scripts)
+*.parquet
 
 # Run outputs / logs
 logs/

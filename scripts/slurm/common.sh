@@ -407,7 +407,7 @@ lattice_pipeline_backfill_env() {
 # Resolve pipeline.env for an adapter run id (plain or _finished dir).
 lattice_pipeline_env_path() {
   local id="$1" root pe
-  for root in logs/slurm/ablation logs/slurm/pipeline; do
+  for root in logs/slurm/ablation logs/slurm/ablation/new_ablation logs/slurm/ablation/component logs/slurm/pipeline; do
     pe="${REPO}/${root}/${id}/pipeline.env"
     if [[ -f "${pe}" ]]; then
       echo "${pe}"

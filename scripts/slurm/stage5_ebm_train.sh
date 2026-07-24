@@ -181,6 +181,10 @@ if [[ "${ENCODER_3D:-0}" == 1 ]]; then
     "data.val_parquet=${BINDER_STORE3D}/val_3d.parquet"
   )
 fi
+if [[ -n "${EXTRA_EBM_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  STAGE5_ARGS+=(${EXTRA_EBM_ARGS})
+fi
 if [[ -n "${PIPELINE_LOG_DIR:-}" ]]; then
   lattice_pipeline_save_train_args 5 "${PIPELINE_CONFIG[@]}" "${STAGE5_ARGS[@]}"
 fi

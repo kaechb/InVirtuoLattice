@@ -55,6 +55,7 @@ class EBMLitModule(L.LightningModule):
         num_steps: int = 20_000,
         warmup_steps: int = 500,
         temperature: float = 0.1,
+        head_type: str = "film",
         lambda_sink: float = 1.0,
         lambda_sink_warmup: int = 10_000,
         lambda_neg: float = 1.0,
@@ -68,8 +69,10 @@ class EBMLitModule(L.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["encoder"])
         self.encoder = encoder
-        self.head = build_energy_head(d_adapter=d_adapter, d_protein=d_protein)
-        logger.info("energy head: params=%d", self.head.num_trainable_params)
+        self.head = build_energy_head(
+            d_adapter=d_adapter, d_protein=d_protein, head_type=head_type
+        )
+        logger.info("energy head (%s): params=%d", head_type, self.head.num_trainable_params)
 
         self.info_loss = InfoNCEEnergyLoss(temperature=temperature)
         self.sink_loss = SinkhornEnergyLoss()
@@ -196,8 +199,6 @@ class EBMLitModule(L.LightningModule):
         # ~0 the head is ignoring the protein. Cheap probe, but LayerNorm after
         # FiLM can absorb part of it — diagnostics/e_protein_gap below is the
         # decisive test of whether the *energy* actually depends on z_p.
-        with torch.no_grad():
-            gamma, beta = self.head.protein_proj(z_p).chunk(2, dim=-1)
         log = {
             "train/loss": total.detach(),
             "train/infonce": info_log["infonce/loss"],
@@ -206,9 +207,12 @@ class EBMLitModule(L.LightningModule):
             "train/top1": info_log["infonce/top1"],
             "train/binder_e_mean": e_pos.detach().mean(),
             "train/decoy_e_mean": e_dec.detach().mean(),
-            "diagnostics/film_gamma_absmean": gamma.abs().mean(),
-            "diagnostics/film_beta_absmean": beta.abs().mean(),
         }
+        if hasattr(self.head, "protein_proj"):
+            with torch.no_grad():
+                gamma, beta = self.head.protein_proj(z_p).chunk(2, dim=-1)
+            log["diagnostics/film_gamma_absmean"] = gamma.abs().mean()
+            log["diagnostics/film_beta_absmean"] = beta.abs().mean()
         if ct_log is not None:
             log["train/cross_target"] = ct_log["cross_target/loss"]
             log["train/cross_target_viol"] = ct_log["cross_target/violation_rate"]

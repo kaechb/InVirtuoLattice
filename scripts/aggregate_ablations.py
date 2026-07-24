@@ -38,6 +38,25 @@ def parse_env(path: Path) -> dict:
     return env
 
 
+def parse_stage5_args(path: Path) -> dict:
+    """Optional Stage-5 leave-one-out knobs (component ablations)."""
+    out = {}
+    if not path.exists():
+        return out
+    for tok in path.read_text().split():
+        k, _, v = tok.partition("=")
+        if k in (
+            "model.head_type",
+            "model.lambda_sink",
+            "model.cross_target_p",
+            "data.hard_mining_mult",
+            "data.frac_other_binder",
+            "data.frac_non_binder",
+        ):
+            out[k.split(".", 1)[1]] = v
+    return out
+
+
 def parse_stage2_args(path: Path) -> dict:
     """Extract the knobs this round varies from the frozen stage-2 Hydra args."""
     out = {}
@@ -106,6 +125,7 @@ def collect(roots: list[str], prefix: str | None) -> pd.DataFrame:
             if prefix and not name.startswith(prefix):
                 continue
             args = parse_stage2_args(run_dir / "stage2.train.args")
+            s5 = parse_stage5_args(run_dir / "stage5.train.args")
             ebm_ids = [
                 (run_dir / f"ebm.{s}").read_text().strip()
                 for s in range(int(env.get("N_SEEDS", "1")))
@@ -118,12 +138,14 @@ def collect(roots: list[str], prefix: str | None) -> pd.DataFrame:
                 {
                     "run_name": name,
                     "run_id": run_id,
+                    "component": env.get("COMPONENT_ABLATION", ""),
                     "method": args.get("ssl_loss", env.get("METHOD", "?")),
                     "protein": env.get("PROTEIN", "?"),
                     "merge": env.get("MERGE", "0"),
                     "view3d": int(view3d),
                     "pool": args.get("adapter_pool", DEFAULTS["adapter_pool"]),
                     "n_layers": int(args.get("adapter_n_layers", DEFAULTS["adapter_n_layers"])),
+                    "head_type": s5.get("head_type", "film"),
                     "seed": int(args.get("seed", DEFAULTS["seed"])),
                     "n_ebm_seeds": len(ebm_ids),
                     "finished": env.get("FINISHED", "0") == "1",
@@ -151,8 +173,9 @@ def main() -> None:
         return
     df = df.sort_values("bedroc", ascending=False, na_position="last").reset_index(drop=True)
 
-    cols = ["run_name", "method", "protein", "view3d", "pool", "n_layers", "seed",
-            "bedroc", "bedroc_median", "auroc", "ef1", "n_ebm_seeds", "finished", "eval"]
+    cols = ["run_name", "component", "method", "protein", "view3d", "pool", "n_layers",
+            "head_type", "seed", "bedroc", "bedroc_median", "auroc", "ef1", "n_ebm_seeds",
+            "finished", "eval"]
     cols = [c for c in cols if c in df.columns]
     with pd.option_context("display.max_rows", None, "display.width", 200):
         print("\n=== per-run (sorted by mean BEDROC) ===")

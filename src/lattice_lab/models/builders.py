@@ -17,7 +17,7 @@ from lattice_lab.backbone.discrete_flow import (
     build_discrete_flow_encoder,
     pad_batch,
 )
-from lattice_lab.ebm.head import EnergyHead
+from lattice_lab.ebm.head import CosineMatchHead, EnergyHead
 
 logger = logging.getLogger(__name__)
 
@@ -147,11 +147,13 @@ def infer_energy_head_dims(raw: object) -> tuple[int, int]:
         if isinstance(hp, dict) and "d_adapter" in hp and "d_protein" in hp:
             return int(hp["d_adapter"]), int(hp["d_protein"])
     head_state = parse_head_checkpoint(raw)
+    if "prot.weight" in head_state and "mol.weight" in head_state:
+        return int(head_state["mol.weight"].shape[1]), int(head_state["prot.weight"].shape[1])
     try:
         w0 = head_state["protein_proj.0.weight"]
     except KeyError as e:
         raise ValueError(
-            "cannot infer energy-head dims (missing protein_proj.0.weight)"
+            "cannot infer energy-head dims (missing protein_proj.0.weight / mol.weight)"
         ) from e
     d_hidden = int(w0.shape[0])
     d_p = int(w0.shape[1])
@@ -162,14 +164,25 @@ def infer_energy_head_dims(raw: object) -> tuple[int, int]:
     return d_m, d_p
 
 
+def _head_type_from_raw(raw: object) -> str:
+    if isinstance(raw, dict):
+        hp = raw.get("hyper_parameters")
+        if isinstance(hp, dict) and hp.get("head_type"):
+            return str(hp["head_type"])
+    head_state = parse_head_checkpoint(raw)
+    if "prot.weight" in head_state and "mol.weight" in head_state:
+        return "cosine"
+    return "film"
+
+
 def load_energy_head(
     head_ckpt: str | Path,
     *,
     d_adapter: int | None = None,
     d_protein: int | None = None,
     device: str | torch.device = "cpu",
-) -> EnergyHead:
-    """Load a trained Stage-5 :class:`EnergyHead` (frozen, ``eval()``).
+) -> EnergyHead | CosineMatchHead:
+    """Load a trained Stage-5 energy / cosine head (frozen, ``eval()``).
 
     ``head_ckpt`` is a full EBM Lightning ``.ckpt``; the head is pulled out of its
     ``state_dict`` by the ``head.`` prefix. When ``d_adapter`` / ``d_protein`` are
@@ -181,7 +194,9 @@ def load_energy_head(
         d_adapter = inf_m if d_adapter is None else d_adapter
         d_protein = inf_p if d_protein is None else d_protein
         logger.info("inferred energy head dims d_m=%d d_p=%d", d_adapter, d_protein)
-    head = EnergyHead(d_m=d_adapter, d_p=d_protein)
+    head = build_energy_head(
+        d_adapter=d_adapter, d_protein=d_protein, head_type=_head_type_from_raw(raw)
+    )
     head.load_state_dict(parse_head_checkpoint(raw))
     head.to(device).eval()
     for p in head.parameters():
@@ -641,5 +656,11 @@ def build_eval_encoder(
     )
 
 
-def build_energy_head(*, d_adapter: int, d_protein: int) -> EnergyHead:
-    return EnergyHead(d_m=d_adapter, d_p=d_protein)
+def build_energy_head(
+    *, d_adapter: int, d_protein: int, head_type: str = "film"
+) -> EnergyHead | CosineMatchHead:
+    if head_type == "film":
+        return EnergyHead(d_m=d_adapter, d_p=d_protein)
+    if head_type == "cosine":
+        return CosineMatchHead(d_m=d_adapter, d_p=d_protein)
+    raise ValueError(f"head_type must be 'film' or 'cosine', got {head_type!r}")

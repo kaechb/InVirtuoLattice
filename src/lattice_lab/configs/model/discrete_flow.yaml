@@ -8,7 +8,7 @@ encoder:
   backbone_layer_start: 6
   backbone_layer_end: 10
   d_adapter: ${d_adapter}
-  adapter_n_layers: 2
+  adapter_n_layers: 4   # ablation winner (w790kdrh); 2 is the lighter legacy default
   adapter_pool: attn   # z_m pooling: mean (masked mean over tokens) | attn (learned-query attention pool)
   # Two independent half-width (d_adapter//2) attention pools (requires
   # adapter_pool=attn; d_adapter must be even). z_m is their concatenation (back to

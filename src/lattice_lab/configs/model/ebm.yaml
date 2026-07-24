@@ -12,6 +12,8 @@ resume_from: null
 d_adapter: ${d_adapter}
 d_protein: ${d_protein}
 n_decoys: ${n_decoys}
+# film = FiLM energy MLP (default); cosine = linear contrastive matching baseline
+head_type: film
 
 learning_rate: 3.0e-4
 weight_decay: 0.01

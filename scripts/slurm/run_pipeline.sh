@@ -2,12 +2,15 @@
 #
 # Submit stages 2→6 as separate SLURM jobs with dependencies (login node).
 #
+# Defaults reproduce the ablation winner w790kdrh (ntxent adapter, 4 adapter
+# layers, esm2, hard-neg EBM, 3-seed ensemble). Override METHOD/N_SEEDS for others.
+#
 # Env / positional args:
-#   METHOD     lejepa | ntxent | siglip | ijepa | denoise   (default: lejepa; positional $1)
+#   METHOD     lejepa | ntxent | siglip | ijepa | denoise   (default: ntxent; positional $1)
 #   RUN_NAME   optional label for pipeline stage2 W&B name: {RUN_NAME}_stage2_{run_id}
 #              (standalone stage 2: used as logger.wandb.name directly)
 #   PROTEIN    esm2 | esmc — stages 3/5/6 protein store + d_protein (default: esm2)
-#   N_SEEDS    EBM seeds in stage 5 (default: 1; N_SEEDS=3 → 3 ckpts / ensemble eval)
+#   N_SEEDS    EBM seeds in stage 5 (default: 3 → ensemble eval; N_SEEDS=1 → single ckpt)
 #   STAGE_FROM=5  resume stage5 + stage6 on an existing pipeline (stages 2–4 unchanged)
 #   MULTISEED=1  on an existing pipeline: train only missing EBM seeds (0–2) + stage6 ensemble
 #   SMOKE=1    fast wiring test: 1 val epoch, ~1% SSL data, 5k-row pools, 50 EBM steps
@@ -17,8 +20,8 @@
 #
 # Pipeline W&B names: {RUN_NAME}_stage2_{id}, {RUN_NAME}_stage5_{id}[_seedN]
 #
-#   ./scripts/slurm/run_pipeline.sh lejepa
-#   N_SEEDS=3 ./scripts/slurm/run_pipeline.sh lejepa          # fresh run, 3 EBM seeds
+#   ./scripts/slurm/run_pipeline.sh                          # reproduce winner (ntxent, 3 seeds)
+#   N_SEEDS=1 ./scripts/slurm/run_pipeline.sh lejepa         # single-seed lejepa run
 #   STAGE_FROM=5 ADAPTER_RUN_ID=rq6fpmxs ./scripts/slurm/run_pipeline.sh   # resume after stage5 failure
 #   MULTISEED=1 ADAPTER_RUN_ID=avy80iqo ./scripts/slurm/run_pipeline.sh   # add 3 seeds to existing run
 #   ./scripts/slurm/run_pipeline.sh ijepa ijepa_blockhole_smoke
@@ -31,10 +34,10 @@ cd "$(dirname "$0")/../.."
 source "scripts/slurm/common.sh"
 lattice_cd_repo
 
-METHOD="${1:-${METHOD:-lejepa}}"
+METHOD="${1:-${METHOD:-ntxent}}"
 RUN_NAME="${2:-${RUN_NAME:-}}"
 PROTEIN="${PROTEIN:-esm2}"
-N_SEEDS="${N_SEEDS:-1}"
+N_SEEDS="${N_SEEDS:-3}"
 MULTISEED="${MULTISEED:-0}"
 SMOKE="${SMOKE:-0}"
 MERGE="${MERGE:-0}"

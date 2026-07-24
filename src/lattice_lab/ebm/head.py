@@ -127,3 +127,50 @@ class EnergyHead(nn.Module):
         h = self.post_norm(h)
         e = self.energy_mlp(h).squeeze(-1)
         return e
+
+
+class CosineMatchHead(nn.Module):
+    """Contrastive matching baseline: ``E = -cos(proj_m(z_m), proj_p(z_p))``.
+
+    Linear projections into a shared space, L2-normalize, score by negative
+    cosine. Same ``(z_m, z_p) → scalar`` contract as :class:`EnergyHead` so
+    Stage-5/6 wiring is unchanged. Use via ``model.head_type=cosine``.
+    """
+
+    def __init__(self, *, d_m: int = 512, d_p: int = 1280, d_hidden: int = 512) -> None:
+        super().__init__()
+        self.d_m = d_m
+        self.d_p = d_p
+        self.d_hidden = d_hidden
+        self.mol = nn.Linear(d_m, d_hidden, bias=False)
+        self.prot = nn.Linear(d_p, d_hidden, bias=False)
+
+    @property
+    def num_trainable_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def forward(self, z_m: torch.Tensor, z_p: torch.Tensor) -> torch.Tensor:
+        if z_m.shape[-1] != self.d_m:
+            raise ValueError(f"z_m last dim {z_m.shape[-1]} != d_m {self.d_m}")
+        if z_p.shape[-1] != self.d_p:
+            raise ValueError(f"z_p last dim {z_p.shape[-1]} != d_p {self.d_p}")
+        a = nn.functional.normalize(self.mol(z_m), dim=-1)
+        b = nn.functional.normalize(self.prot(z_p), dim=-1)
+        return -(a * b).sum(dim=-1)
+
+
+if __name__ == "__main__":
+    # Binder and protein that align after proj must score lower energy than a decoy.
+    torch.manual_seed(0)
+    h = CosineMatchHead(d_m=8, d_p=16, d_hidden=8)
+    with torch.no_grad():
+        h.mol.weight.copy_(torch.eye(8))
+        h.prot.weight.zero_()
+        h.prot.weight[:, :8] = torch.eye(8)
+    z_m_pos = torch.randn(1, 8)
+    z_m_neg = -z_m_pos
+    z_p = torch.cat([z_m_pos, torch.zeros(1, 8)], dim=-1)
+    e_pos = h(z_m_pos, z_p)
+    e_neg = h(z_m_neg, z_p)
+    assert e_pos.item() < e_neg.item(), (e_pos.item(), e_neg.item())
+    print("CosineMatchHead ok")

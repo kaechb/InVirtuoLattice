@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.metrics import average_precision_score
 
 from lattice_lab.ebm.head import EnergyHead
 from lattice_lab.eval.lit_pcba import (
@@ -45,7 +46,7 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-_METRIC_COLS = ("auroc", "bedroc", "ef@0.5%", "ef@1.0%", "ef@5.0%")
+_METRIC_COLS = ("ap", "auroc", "bedroc", "ef@0.5%", "ef@1.0%", "ef@2.0%", "ef@5.0%")
 
 
 def _summary_from_df(res: pd.DataFrame) -> dict[str, float | int]:
@@ -172,10 +173,12 @@ def main() -> None:
         y_score = -energies.mean(axis=0)
         m = {
             "target": t, "n": int(y_true.size), "n_active": int(y_true.sum()),
+            "ap": float(average_precision_score(y_true, y_score)),
             "auroc": auroc(y_true, y_score),
             "bedroc": bedroc(y_true, y_score, alpha=a.bedroc_alpha),
             "ef@0.5%": ef_at_k(y_true, y_score, 0.5),
             "ef@1.0%": ef_at_k(y_true, y_score, 1.0),
+            "ef@2.0%": ef_at_k(y_true, y_score, 2.0),
             "ef@5.0%": ef_at_k(y_true, y_score, 5.0),
         }
         rows.append(m)
@@ -187,10 +190,12 @@ def main() -> None:
             y_seed = -energies[hi]
             seed_rows[hi].append({
                 "target": t, "n": m["n"], "n_active": m["n_active"],
+                "ap": float(average_precision_score(y_true, y_seed)),
                 "auroc": auroc(y_true, y_seed),
                 "bedroc": bedroc(y_true, y_seed, alpha=a.bedroc_alpha),
                 "ef@0.5%": ef_at_k(y_true, y_seed, 0.5),
                 "ef@1.0%": ef_at_k(y_true, y_seed, 1.0),
+                "ef@2.0%": ef_at_k(y_true, y_seed, 2.0),
                 "ef@5.0%": ef_at_k(y_true, y_seed, 5.0),
             })
         if a.violin_dir is not None:

@@ -86,6 +86,10 @@ lattice_require_gpu
 
 _ebm_ckpt() {
   local run_id="$1"
+  if [[ "${EVAL_PREFER_LAST:-0}" == 1 ]]; then
+    echo "$(lattice_artifacts_root)/energy/checkpoints/${run_id}/last.ckpt"
+    return
+  fi
   if [[ -n "${PIPELINE_ENV:-}" && -f "${PIPELINE_ENV}" ]]; then
     lattice_pipeline_ebm_eval_ckpt "${run_id}"
   else

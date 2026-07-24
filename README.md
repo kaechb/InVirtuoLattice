@@ -268,18 +268,24 @@ sbatch --dependency=afterok:<stage4_jobid> scripts/slurm/stage5_ebm_train.sh lej
 stage 2 snapshots Hydra configs into that directory; stage 5 trains against the
 snapshot so later repo edits cannot change EBM settings mid-pipeline.
 
+**The bare defaults reproduce the ablation winner `w790kdrh`** — `METHOD=ntxent`,
+a 4-layer adapter (`model.encoder.adapter_n_layers=4`, now the config default),
+esm2 proteins, the hard-neg EBM (`ebm_hardneg_ntxent`) and a 3-seed ensemble.
+So `./scripts/slurm/run_pipeline.sh` with no arguments trains and evaluates that
+recipe end-to-end; pass `METHOD`/`N_SEEDS`/etc. to explore anything else.
+
 `run_pipeline.sh` starts at Stage 2, so build the matching Stage-1 dataset first
 (e.g. `MERGE=1 sbatch scripts/slurm/stage1_preprocess.sh`) and pass the same
 `MERGE` to the pipeline; it seeds `MERGE` into `PIPELINE_ENV` and every stage
 follows the adapter checkpoint from there.
 
 ```bash
-./scripts/slurm/run_pipeline.sh lejepa
+./scripts/slurm/run_pipeline.sh                          # reproduce winner: ntxent, 4-layer adapter, 3-seed ensemble
+N_SEEDS=1 ./scripts/slurm/run_pipeline.sh lejepa         # single-seed lejepa run
 PROTEIN=esmc RUN_NAME=ijepa_ablation ./scripts/slurm/run_pipeline.sh ijepa
-N_SEEDS=3 ./scripts/slurm/run_pipeline.sh lejepa          # fresh run: stages 2–4 once, EBM ×3, ensemble eval
 MULTISEED=1 ADAPTER_RUN_ID=avy80iqo ./scripts/slurm/run_pipeline.sh   # existing run: only stage 5 ×3 + stage 6
 MERGE=1 ./scripts/slurm/run_pipeline.sh lejepa            # coarser fragment-view variant end-to-end
-SMOKE=1 ./scripts/slurm/run_pipeline.sh lejepa           # fast wiring test (~1h total)
+SMOKE=1 ./scripts/slurm/run_pipeline.sh                   # fast wiring test (~1h total)
 ```
 
 **Smoke test (`SMOKE=1`):** exercises the full dependency chain with tiny data —
@@ -304,10 +310,10 @@ stage2 ─┬─→ stage3 ─┐
 
 | Env | Default | Meaning |
 |---|---|---|
-| `METHOD` | `lejepa` | Stage-2 SSL objective (positional `$1`) |
+| `METHOD` | `ntxent` | Stage-2 SSL objective (positional `$1`) |
 | `RUN_NAME` | — | Optional W&B run name for stage 2 (positional `$2`) |
 | `PROTEIN` | `esm2` | Stage 3: `esm2` or `esmc` (pipeline sets `OVERWRITE=0` for incremental embed) |
-| `N_SEEDS` | `1` | Stage-5 seeds; `3` runs ensemble eval, else single-checkpoint eval |
+| `N_SEEDS` | `3` | Stage-5 seeds; `3` runs ensemble eval, else single-checkpoint eval |
 | `MULTISEED` | `0` | `1` + `ADAPTER_RUN_ID` (or `PIPELINE_ENV`) = re-submit stage 5 ×3 + stage 6 only |
 | `VIEW3D` | `0` | `1` = pretrain the adapter with the 3D point-cloud view (`experiment=adapter3d`; auto-submits stage 1b) |
 | `ENCODER_3D` | `0` | `1` = also encode Stage 4–6 ligands with the 3D encoder (implies `VIEW3D=1`) |
