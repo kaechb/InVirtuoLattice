@@ -309,14 +309,27 @@ stage2 ─┬─→ stage3 ─┐
 | `PROTEIN` | `esm2` | Stage 3: `esm2` or `esmc` (pipeline sets `OVERWRITE=0` for incremental embed) |
 | `N_SEEDS` | `1` | Stage-5 seeds; `3` runs ensemble eval, else single-checkpoint eval |
 | `MULTISEED` | `0` | `1` + `ADAPTER_RUN_ID` (or `PIPELINE_ENV`) = re-submit stage 5 ×3 + stage 6 only |
+| `VIEW3D` | `0` | `1` = pretrain the adapter with the 3D point-cloud view (`experiment=adapter3d`; auto-submits stage 1b) |
+| `ENCODER_3D` | `0` | `1` = also encode Stage 4–6 ligands with the 3D encoder (implies `VIEW3D=1`) |
+| `STAGE_FROM` | — | `4` or `5` + `ADAPTER_RUN_ID` = resume an existing pipeline from that stage |
 | `SMOKE` | `0` | `1` = smoke mode (see above) |
 
 Stage 3 skips pids already in the protein store; stages 4–6 rebuild decoy pools
 and LIT-PCBA caches from scratch (`--force` / cache clear).
 
-Stage-2 `METHOD` values: `lejepa`, `ntxent`, `ijepa`, `denoise` (maps to Hydra
-`experiment=`). Stage-5 `METHOD` is `lejepa` or `ntxent` (W&B grouping only;
-pools always come from the Stage-2 `RUN_ID`).
+Stage-2 `METHOD` values: `lejepa`, `ntxent`, `siglip`, `ijepa`, `denoise` (maps
+to Hydra `experiment=`; `siglip` is a sigmoid-loss contrastive variant of
+`ntxent`). Stage-5 `METHOD` is `lejepa` or `ntxent` (W&B grouping only; `siglip`
+folds into `ntxent`; pools always come from the Stage-2 `RUN_ID`).
+
+**3D cross-modal pretraining (`VIEW3D` / `ENCODER_3D`).** `VIEW3D=1` pretrains
+the 2D adapter *with* an auxiliary 3D point-cloud view (`experiment=adapter3d`);
+`run_pipeline.sh` first submits `stage1b_precompute_conformers.sh` when the
+conformer cache is missing. The 3D encoder is a pretraining crutch by default and
+its weights are discarded downstream — unless you also set `ENCODER_3D=1`, which
+keeps the 3D encoder and uses it (instead of the 2D adapter) to encode ligands in
+Stages 4–6. `ENCODER_3D=1` implies `VIEW3D=1`; neither is compatible with
+`METHOD=denoise`.
 
 Stage 6 eval artifacts for EBM run id `<ebm_id>`:
 
@@ -457,13 +470,14 @@ MMseqs2 (the Stage-1 clustering dep) runs in a fresh per-run workdir
 
 ### Stage 2 — Molecule encoder (DDiT + adapter SSL)
 
-Pick an SSL objective via `METHOD` on SLURM (`lejepa`, `ntxent`, `ijepa`,
-`denoise`). Each lands at `artifacts/adapter/checkpoints/<wandb_run_id>/last.ckpt`,
+Pick an SSL objective via `METHOD` on SLURM (`lejepa`, `ntxent`, `siglip`,
+`ijepa`, `denoise`). Each lands at `artifacts/adapter/checkpoints/<wandb_run_id>/last.ckpt`,
 which Stage 4+ load **directly** — no export step.
 
 ```bash
 sbatch scripts/slurm/stage2_ssl.sh lejepa
 sbatch scripts/slurm/stage2_ssl.sh ijepa my_ablation_name   # custom W&B run name
+VIEW3D=1 sbatch scripts/slurm/stage2_ssl.sh lejepa          # + auxiliary 3D point-cloud view
 ```
 
 Manual equivalents:
@@ -619,6 +633,12 @@ done
 `ebm_hardneg` sets `data.hard_mining_mult=3` + the 0.4/0.15 hard-neg mix.
 `ModelCheckpoint(monitor="val/ef1", mode="max")` keeps the best head per seed.
 
+**Head type (`model.head_type`, default `film`).** The energy head is a FiLM
+MLP; `model.head_type=cosine` swaps in `CosineMatchHead`, a linear
+contrastive-matching baseline (`E = -cos(proj_m(z_m), proj_p(z_p))`) with the same
+`(z_m, z_p) → scalar` contract, so Stage 5/6 wiring is unchanged. The type is
+embedded in the checkpoint and read back at eval, so callers never re-specify it.
+
 ### Stage 6 — Evaluation (LIT-PCBA)
 
 ```bash
@@ -691,11 +711,31 @@ python -m lattice_lab.inference.predict_ensemble \
 > no export step. (Old pre-`encoder_config` ckpts fall back to documented
 > defaults; re-saving them embeds the config.)
 
-## Not re-homed (intentionally)
+## Ablations & ensemble scaling
 
-The `artifacts/energy/` ablation tooling (`run_ablations.py`, `collect_ablation_results.py`,
-the reproduce/sweep shell scripts) is monorepo experiment-management, not part of
-the model pipeline — it stays in the monorepo.
+Experiment-management helpers around a finished winner (they reuse the standard
+stage scripts, so nothing about the core pipeline changes):
+
+```bash
+# Leave-one-out component ablations vs a base run (default BASE_RUN_ID=w790kdrh).
+# Each run drops one piece (no_ssl, cosine_match, no_hardneg, no_bdb_mix,
+# no_cross_target, no_sinkhorn); Stage-6 LIT-PCBA BEDROC is the score.
+./scripts/slurm/run_component_ablations.sh
+DRY_RUN=1 ./scripts/slurm/run_component_ablations.sh          # print the plan
+
+# Ensemble-size scaling: train extra EBM seeds, then mean±std BEDROC over all
+# subsets of size k.
+BASE_RUN_ID=w790kdrh EXTRA_SEEDS=6 ./scripts/slurm/run_ensemble_scaling.sh
+
+# Aggregate stage-6 results across pipeline/ablation runs into one ranked table.
+python scripts/aggregate_ablations.py --prefix comp_
+```
+
+EBM leave-one-outs symlink the base adapter + decoy/binder stores; `no_ssl`
+plants a random-adapter init and re-runs Stage 4→6. Extra ablation env knobs feed
+through the stage scripts: `EXTRA_EBM_ARGS` (append Hydra overrides to Stage 5)
+and `EVAL_PREFER_LAST=1` (Stage 6 scores `last.ckpt` instead of the monitored
+best).
 
 ## Spinning out into its own repo
 
